@@ -1149,6 +1149,9 @@ class Parser:
     def macos_traditional_fullscreen(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['macos_traditional_fullscreen'] = to_bool(val)
 
+    def macos_transparent_window_shadow(self, val: str, ans: dict[str, typing.Any]) -> None:
+        ans['macos_transparent_window_shadow'] = to_bool(val)
+
     def macos_use_physical_screen_frame(self, val: str, ans: dict[str, typing.Any]) -> None:
         ans['macos_use_physical_screen_frame'] = to_bool(val)
 

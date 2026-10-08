@@ -3475,6 +3475,19 @@ macOS.
 )
 
 opt(
+    'macos_transparent_window_shadow',
+    'no',
+    option_type='to_bool',
+    ctype='bool',
+    long_text="""
+Allow semi-transparent kitty OS windows to have the native macOS window shadow.
+By default such windows have no shadow, because macOS can leave a stale shadow
+behind, causing "ghosting" of text, after the window is resized, minimized or
+restored. See :iss:`6439`. Enabling this restores the shadow.
+""",
+)
+
+opt(
     'macos_thicken_font',
     '0',
     option_type='positive_float',
