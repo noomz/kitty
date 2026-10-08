@@ -1943,6 +1943,7 @@ init_window_chrome_state(WindowChromeState *s, color_type active_window_bg, floa
     }
     s->macos_colorspace = OPT(macos_colorspace);
     s->resizable = OPT(macos_window_resizable);
+    s->transparent_window_shadow = OPT(macos_transparent_window_shadow);
 #else
     if (global_state.is_wayland) { SET_TCOL(OPT(wayland_titlebar_color)); }
 #endif
@@ -1965,7 +1966,8 @@ apply_window_chrome_state(GLFWwindow *w, WindowChromeState new_state, int width,
         new_state.show_title_in_titlebar,
         new_state.macos_colorspace,
         new_state.background_opacity,
-        new_state.resizable);
+        new_state.resizable,
+        new_state.transparent_window_shadow);
     // Need to resize the window again after hiding decorations or title bar to take up screen space
     if (window_decorations_changed) glfwSetWindowSize(w, width, height);
 #else

@@ -402,6 +402,7 @@ option_names = (
     'macos_thicken_font',
     'macos_titlebar_color',
     'macos_traditional_fullscreen',
+    'macos_transparent_window_shadow',
     'macos_use_physical_screen_frame',
     'macos_window_resizable',
     'map',
@@ -626,6 +627,7 @@ class Options:
     macos_thicken_font: float = 0
     macos_titlebar_color: int = 0
     macos_traditional_fullscreen: bool = False
+    macos_transparent_window_shadow: bool = False
     macos_use_physical_screen_frame: bool = False
     macos_window_resizable: bool = True
     map_timeout: float = 0

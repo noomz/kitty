@@ -83,7 +83,7 @@ typedef struct Options {
         bool on_cross, on_drop;
     } focus_follows_mouse;
     unsigned int hide_window_decorations;
-    bool macos_hide_from_tasks, macos_quit_when_last_window_closed, macos_window_resizable, macos_traditional_fullscreen,
+    bool macos_hide_from_tasks, macos_quit_when_last_window_closed, macos_window_resizable, macos_transparent_window_shadow, macos_traditional_fullscreen,
         macos_fullscreen_ignore_safe_area_insets, macos_use_physical_screen_frame;
     unsigned int macos_option_as_alt;
     float macos_thicken_font;
@@ -492,6 +492,7 @@ typedef struct WindowChromeState {
     unsigned hide_window_decorations;
     bool show_title_in_titlebar;
     bool resizable;
+    bool transparent_window_shadow;
     int macos_colorspace;
     float background_opacity;
 } WindowChromeState;

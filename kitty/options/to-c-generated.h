@@ -4,6 +4,7 @@
 #include "to-c.h"
 
 
+
 static void
 convert_from_python_font_size(PyObject *val, Options *opts) {
     opts->font_size = PyFloat_AsDouble(val);
@@ -1448,6 +1449,19 @@ convert_from_opts_macos_window_resizable(PyObject *py_opts, Options *opts) {
 }
 
 static void
+convert_from_python_macos_transparent_window_shadow(PyObject *val, Options *opts) {
+    opts->macos_transparent_window_shadow = PyObject_IsTrue(val);
+}
+
+static void
+convert_from_opts_macos_transparent_window_shadow(PyObject *py_opts, Options *opts) {
+    PyObject *ret = PyObject_GetAttrString(py_opts, "macos_transparent_window_shadow");
+    if (ret == NULL) return;
+    convert_from_python_macos_transparent_window_shadow(ret, opts);
+    Py_DECREF(ret);
+}
+
+static void
 convert_from_python_macos_thicken_font(PyObject *val, Options *opts) {
     opts->macos_thicken_font = PyFloat_AsFloat(val);
 }
@@ -1800,6 +1814,8 @@ convert_opts_from_python_opts(PyObject *py_opts, Options *opts) {
     convert_from_opts_macos_quit_when_last_window_closed(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_macos_window_resizable(py_opts, opts);
+    if (PyErr_Occurred()) return false;
+    convert_from_opts_macos_transparent_window_shadow(py_opts, opts);
     if (PyErr_Occurred()) return false;
     convert_from_opts_macos_thicken_font(py_opts, opts);
     if (PyErr_Occurred()) return false;

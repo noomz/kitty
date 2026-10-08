@@ -2575,6 +2575,7 @@ createNativeWindow(_GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _
     window->ns.view = [[GLFWContentView alloc] initWithGlfwWindow:window];
     window->ns.retina = wndconfig->ns.retina;
 
+    window->ns.has_shadow = !fbconfig->transparent;
     if (fbconfig->transparent) {
         [window->ns.object setOpaque:NO];
         [window->ns.object setHasShadow:NO];
@@ -3254,7 +3255,7 @@ _glfwPlatformSetWindowMonitor(_GLFWwindow *window, _GLFWmonitor *monitor, int xp
         if (window->floating) [window->ns.object setLevel:NSFloatingWindowLevel];
         else [window->ns.object setLevel:NSNormalWindowLevel];
 
-        [window->ns.object setHasShadow:YES];
+        [window->ns.object setHasShadow:window->ns.has_shadow];
         // HACK: Clearing NSWindowStyleMaskTitled resets and disables the window
         //       title property but the miniwindow title property is unaffected
         [window->ns.object setTitle:[window->ns.object miniwindowTitle]];
@@ -4159,7 +4160,8 @@ glfwCocoaSetWindowChrome(
     bool show_text_in_titlebar,
     int color_space,
     float background_opacity,
-    bool resizable) {
+    bool resizable,
+    bool transparent_window_shadow) {
     @autoreleasepool {
         _GLFWwindow *window = (_GLFWwindow *)w;
         if (window->ns.layer_shell.is_active) return;
@@ -4234,7 +4236,9 @@ glfwCocoaSetWindowChrome(
         }
         // shadow causes burn-in/ghosting because cocoa doesnt invalidate it on OS window resize/minimize/restore.
         // https://github.com/kovidgoyal/kitty/issues/6439
-        if (is_transparent) has_shadow = false;
+        // Can be re-enabled with macos_transparent_window_shadow.
+        if (is_transparent && !transparent_window_shadow) has_shadow = false;
+        window->ns.has_shadow = has_shadow;
         bool hide_titlebar_buttons = !in_fullscreen && window->ns.titlebar_hidden;
         [nsw setTitlebarAppearsTransparent:window->ns.last_applied_titlebar_settings.transparent];
         [nsw setHasShadow:has_shadow];

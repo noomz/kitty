@@ -139,6 +139,7 @@ typedef struct _GLFWwindowNS {
 
     bool maximized;
     bool retina;
+    bool has_shadow;
     bool in_traditional_fullscreen;
     bool in_fullscreen_transition;
     bool suppress_frame_constraints;
