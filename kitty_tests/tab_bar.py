@@ -3,7 +3,7 @@
 
 from unittest.mock import patch
 
-from kitty.fast_data_types import LEFT_EDGE, Color, Region, Screen
+from kitty.fast_data_types import BOTTOM_EDGE, LEFT_EDGE, Color, Region, Screen
 from kitty.options.utils import tab_title_wrap
 from kitty.tab_bar import CellRange, DrawData, ExtraData, TabBar, TabBarData, TabExtent, WindowDropTarget, as_rgb, powerline_symbols, truncate_line, wrap_title
 from kitty.utils import color_as_int
@@ -691,3 +691,50 @@ class TestTabBar(BaseTest):
             with patch('kitty.tab_bar.caching_titles', nullcontext):
                 self.ae(self.horizontal_tab_bar_line(titles, 60, tab_bar_style='separator', tab_title_template=template), cached, template)
             self.assertGreater(ev.call_count, len(titles), template)
+
+    def horizontal_tab_bar(self, num_tabs: int = 2, **opts: object) -> TabBar:
+        self.set_options({'tab_bar_edge': BOTTOM_EDGE, 'tab_title_template': '{title}', **opts})
+        central = region(0, 0, 400, 140)
+        tab_bar = region(0, 140, 400, 160)
+        with (
+            patch('kitty.tab_bar.cell_size_for_window', return_value=(10, 20)),
+            patch('kitty.tab_bar.viewport_for_window', return_value=(central, tab_bar, 400, 160, 10, 20)),
+            patch('kitty.tab_bar.set_tab_bar_render_data'),
+            patch('kitty.tab_bar.get_boss', return_value=DummyBoss()),
+        ):
+            tb = TabBar(1)
+            tb.layout()
+            tb.update(tuple(TabBarData(title=f't{i}', tab_id=i + 1, is_active=i == 0) for i in range(num_tabs)))
+        return tb
+
+    def test_powerline_separator_matching_background(self) -> None:
+        # A separator whose color matches the background behind it is drawn as a
+        # blank, as glyphs are not affected by background_opacity
+        bg = Color(0, 0, 100)
+        same = {'active_tab_background': bg, 'inactive_tab_background': bg, 'tab_bar_background': bg}
+        for style, (separator, soft_separator) in powerline_symbols.items():
+            with self.subTest(style=style):
+                tb = self.horizontal_tab_bar(num_tabs=2, tab_bar_style='powerline', tab_powerline_style=style, **same)
+                text = str(tb.screen.line(0))
+                self.assertNotIn(separator, text)
+                self.ae(text.rstrip(), f' t0 {soft_separator} t1')
+
+                tb = self.horizontal_tab_bar(
+                    num_tabs=2, tab_bar_style='powerline', tab_powerline_style=style,
+                    active_tab_background=Color(200, 0, 0), inactive_tab_background=Color(0, 200, 0), tab_bar_background=bg,
+                )
+                line = tb.screen.line(0)
+                text = str(line)
+                self.ae(text.count(separator), 2)
+                sep = line.cursor_from(text.rindex(separator))
+                self.ae((int(sep.fg), int(sep.bg)), (as_rgb(color_as_int(Color(0, 200, 0))), as_rgb(color_as_int(bg))))
+
+        separator = powerline_symbols['slanted'][0]
+        tb = self.vertical_tab_bar(
+            num_tabs=1, height=200, tab_bar_style='powerline', tab_powerline_style='slanted',
+            tab_title_max_lines=3, tab_title_wrap=-1, tab_title_template='{title} abcdefgh ijklmnopq rs', **same,
+        )
+        lines = [x for x in (str(tb.screen.line(i)) for i in range(tb.screen.lines)) if x.strip()]
+        self.ae(len(lines), 3)
+        for text in lines:
+            self.assertNotIn(separator, text)

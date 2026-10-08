@@ -689,17 +689,20 @@ def draw_tab_with_powerline(
         # so that wrapped titles have a straight edge.
         screen.cursor.fg = tab_bg
         screen.cursor.bg = default_bg
+        # A separator in the same color as the background behind it is invisible,
+        # except that glyphs ignore background_opacity, so draw a blank instead.
+        symbol = ' ' if tab_bg == default_bg else separator_symbol
         for y in range(first_row, screen.cursor.y + 1):
             screen.cursor.x = screen.columns - 1
             screen.cursor.y = y
-            screen.draw(separator_symbol)
+            screen.draw(symbol)
         return screen.cursor.x
 
     if not needs_soft_separator:
         screen.draw(' ')
         screen.cursor.fg = tab_bg
         screen.cursor.bg = next_tab_bg
-        screen.draw(separator_symbol)
+        screen.draw(' ' if tab_bg == next_tab_bg else separator_symbol)
     else:
         prev_fg = screen.cursor.fg
         if tab_bg == tab_fg:
