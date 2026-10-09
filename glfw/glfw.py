@@ -94,7 +94,8 @@ def generate_wrappers(glfw_header: str) -> None:
     void glfwSetPrimarySelectionString(GLFWwindow* window, const char* string)
     void glfwCocoaCycleThroughOSWindows(bool backwards)
     void glfwCocoaSetWindowChrome(GLFWwindow* window, unsigned int color, bool use_system_color, unsigned int system_color,\
-    int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, int color_space, float background_opacity, bool resizable, bool transparent_window_shadow)
+    int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, int color_space, float background_opacity,\
+    bool resizable, bool transparent_window_shadow)
     void glfwCocoaRegisterMIMETypes(GLFWwindow *window, const char **mimes, size_t count)
     const char* glfwCocoaPreserveDroppedFilePromises(GLFWwindow *window)
     void glfwCocoaSetWindowLevel(GLFWwindow *window, const char *level_spec)
