@@ -712,8 +712,12 @@ class TestTabBar(BaseTest):
                 self.ae(text.rstrip(), f' t0 {soft_separator} t1')
 
                 tb = self.horizontal_tab_bar(
-                    num_tabs=2, tab_bar_style='powerline', tab_powerline_style=style,
-                    active_tab_background=Color(200, 0, 0), inactive_tab_background=Color(0, 200, 0), tab_bar_background=bg,
+                    num_tabs=2,
+                    tab_bar_style='powerline',
+                    tab_powerline_style=style,
+                    active_tab_background=Color(200, 0, 0),
+                    inactive_tab_background=Color(0, 200, 0),
+                    tab_bar_background=bg,
                 )
                 line = tb.screen.line(0)
                 text = str(line)
@@ -723,8 +727,14 @@ class TestTabBar(BaseTest):
 
         separator = powerline_symbols['slanted'][0]
         tb = self.vertical_tab_bar(
-            num_tabs=1, height=200, tab_bar_style='powerline', tab_powerline_style='slanted',
-            tab_title_max_lines=3, tab_title_wrap=-1, tab_title_template='{title} abcdefgh ijklmnopq rs', **same,
+            num_tabs=1,
+            height=200,
+            tab_bar_style='powerline',
+            tab_powerline_style='slanted',
+            tab_title_max_lines=3,
+            tab_title_wrap=-1,
+            tab_title_template='{title} abcdefgh ijklmnopq rs',
+            **same,
         )
         lines = [x for x in (str(tb.screen.line(i)) for i in range(tb.screen.lines)) if x.strip()]
         self.ae(len(lines), 3)
