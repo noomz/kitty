@@ -2099,7 +2099,10 @@ def create_macos_bundle_gunk(dest: str, for_freeze: bool, args: Options) -> str:
         kitten_exe = build_static_kittens(args, launcher_dir=os.path.dirname(kitty_exe))
         if not kitten_exe:
             raise SystemExit('kitten not built cannot create macOS bundle')
-        os.symlink(os.path.relpath(kitten_exe, os.path.dirname(in_src_launcher)), os.path.join(os.path.dirname(in_src_launcher), os.path.basename(kitten_exe)))
+        kitten_link = os.path.join(os.path.dirname(in_src_launcher), os.path.basename(kitten_exe))
+        if os.path.lexists(kitten_link):
+            os.remove(kitten_link)
+        os.symlink(os.path.relpath(kitten_exe, os.path.dirname(in_src_launcher)), kitten_link)
     create_quick_access_bundle(dest)
     return str(kitty_exe)
 
