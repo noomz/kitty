@@ -601,11 +601,15 @@ key_callback(GLFWwindow *w, GLFWkeyevent *ev) {
 #ifndef __APPLE__
     if (key_modifier != -1) update_modifier_state_on_modifier_key_event(ev, key_modifier, is_left);
 #endif
+    const int old_mods = global_state.mods_at_last_key_or_button_event;
     global_state.mods_at_last_key_or_button_event = ev->mods;
     global_state.callback_os_window->cursor_blink_zero_time = monotonic();
     global_state.callback_os_window->user_is_idle = false;
     global_state.callback_os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_USER_ACTIVITY);
-    if (is_window_ready_for_callbacks() && !ev->fake_event_on_focus_change) on_key_input(ev);
+    if (is_window_ready_for_callbacks()) {
+        update_link_hover_for_modifiers(old_mods, ev->mods);
+        if (!ev->fake_event_on_focus_change) on_key_input(ev);
+    }
     global_state.callback_os_window = NULL;
     request_tick_callback();
 }
@@ -1611,7 +1615,8 @@ set_glfw_mouse_pointer_shape_in_window(GLFWwindow *w, MouseShape type) {
 
 void
 set_mouse_cursor(MouseShape type) {
-    if (global_state.callback_os_window) {
+    // Headless mock OS windows have no native cursor.
+    if (global_state.callback_os_window && global_state.callback_os_window->handle) {
         GLFWwindow *w = (GLFWwindow *)global_state.callback_os_window->handle;
         set_glfw_mouse_pointer_shape_in_window(w, type);
     }
@@ -3598,12 +3603,13 @@ dbus_send_notification(PyObject *self UNUSED, PyObject *args, PyObject *kw) {
     int timeout = -1, urgency = 1;
     unsigned int replaces = 0;
     GLFWDBUSNotificationData d = {0};
-    static const char *kwlist[] = {"app_name", "app_icon", "title", "body", "actions", "timeout", "urgency", "replaces", "category", "muted", NULL};
+    static const char *kwlist[] = {
+        "app_name", "app_icon", "title", "body", "actions", "timeout", "urgency", "replaces", "category", "muted", "desktop_entry", NULL};
     PyObject *actions = NULL;
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kw,
-            "ssssO!|iiIsp",
+            "ssssO!|iiIsps",
             (char **)kwlist,
             &d.app_name,
             &d.icon,
@@ -3615,7 +3621,8 @@ dbus_send_notification(PyObject *self UNUSED, PyObject *args, PyObject *kw) {
             &urgency,
             &replaces,
             &d.category,
-            &d.muted))
+            &d.muted,
+            &d.desktop_entry))
         return NULL;
     if (!glfwDBusUserNotify) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to load glfwDBusUserNotify, did you call glfw_init?");
