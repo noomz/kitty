@@ -489,6 +489,7 @@ typedef struct CustomShaderGroup {
     Animation *animation_curve;                  // parsed easing curve; NULL = no animation
     bool animation_curve_is_shared;              // true if animation_curve is owned by an earlier group
     bool attached;                               // true = always active when the preceding group is active
+    bool restart_while_running;                  // false = start events are ignored while the animation is on
 } CustomShaderGroup;
 
 typedef struct CustomShaderPipeline {
@@ -929,7 +930,7 @@ update_custom_shader_animations(ShaderAnimEventMask event_mask, monotonic_t now,
                 if (was_on) {
                     turn_off = (cg->animation_end_events && (event_mask & cg->animation_end_events)) || (eff_dur > 0 && now - s->started_at >= eff_dur);
                 }
-                if ((event_mask & cg->animation_start_events) && !hard_stop) turn_on = true;
+                if ((event_mask & cg->animation_start_events) && !hard_stop && (cg->restart_while_running || !was_on)) turn_on = true;
                 // A toggle flips the state the group had before this tick and so
                 // takes precedence over simultaneous start and stop events.
                 if (event_mask & cg->animation_toggle_events) {
@@ -3611,6 +3612,8 @@ transfer_pipeline_to_struct(PyObject *pg, CustomShaderPipeline *p) {
         if (is_seq(astart)) cg->animation_start_events = parse_anim_event_sequence(astart, p);
         PyObject *atoggle = PyDict_GetItemString(g, "animation_toggle");
         if (is_seq(atoggle)) cg->animation_toggle_events = parse_anim_event_sequence(atoggle, p);
+        PyObject *arestart = PyDict_GetItemString(g, "animation_restart");
+        cg->restart_while_running = !(arestart && PyUnicode_Check(arestart) && strcmp(PyUnicode_AsUTF8(arestart), "while-stopped") == 0);
 
         PyObject *acurve = PyDict_GetItemString(g, "animation_curve");
         if (acurve && PyObject_IsTrue(acurve)) {

@@ -339,6 +339,13 @@ Directives inside a group:
     are separated by ``|``. If neither this nor ``animation_toggle`` is
     specified the group runs on every frame unconditionally. See *Animation events* below for the full list.
 
+``animation_restart <always|while-stopped>``
+    What happens when a start event fires while the animation is already
+    running. The default ``always`` restarts the animation from zero.
+    ``while-stopped`` ignores start events until the animation has stopped,
+    which debounces rapid repeat triggers (for example several
+    ``cursor-trail-move`` events within one effect's duration).
+
 ``animation_stop <token>[|<token> …]``
     When to stop the animation. Tokens are separated by ``|`` and may be:
 

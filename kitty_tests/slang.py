@@ -193,7 +193,11 @@ class TestSlang(BaseTest):
         self.ae(group('animation_reverse 200')['animation_reverse'], 200_000_000)
         self.ae(group('')['animation_loops'], 1)
         self.ae(group('animation_reverse yes\nanimation_loops 3')['animation_loops'], 3)
+        self.ae(group('')['animation_restart'], 'always')
+        self.ae(group('animation_restart while-stopped')['animation_restart'], 'while-stopped')
         for bad in (
+            'animation_restart',
+            'animation_restart sometimes',
             'animation_duration -1',
             'animation_duration x',
             'animation_reverse -1',
@@ -231,6 +235,10 @@ class TestSlang(BaseTest):
             progress('animation_start user:t\nanimation_stop user:off\nanimation_duration 40\nanimation_reverse yes', [on] + [none] * 4 + [off, off, on, none]),
             [0, 0.25, 0.5, 0.75, 1, 1, 0.75, 0.5, 0.75],
         )
+        # A start event while running restarts the animation, unless
+        # animation_restart is while-stopped
+        self.ae(progress('animation_start user:t\nanimation_stop 40', [on, none, on, none]), [0, 0.25, 0, 0.25])
+        self.ae(progress('animation_start user:t\nanimation_stop 40\nanimation_restart while-stopped', [on, none, on, none]), [0, 0.25, 0.5, 0.75])
         # The stop duration ending also reverses, with progress having reached one
         self.ae(progress('animation_start user:t\nanimation_stop 40\nanimation_reverse yes', [on] + [none] * 8), [0, 0.25, 0.5, 0.75, 1, 0.75, 0.5, 0.25, None])
         # Loops play the animation forwards and in reverse again after the

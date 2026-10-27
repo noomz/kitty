@@ -1640,6 +1640,7 @@ class Group(TypedDict):
     vars: dict[str, tuple[str, str]]
     animation_start: tuple[str, ...]  # empty = no animation
     animation_toggle: tuple[str, ...]  # events that start the animation if stopped and stop it if running
+    animation_restart: str  # 'always' = a start event while running restarts; 'while-stopped' = start events ignored while running
     animation_curve: EasingFunction  # parsed easing curve
     animation_step: int  # nanoseconds between animation samples
     animation_end_events: tuple[str, ...]  # events that stop the animation
@@ -1695,6 +1696,7 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
             'vars': {},
             'animation_start': (),
             'animation_toggle': (),
+            'animation_restart': 'always',
             'animation_curve': EasingFunction(),
             'animation_step': ANIMATION_SAMPLE_WAIT,
             'animation_end_events': (),
@@ -1749,6 +1751,11 @@ def parse_pipeline_definition(lines: Iterable[str], pipeline_name: str, pipeline
                 case 'animation_toggle':
                     val = ''.join(parts[1:]) if len(parts) > 1 else 'none'
                     current_group['animation_toggle'] = () if val == 'none' else parse_animation_events(val)
+                case 'animation_restart':
+                    val = ''.join(parts[1:]) if len(parts) > 1 else ''
+                    if val not in ('always', 'while-stopped'):
+                        raise ValueError(f'animation_restart must be "always" or "while-stopped", not: {val}')
+                    current_group['animation_restart'] = val
                 case 'animation_curve':
                     if len(parts) < 2:
                         raise ValueError('animation_curve requires a CSS curve name')
