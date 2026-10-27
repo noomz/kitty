@@ -397,6 +397,13 @@ Detailed list of changes
   downloaded only once and images are decoded only once for all such outputs.
   Specifying the same output file twice is now an error (:pull:`10744`)
 
+- Clipboard kitten: Correctly detect duplicate output files when a path contains
+  a symlink followed by ``..``, avoiding overwrites of the same target and
+  erroneous rejection of distinct output files
+
+- Clipboard kitten: Reject duplicate output files that differ only in case on
+  case-insensitive filesystems, preventing one output from overwriting another
+
 - Kittens: When saving files, such as themes, config files or clipboard
   output, write to the target of a symlink even when the target does not yet
   exist, instead of replacing the symlink with a regular file (:pull:`10740`)
@@ -451,6 +458,13 @@ Detailed list of changes
   leak and kitty freezing when opening a new window while another entry in
   :file:`/dev` is stuck (:iss:`10708`, :iss:`10581`, :iss:`10628`,
   :iss:`10673`, :iss:`10741`)
+
+- zsh completion: Respect the user's ``descriptions`` format style for group
+  headings instead of always using bold titles. Fixes literal ``%B`` markers
+  appearing with fzf-tab (:iss:`10748`)
+
+- Do not render between render frames to reduce flicker from programs that draw
+  with many small partial updates (:iss:`10749`)
 
 
 0.49.2 [2026-10-01]
