@@ -63,10 +63,13 @@ action two
         import subprocess
         import tempfile
 
+        from kitty.constants import is_macos
         from kitty.fast_data_types import clear_mime_cache_data, mime_type_aliases, mime_type_for_filename
         from kitty.guess_mime_type import guess_type, mime_types_for_matching
         from kitty.open_actions import KeyAction, actions_for_url
 
+        if is_macos:
+            self.skipTest('mime.cache lookups are not used on macOS')
         if not shutil.which('update-mime-database'):
             self.skipTest('update-mime-database not available')
 
