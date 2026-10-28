@@ -404,6 +404,9 @@ Detailed list of changes
 - Clipboard kitten: Reject duplicate output files that differ only in case on
   case-insensitive filesystems, preventing one output from overwriting another
 
+- choose-fonts kitten: Sort font styles by numeric axis value, fixing the order
+  of styles with negative or closely spaced fractional values
+
 - Kittens: When saving files, such as themes, config files or clipboard
   output, write to the target of a symlink even when the target does not yet
   exist, instead of replacing the symlink with a regular file (:pull:`10740`)
@@ -465,6 +468,12 @@ Detailed list of changes
 
 - Do not render between render frames to reduce flicker from programs that draw
   with many small partial updates (:iss:`10749`)
+
+- Nightly builds now show the date and hash of the commit they were built from
+  in the output of :option:`kitty --version` and :code:`kitten --version`
+
+- macOS: Fix emoji rendered with a monochrome emoji font such as Noto Emoji
+  not using the foreground color (:iss:`10757`)
 
 
 0.49.2 [2026-10-01]
