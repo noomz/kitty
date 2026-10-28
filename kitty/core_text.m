@@ -283,6 +283,12 @@ font_descriptor_from_python(PyObject *src) {
     SET(style, kCTFontStyleNameAttribute);
     SET(postscript_name, kCTFontNameAttribute);
 #undef SET
+    // Pin the font file, otherwise CoreText may pick a different file with the same
+    // PostScript name, such as a static instance installed alongside a variable font
+    if ((t = PyDict_GetItemString(src, "path"))) {
+        RAII_CoreFoundation(CFURLRef, url, CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)PyUnicode_AsUTF8(t), (CFIndex)strlen(PyUnicode_AsUTF8(t)), false));
+        if (url) CFDictionaryAddValue(ans, kCTFontURLAttribute, url);
+    }
     if ((t = PyDict_GetItemString(src, "axis_map"))) {
         RAII_CoreFoundation(
             CFMutableDictionaryRef, axis_map, CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));

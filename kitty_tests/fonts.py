@@ -109,7 +109,12 @@ class Selection(BaseTest):
         t('iosevka fixed', 'Iosevka-Fixed', 'Semibold', reg='', bi='Semibold-Italic', allow_missing_in_ci=True)
         t('iosevka term', 'Iosevka-Term', 'Semibold', reg='', bi='Semibold-Italic', allow_missing_in_ci=True)
         t('fantasque sans mono', 'FantasqueSansMono')
-        t('jetbrains mono', 'JetBrainsMono', 'SemiBold')
+        t(
+            'jetbrains mono',
+            'JetBrainsMono',
+            'SemiBold',
+            alternate=('JetBrainsMono-Regular', 'JetBrainsMono-Regular_SemiBold', 'JetBrainsMono-Italic', 'JetBrainsMono-Italic_SemiBold-Italic'),
+        )
         t('consolas', 'Consolas', reg='', allow_missing_in_ci=True)
         if has('cascadia code'):
             if is_macos:
