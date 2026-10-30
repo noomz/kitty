@@ -233,6 +233,21 @@ Detailed list of changes
 
 - macOS: Add :opt:`macos_transparent_window_shadow` to allow semi-transparent windows to have the native window shadow
 
+- A new option :opt:`hyperlink_target_position` to control where the URL shown
+  by :opt:`show_hyperlink_targets` is displayed, including as a browser style
+  tooltip next to the mouse cursor (:iss:`10770`)
+
+- macOS: Commit in-progress IME or dictation text instead of discarding it when
+  the OS window loses focus, matching native macOS applications
+
+- Fix wide characters being drawn on the wrong row after colliding with
+  scaled text and emoji sequences being split into multiple cells when
+  wrapped onto the next line (:pull:`10767`)
+
+- zsh integration: Fix a "maximum nested function level reached" error at
+  every prompt after interrupting a command run at shell startup, for example
+  via a session file (:iss:`10768`)
+
 - Fix changing text marker colors at runtime, for example with
   :code:`kitten @ set-colors` or automatic dark/light theme switching, applying
   the colors of each marker to the next one, with changes to ``mark3`` having
@@ -388,6 +403,18 @@ Detailed list of changes
   links at the destination instead of overwriting the files they point to, and
   write to a temporary file that is renamed into place, so an interrupted
   transfer no longer leaves a truncated file behind (:pull:`10713`)
+
+- Drag and drop kitten: Reject copying or moving a directory into itself or
+  one of its subdirectories before staging files, preventing recursive
+  copying of the staging directory (:pull:`10769`)
+
+- Drag and drop kitten: Respect overwrite confirmation for case and Unicode
+  equivalent file and directory names on filesystems that treat them as
+  aliases. Also list the existing files that will be overwritten under their
+  actual names, including files inside symlinked directories, and fix dropping
+  a directory over an existing file. Also no longer rename remotely dropped
+  files whose names differ only in case on case sensitive filesystems
+  (:pull:`10772`)
 
 - Clipboard kitten: Fix a race when replacing an existing output file and
   losing the original file if writing it fails. Also preserve the permissions

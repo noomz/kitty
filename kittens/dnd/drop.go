@@ -14,8 +14,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/emmansun/base64"
+	"golang.org/x/sys/unix"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/kovidgoyal/go-parallel"
 	"github.com/kovidgoyal/kitty/tools/utils"
@@ -113,25 +116,41 @@ type remote_dir_entry struct {
 
 const case_conflict_template = "case-conflict-%d-%s"
 
+// The key under which a case and normalization insensitive filesystem
+// stores name, so that names that would alias each other compare equal.
+func filesystem_name_key(name string) string {
+	return strings.ToLower(norm.NFC.String(name))
+}
+
 func uniqify_child_names(names []string, is_case_sensitive_filesystem bool) []string {
 	if !is_case_sensitive_filesystem {
 		seen := utils.NewSet[string](len(names))
 		for i, x := range names {
-			name := x
-			key := strings.ToLower(name)
-			for q := 0; seen.Has(key); q++ {
-				name = fmt.Sprintf(case_conflict_template, q+1, x)
-				key = strings.ToLower(name)
-			}
-			seen.Add(key)
-			names[i] = name
+			names[i] = uniqify_name(x, seen)
 		}
 	}
 	return names
 }
 
+func uniqify_name(name string, seen *utils.Set[string]) string {
+	ans := name
+	key := filesystem_name_key(ans)
+	for q := 0; seen.Has(key); q++ {
+		ans = fmt.Sprintf(case_conflict_template, q+1, name)
+		key = filesystem_name_key(ans)
+	}
+	seen.Add(key)
+	return ans
+}
+
 func do_local_copy(ctx context.Context, dest_dir *os.File, uri_list []string, action int, copy_mode string) (err error) {
 	disallow_hardlinks := action == copy_on_drop && copy_mode == "independent"
+	// Never copy the staging directory into itself, even if it is reachable
+	// from a source by a route the up-front check cannot see, such as a bind mount.
+	staging_info, err := dest_dir.Stat()
+	if err != nil {
+		return err
+	}
 	var src_file *os.File
 	defer func() {
 		if src_file != nil {
@@ -179,7 +198,10 @@ func do_local_copy(ctx context.Context, dest_dir *os.File, uri_list []string, ac
 			err = utils.CopyFolderContents(ctx, src_file, d, utils.CopyFolderOptions{
 				Disallow_hardlinks: disallow_hardlinks,
 				Filter_files: func(parent *os.File, child os.FileInfo) bool {
-					return child.IsDir() || child.Mode().IsRegular() || child.Mode()&fs.ModeSymlink != 0
+					if child.IsDir() {
+						return !os.SameFile(child, staging_info)
+					}
+					return child.Mode().IsRegular() || child.Mode()&fs.ModeSymlink != 0
 				},
 			})
 			d.Close()
@@ -232,52 +254,117 @@ func do_local_copy_in_goroutine(ctx context.Context, dest_dir *os.File, completi
 	err = do_local_copy(ctx, dest_dir, uri_list, action, copy_mode)
 }
 
-type path_stack struct {
+type path_stack[T any] struct {
 	s list.List
 }
 
-func (p *path_stack) push(x string) { p.s.PushBack(x) }
-func (p *path_stack) pop() string   { return p.s.Remove(p.s.Front()).(string) }
-func (p *path_stack) empty() bool   { return p.s.Front() == nil }
+func (p *path_stack[T]) push(x T)    { p.s.PushBack(x) }
+func (p *path_stack[T]) pop() T      { return p.s.Remove(p.s.Front()).(T) }
+func (p *path_stack[T]) empty() bool { return p.s.Front() == nil }
 
-// Return a list of relative paths for all entries in the tree rooted at
-// src_dir that also exist in the tree rooted at dest_dir, except for
-// directories that exist in both places.
+// Return whether name in dir is a directory or a symlink to one. Both
+// find_overwrites and rename_contents merge into such entries.
+func is_dir_at(dir *os.File, name string) (bool, error) {
+	st, err := utils.StatAt(dir, name)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil // dangling symlink
+		}
+		return false, err
+	}
+	return st.IsDir(), nil
+}
+
+// Return the name under which the entry described by info, which was looked
+// up as name, is actually stored in dir, whose entries are dest_entries.
+// These differ when the filesystem resolves case or Unicode normalization
+// aliases.
+func stored_name(dir *os.File, dest_entries []os.DirEntry, name string, info os.FileInfo) (string, error) {
+	for _, e := range dest_entries {
+		if e.Name() == name {
+			return name, nil
+		}
+	}
+	for _, e := range dest_entries {
+		einfo, err := utils.LstatAt(dir, e.Name())
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return "", err
+		}
+		if same, err := same_file(einfo, info); err != nil {
+			return "", err
+		} else if same {
+			return e.Name(), nil
+		}
+	}
+	return name, nil
+}
+
+type overwrite_dir struct{ src, dest string }
+
+// Return a list of relative paths, as stored in dest_dir, for all entries in
+// the tree rooted at src_dir that also exist in the tree rooted at dest_dir,
+// except for directories that exist in both places. Symlinks to directories
+// in dest_dir are treated as directories, matching rename_contents.
 func find_overwrites(src_dir *os.File, dest_dir *os.File) (ans []string, err error) {
-	stack := path_stack{}
-	stack.push(".")
+	stack := path_stack[overwrite_dir]{}
+	stack.push(overwrite_dir{".", "."})
+	join := func(parent, name string) string {
+		return utils.IfElse(parent == ".", name, filepath.Join(parent, name))
+	}
 	for !stack.empty() {
 		relpath := stack.pop()
 		if err = func() (err error) {
-			sd, err := utils.OpenDirAt(src_dir, relpath)
+			sd, err := utils.OpenDirAt(src_dir, relpath.src)
 			if err != nil {
 				return err
 			}
 			defer sd.Close()
-			dd, err := utils.OpenDirAt(dest_dir, relpath)
+			dd, err := utils.OpenDirAt(dest_dir, relpath.dest)
 			if err != nil {
 				return err
 			}
 			defer dd.Close()
-			dest_children, err := dd.ReadDir(0)
 			src_children, err := sd.ReadDir(0)
 			if err != nil {
 				return err
 			}
-			dest_map := make(map[string]os.DirEntry)
-			for _, x := range dest_children {
-				dest_map[x.Name()] = x
-			}
+			var dest_entries []os.DirEntry
 			for _, x := range src_children {
-				if d, found := dest_map[x.Name()]; found {
-					crelpath := utils.IfElse(relpath == ".", x.Name(), filepath.Join(relpath, x.Name()))
-					if !d.IsDir() || !x.IsDir() {
-						ans = append(ans, crelpath)
-					} else {
-						stack.push(crelpath)
-					}
-				} else {
+				// Let the destination filesystem resolve case and Unicode aliases,
+				// just as it does when renaming the staged entries into place.
+				// Any error here other than the entry not existing would also
+				// make renaming the staged entry into place fail.
+				d, err := utils.LstatAt(dd, x.Name())
+				if errors.Is(err, fs.ErrNotExist) {
 					continue
+				} else if err != nil {
+					return err
+				}
+				if dest_entries == nil {
+					if dest_entries, err = dd.ReadDir(0); err != nil {
+						return err
+					}
+				}
+				name, err := stored_name(dd, dest_entries, x.Name(), d)
+				if err != nil {
+					return err
+				}
+				dest_is_dir := d.IsDir()
+				if !dest_is_dir && d.Mode()&fs.ModeSymlink != 0 {
+					if dest_is_dir, err = is_dir_at(dd, x.Name()); err != nil {
+						return err
+					}
+				}
+				switch {
+				case x.IsDir() && dest_is_dir:
+					stack.push(overwrite_dir{join(relpath.src, x.Name()), join(relpath.dest, name)})
+				case dest_is_dir:
+					return fmt.Errorf("cannot replace the existing directory %s with a dropped file", join(relpath.dest, name))
+				default:
+					ans = append(ans, join(relpath.dest, name))
 				}
 			}
 			return
@@ -289,9 +376,11 @@ func find_overwrites(src_dir *os.File, dest_dir *os.File) (ans []string, err err
 }
 
 // Rename the contents of src_dir into dest_dir, handling the case of
-// directories already existing in dest_dir transparently.
+// directories already existing in dest_dir transparently. Existing
+// directories and symlinks to directories are merged into, other existing
+// entries are replaced.
 func rename_contents(src_dir *os.File, dest_dir *os.File) (err error) {
-	stack := path_stack{}
+	stack := path_stack[string]{}
 	stack.push(".")
 	for !stack.empty() {
 		relpath := stack.pop()
@@ -317,12 +406,34 @@ func rename_contents(src_dir *os.File, dest_dir *os.File) (err error) {
 				for _, child := range src_children {
 					crelpath := utils.IfElse(relpath == ".", child.Name(), filepath.Join(relpath, child.Name()))
 					rerr := utils.RenameAt(sd, child.Name(), dd, child.Name())
-					if rerr != nil {
-						if child.IsDir() {
-							stack.push(crelpath)
-						} else {
+					if rerr == nil {
+						continue
+					}
+					if _, err := utils.LstatAt(dd, child.Name()); err != nil {
+						if errors.Is(err, fs.ErrNotExist) {
 							return rerr
 						}
+						return err
+					}
+					dest_is_dir, err := is_dir_at(dd, child.Name())
+					if err != nil {
+						return err
+					}
+					switch {
+					case child.IsDir() && dest_is_dir:
+						stack.push(crelpath)
+					case dest_is_dir:
+						return fmt.Errorf("cannot replace the existing directory %s with a dropped file: %w", filepath.Join(dest_dir.Name(), crelpath), rerr)
+					case child.IsDir():
+						// rename() cannot replace a non-directory with a directory
+						if err := utils.UnlinkAt(dd, child.Name()); err != nil {
+							return err
+						}
+						if err := utils.RenameAt(sd, child.Name(), dd, child.Name()); err != nil {
+							return err
+						}
+					default:
+						return rerr
 					}
 				}
 			}
@@ -543,8 +654,8 @@ func (root *remote_dir_entry) close_tree() {
 
 func (dnd *dnd) end_drop(success bool) {
 	if dnd.drop_status.reading_data {
-		dnd.lp.QueueDnDData(DC{
-			Type: 'r', Operation: utils.IfElse(success, dnd.drop_status.action, 0)}) // end drop
+		// Remove the sources of a move before signalling the end of the drop,
+		// so that the drop is complete when the terminal is told it has finished
 		if success && dnd.drop_status.action == move_on_drop && !dnd.drop_status.is_remote_client {
 			for _, u := range dnd.drop_status.uri_list {
 				if u.kind != parsed_uri_file || u.path == "" {
@@ -561,6 +672,8 @@ func (dnd *dnd) end_drop(success bool) {
 				}
 			}
 		}
+		dnd.lp.QueueDnDData(DC{
+			Type: 'r', Operation: utils.IfElse(success, dnd.drop_status.action, 0)}) // end drop
 	}
 	dnd.reset_drop()
 	if success && dnd.has_exit_on("drop-finish") {
@@ -645,6 +758,54 @@ func (dnd *dnd) new_tdir() (dir_file *os.File, err error) {
 	return utils.CreateDirAt(dnd.base_tempdir, name, 0o700)
 }
 
+// Identify a file by device and inode. Unlike os.SameFile this also works
+// with the os.FileInfo objects returned by utils.StatAt.
+func file_identity(info os.FileInfo) (dev, ino uint64, err error) {
+	switch s := info.Sys().(type) {
+	case *syscall.Stat_t:
+		return uint64(s.Dev), uint64(s.Ino), nil
+	case *unix.Stat_t:
+		return uint64(s.Dev), uint64(s.Ino), nil
+	}
+	return 0, 0, fmt.Errorf("unknown stat result type for %s: %T", info.Name(), info.Sys())
+}
+
+func same_file(a, b os.FileInfo) (bool, error) {
+	adev, aino, err := file_identity(a)
+	if err != nil {
+		return false, err
+	}
+	bdev, bino, err := file_identity(b)
+	if err != nil {
+		return false, err
+	}
+	return adev == bdev && aino == bino, nil
+}
+
+// Walk up from dest_dir via .. relative to its file descriptor rather than
+// its path, so that the result is correct even if dest_dir has been moved or
+// its path contains symlinks. Comparing identities handles case aliases and
+// stat only requires search permission on the ancestors.
+func destination_is_within_source(source_info os.FileInfo, dest_dir *os.File) (bool, error) {
+	info, err := dest_dir.Stat()
+	if err != nil {
+		return false, err
+	}
+	for rel := ".."; ; rel = filepath.Join(rel, "..") {
+		if same, err := same_file(source_info, info); err != nil || same {
+			return same, err
+		}
+		parent, err := utils.StatAt(dest_dir, rel)
+		if err != nil {
+			return false, err
+		}
+		if at_root, err := same_file(parent, info); err != nil || at_root {
+			return false, err
+		}
+		info = parent
+	}
+}
+
 func (dnd *dnd) all_mime_data_dropped() (err error) {
 	drop_status := &dnd.drop_status
 	if len(drop_status.uri_list) == 0 {
@@ -652,7 +813,7 @@ func (dnd *dnd) all_mime_data_dropped() (err error) {
 		dnd.end_drop(true)
 		return dnd.render_screen()
 	}
-	if !drop_status.is_remote_client && drop_status.action == move_on_drop {
+	if !drop_status.is_remote_client {
 		dest_info, err := dnd.drop_output_dir.Stat()
 		if err != nil {
 			return err
@@ -661,14 +822,27 @@ func (dnd *dnd) all_mime_data_dropped() (err error) {
 			if u.kind != parsed_uri_file || u.path == "" {
 				continue
 			}
+			source_info, err := os.Lstat(u.path)
+			if err != nil {
+				return err
+			}
+			if source_info.IsDir() {
+				inside, err := destination_is_within_source(source_info, dnd.drop_output_dir)
+				if err != nil {
+					return err
+				}
+				if inside {
+					return fmt.Errorf("cannot drop directory %q into itself or one of its subdirectories", u.path)
+				}
+			}
+			if drop_status.action != move_on_drop {
+				continue
+			}
 			parent_info, err := os.Stat(filepath.Dir(u.path))
 			if err != nil {
 				return err
 			}
 			if os.SameFile(parent_info, dest_info) {
-				if _, err := os.Lstat(u.path); err != nil {
-					return err
-				}
 				// Moving into the source directory is a no-op. Exclude it
 				// from both staging and end_drop's source cleanup.
 				drop_status.uri_list[i].path = ""
@@ -705,12 +879,7 @@ func (dnd *dnd) all_mime_data_dropped() (err error) {
 			} else {
 				name := filepath.Base(u.path)
 				if !dnd.is_case_sensitive_filesystem {
-					key := strings.ToLower(name)
-					for q := 0; seen.Has(key); q++ {
-						name = fmt.Sprintf(case_conflict_template, q+1, filepath.Base(u.path))
-						key = strings.ToLower(name)
-					}
-					seen.Add(key)
+					name = uniqify_name(name, seen)
 				}
 				c = &remote_dir_entry{base_dir: dnd.drop_status.dropping_to.newref(), name: name}
 				dnd.queue_data_request(DC{Type: 'r', X: idx + 1, Y: i + 1})

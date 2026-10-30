@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,6 +109,13 @@ func TestLocalCopyHardlinkPolicy(t *testing.T) {
 
 func runLocalDrop(t *testing.T, dest string, uris []parsed_uri, action int, copy_mode string) (*dnd, error) {
 	t.Helper()
+	return runLocalDropAfter(t, dest, uris, action, copy_mode, nil)
+}
+
+// Like runLocalDrop but calls before_drop, if not nil, after the kitten has
+// opened dest and before the drop is processed.
+func runLocalDropAfter(t *testing.T, dest string, uris []parsed_uri, action int, copy_mode string, before_drop func()) (*dnd, error) {
+	t.Helper()
 	lp, err := loop.New()
 	if err != nil {
 		t.Fatal(err)
@@ -121,6 +129,9 @@ func runLocalDrop(t *testing.T, dest string, uris []parsed_uri, action int, copy
 		d.remove_tdir()
 		d.drop_output_dir.Close()
 	})
+	if before_drop != nil {
+		before_drop()
+	}
 	d.drop_status = drop_status{action: action, reading_data: true, uri_list: uris}
 	if err := d.all_mime_data_dropped(); err != nil {
 		return d, err
@@ -258,6 +269,211 @@ func TestLocalMoveMissingSource(t *testing.T) {
 	uris := []parsed_uri{{kind: parsed_uri_file, path: filepath.Join(dest, "missing")}}
 	if _, err := runLocalDrop(t, dest, uris, move_on_drop, "auto"); !os.IsNotExist(err) {
 		t.Fatalf("got %v, want a missing source error", err)
+	}
+}
+
+var action_names = map[int]string{copy_on_drop: "copy", move_on_drop: "move"}
+
+func TestLocalDropIntoSourceDirectory(t *testing.T) {
+	for _, action := range []int{copy_on_drop, move_on_drop} {
+		for _, copy_mode := range []string{"auto", "independent"} {
+			for _, location := range []string{"self", "descendant"} {
+				for _, alias := range []string{"none", "source-parent", "destination", "case"} {
+					t.Run(fmt.Sprintf("%s/%s/%s/%s", action_names[action], copy_mode, location, alias), func(t *testing.T) {
+						root := t.TempDir()
+						source := filepath.Join(root, "source")
+						files := map[string]string{"data.txt": "source data", "child/nested/keep.txt": "destination data"}
+						buildTree(t, source, files, nil)
+						dest := source
+						if location == "descendant" {
+							dest = filepath.Join(source, "child", "nested")
+						}
+						source_path, dest_path := source, dest
+						switch alias {
+						case "source-parent", "destination":
+							path := filepath.Join(t.TempDir(), "alias")
+							target := root
+							if alias == "destination" {
+								target = dest
+							}
+							if err := os.Symlink(target, path); err != nil {
+								t.Fatal(err)
+							}
+							if alias == "source-parent" {
+								source_path = filepath.Join(path, "source")
+							} else {
+								dest_path = path
+							}
+						case "case":
+							source_path = filepath.Join(root, "SOURCE")
+							if _, err := os.Stat(source_path); os.IsNotExist(err) {
+								t.Skip("case-sensitive filesystem")
+							} else if err != nil {
+								t.Fatal(err)
+							}
+						}
+						incoming := filepath.Join(root, "incoming.txt")
+						if err := os.WriteFile(incoming, []byte("incoming data"), 0644); err != nil {
+							t.Fatal(err)
+						}
+						uris := []parsed_uri{
+							{kind: parsed_uri_file, path: incoming},
+							{kind: parsed_uri_data, mime: "text/plain", data: []byte("data URI")},
+							{kind: parsed_uri_file, path: source_path},
+						}
+						d, err := runLocalDrop(t, dest_path, uris, action, copy_mode)
+						if err == nil {
+							t.Fatal("dropping a directory into itself must fail")
+						}
+						if d.tdir_counter != 0 || d.drop_status.dropping_to != nil {
+							t.Errorf("invalid drop started staging before failing: %v", err)
+						}
+						for path, want := range files {
+							if data, err := os.ReadFile(filepath.Join(source, path)); err != nil || string(data) != want {
+								t.Errorf("source %s changed: %q, %v", path, data, err)
+							}
+						}
+						if data, err := os.ReadFile(incoming); err != nil || string(data) != "incoming data" {
+							t.Errorf("incoming file changed: %q, %v", data, err)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestLocalDropOutsideSourceDirectory(t *testing.T) {
+	for _, action := range []int{copy_on_drop, move_on_drop} {
+		for _, copy_mode := range []string{"auto", "independent"} {
+			for _, location := range []string{"sibling", "symlink", "search-only-parent"} {
+				t.Run(fmt.Sprintf("%s/%s/%s", action_names[action], copy_mode, location), func(t *testing.T) {
+					root := t.TempDir()
+					source := filepath.Join(root, "source")
+					buildTree(t, source, map[string]string{"data.txt": "source data", "child/keep.txt": "destination data"}, nil)
+					path, dest := source, filepath.Join(root, "source-sibling")
+					if location == "symlink" {
+						path, dest = filepath.Join(root, "link"), filepath.Join(source, "child")
+						if err := os.Symlink(source, path); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						if location == "search-only-parent" {
+							dest = filepath.Join(root, "search-only", "dest")
+						}
+						if err := os.MkdirAll(dest, 0755); err != nil {
+							t.Fatal(err)
+						}
+						if location == "search-only-parent" {
+							parent := filepath.Dir(dest)
+							t.Cleanup(func() {
+								if err := os.Chmod(parent, 0755); err != nil {
+									t.Error(err)
+								}
+							})
+							if err := os.Chmod(parent, 0111); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					d, err := runLocalDrop(t, dest, []parsed_uri{{kind: parsed_uri_file, path: path}}, action, copy_mode)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if d.num_dropped_files != 1 {
+						t.Errorf("got %d dropped files, want 1", d.num_dropped_files)
+					}
+					if location == "symlink" {
+						if target, err := os.Readlink(filepath.Join(dest, "link")); err != nil || target != source {
+							t.Errorf("copied symlink: %q, %v", target, err)
+						}
+					} else if data, err := os.ReadFile(filepath.Join(dest, "source", "data.txt")); err != nil || string(data) != "source data" {
+						t.Errorf("copied data: %q, %v", data, err)
+					}
+					if action == move_on_drop {
+						if _, err := os.Lstat(path); !os.IsNotExist(err) {
+							t.Errorf("moved source still exists: %v", err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestLocalDropIntoMovedDestination(t *testing.T) {
+	for _, action := range []int{copy_on_drop, move_on_drop} {
+		for _, location := range []string{"outside", "inside"} {
+			t.Run(action_names[action]+"/"+location, func(t *testing.T) {
+				root := t.TempDir()
+				source := filepath.Join(root, "source")
+				buildTree(t, source, map[string]string{"data.txt": "source data", "child/keep.txt": "keep"}, nil)
+				dest, moved_to := filepath.Join(root, "dest"), filepath.Join(root, "moved")
+				if location == "inside" {
+					dest, moved_to = filepath.Join(root, "dest"), filepath.Join(source, "child", "moved")
+				}
+				if err := os.Mkdir(dest, 0755); err != nil {
+					t.Fatal(err)
+				}
+				// Replace the original path so that a path based check would
+				// look at the wrong directory.
+				d, err := runLocalDropAfter(t, dest, []parsed_uri{{kind: parsed_uri_file, path: source}}, action, "auto", func() {
+					if err := os.Rename(dest, moved_to); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(dest, 0755); err != nil {
+						t.Fatal(err)
+					}
+				})
+				if location == "inside" {
+					if err == nil {
+						t.Fatal("dropping a directory into a destination moved inside it must fail")
+					}
+					if d.tdir_counter != 0 {
+						t.Errorf("invalid drop started staging before failing: %v", err)
+					}
+					if data, err := os.ReadFile(filepath.Join(source, "data.txt")); err != nil || string(data) != "source data" {
+						t.Errorf("source changed: %q, %v", data, err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if data, err := os.ReadFile(filepath.Join(moved_to, "source", "data.txt")); err != nil || string(data) != "source data" {
+					t.Errorf("copied data: %q, %v", data, err)
+				}
+			})
+		}
+	}
+}
+
+func TestLocalCopySkipsStagingDirectory(t *testing.T) {
+	// Simulate a route to the staging directory that the up-front check
+	// cannot detect, such as a bind mount, by bypassing that check.
+	for _, action := range []int{copy_on_drop, move_on_drop} {
+		t.Run(action_names[action], func(t *testing.T) {
+			source := filepath.Join(t.TempDir(), "source")
+			buildTree(t, source, map[string]string{"data.txt": "source data"}, nil)
+			staging_path := filepath.Join(source, "staging")
+			if err := os.Mkdir(staging_path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			staging, err := os.Open(staging_path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer staging.Close()
+			if err := do_local_copy(context.Background(), staging, []string{source}, action, "auto"); err != nil {
+				t.Fatal(err)
+			}
+			if data, err := os.ReadFile(filepath.Join(staging_path, "source", "data.txt")); err != nil || string(data) != "source data" {
+				t.Errorf("copied data: %q, %v", data, err)
+			}
+			if _, err := os.Lstat(filepath.Join(staging_path, "source", "staging")); !os.IsNotExist(err) {
+				t.Errorf("staging directory was copied into itself: %v", err)
+			}
+		})
 	}
 }
 
@@ -451,6 +667,48 @@ func TestFindOverwrites_FileOverlap(t *testing.T) {
 	}
 }
 
+func TestFindOverwritesFilesystemAliases(t *testing.T) {
+	for _, tc := range []struct{ name, src, dest string }{
+		{"case", "report.txt", "Report.txt"},
+		{"unicode", "cafe\u0301.txt", "caf\u00e9.txt"},
+		{"directory", "folder/file.txt", "Folder/file.txt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src, dest := t.TempDir(), t.TempDir()
+			buildTree(t, src, map[string]string{tc.src: "incoming"}, nil)
+			buildTree(t, dest, map[string]string{tc.dest: "original"}, nil)
+			alias, err := os.Stat(filepath.Join(dest, tc.src))
+			if os.IsNotExist(err) {
+				t.Skip("destination filesystem does not alias these names")
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			original, err := os.Stat(filepath.Join(dest, tc.dest))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(alias, original) {
+				t.Fatal("names do not refer to the same destination file")
+			}
+			got, err := find_overwrites(openDir(t, src), openDir(t, dest))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The existing entry is reported under the name it is stored as,
+			// which some filesystems normalize.
+			entries, err := os.ReadDir(dest)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("unexpected destination contents: %v %v", entries, err)
+			}
+			_, rest, _ := strings.Cut(tc.dest, "/")
+			want := filepath.Join(entries[0].Name(), rest)
+			if len(got) != 1 || got[0] != want {
+				t.Errorf("got overwrites %q, want [%q]", got, want)
+			}
+		})
+	}
+}
+
 // TestFindOverwrites_DirsNotReported verifies that matching *directories* in
 // both trees are not reported as overwrites — only non-directory conflicts are.
 func TestFindOverwrites_DirsNotReported(t *testing.T) {
@@ -583,7 +841,96 @@ func TestFindOverwrites_DirVsFile(t *testing.T) {
 	}
 }
 
+// TestFindOverwrites_FileVsDir verifies that a dropped file that would
+// replace an existing directory is an error up front, as rename_contents
+// cannot replace a directory with a file.
+func TestFindOverwrites_FileVsDir(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	buildTree(t, src, map[string]string{"conflict": "file"}, nil)
+	buildTree(t, dst, map[string]string{"conflict/x.txt": "x"}, nil)
+	if got, err := find_overwrites(openDir(t, src), openDir(t, dst)); err == nil {
+		t.Fatalf("expected an error, got overwrites %v", got)
+	}
+}
+
+// TestSymlinkToDirInDestIsMerged verifies that a symlink to a directory in
+// the destination is merged into by rename_contents and that find_overwrites
+// reports the files in the symlink target that will be overwritten.
+func TestSymlinkToDirInDestIsMerged(t *testing.T) {
+	tmp := t.TempDir()
+	src, dst, target := filepath.Join(tmp, "src"), filepath.Join(tmp, "dst"), filepath.Join(tmp, "target")
+	buildTree(t, src, map[string]string{"folder/file.txt": "new", "folder/new.txt": "new"}, nil)
+	buildTree(t, target, map[string]string{"file.txt": "old", "other.txt": "old"}, nil)
+	buildTree(t, dst, nil, map[string]string{"folder": target})
+	srcDir, dstDir := openDir(t, src), openDir(t, dst)
+
+	got, err := find_overwrites(srcDir, dstDir)
+	if err != nil {
+		t.Fatalf("find_overwrites: %v", err)
+	}
+	if want := []string{filepath.Join("folder", "file.txt")}; !equalStringSlices(got, want) {
+		t.Errorf("find_overwrites: got %v, want %v", got, want)
+	}
+	if err := rename_contents(srcDir, dstDir); err != nil {
+		t.Fatalf("rename_contents: %v", err)
+	}
+	if st, err := os.Lstat(filepath.Join(dst, "folder")); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("dst/folder is no longer a symlink: %v %v", st, err)
+	}
+	for name, want := range map[string]string{"file.txt": "new", "new.txt": "new", "other.txt": "old"} {
+		if data, err := os.ReadFile(filepath.Join(target, name)); err != nil || string(data) != want {
+			t.Errorf("target/%s: got %q %v, want %q", name, data, err, want)
+		}
+	}
+}
+
 // --- rename_contents tests ---
+
+// TestRenameContents_DirReplacesNonDir verifies that a dropped directory
+// replaces an existing file or dangling symlink of the same name.
+func TestRenameContents_DirReplacesNonDir(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		files, symlinks map[string]string
+	}{
+		{"file", map[string]string{"conflict": "file"}, nil},
+		{"dangling symlink", nil, map[string]string{"conflict": "nonexistent"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src, dst := t.TempDir(), t.TempDir()
+			buildTree(t, src, map[string]string{"conflict/a.txt": "a"}, nil)
+			buildTree(t, dst, tc.files, tc.symlinks)
+			if err := rename_contents(openDir(t, src), openDir(t, dst)); err != nil {
+				t.Fatalf("rename_contents: %v", err)
+			}
+			if data, err := os.ReadFile(filepath.Join(dst, "conflict", "a.txt")); err != nil || string(data) != "a" {
+				t.Errorf("dst/conflict/a.txt: got %q %v", data, err)
+			}
+		})
+	}
+}
+
+// TestRenameContents_FileVsDir verifies that replacing an existing directory
+// with a file fails and leaves the directory intact.
+func TestRenameContents_FileVsDir(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	buildTree(t, src, map[string]string{"conflict": "file"}, nil)
+	buildTree(t, dst, map[string]string{"conflict/x.txt": "x"}, nil)
+	if err := rename_contents(openDir(t, src), openDir(t, dst)); err == nil {
+		t.Fatal("expected an error")
+	}
+	if _, err := os.Stat(filepath.Join(dst, "conflict", "x.txt")); err != nil {
+		t.Errorf("dst/conflict/x.txt missing: %v", err)
+	}
+}
+
+func TestUniqifyChildNamesNormalization(t *testing.T) {
+	got := uniqify_child_names([]string{"caf\u00e9.txt", "Cafe\u0301.txt", "other"}, false)
+	want := []string{"caf\u00e9.txt", fmt.Sprintf(case_conflict_template, 1, "Cafe\u0301.txt"), "other"}
+	if !equalStringSlices(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
 
 // TestRenameContents_SimpleFiles verifies that plain files are moved from src
 // to dst.
@@ -774,4 +1121,34 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestSetupBaseDirDetectsNameAliases verifies that setup_base_dir detects
+// whether the filesystem treats names differing in case or Unicode
+// normalization as aliases and leaves no probe files behind.
+func TestSetupBaseDirDetectsNameAliases(t *testing.T) {
+	dest := t.TempDir()
+	buildTree(t, dest, map[string]string{"Probe": "", "é": ""}, nil)
+	_, cerr := os.Lstat(filepath.Join(dest, "probe"))
+	_, nerr := os.Lstat(filepath.Join(dest, "é"))
+	want := os.IsNotExist(cerr) && os.IsNotExist(nerr)
+	for _, name := range []string{"Probe", "é"} {
+		if err := os.Remove(filepath.Join(dest, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d, err := runLocalDrop(t, dest, nil, copy_on_drop, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.is_case_sensitive_filesystem != want {
+		t.Errorf("is_case_sensitive_filesystem: got %v, want %v", d.is_case_sensitive_filesystem, want)
+	}
+	entries, err := os.ReadDir(d.base_tempdir.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("probe files left in the base temporary directory: %v", entries)
+	}
 }
