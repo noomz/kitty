@@ -9,34 +9,25 @@ To update |kitty|, :doc:`follow the instructions <binary>`.
 Recent major new features
 ---------------------------
 
-Choose an edge when resizing [unreleased]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Docked windows [0.50]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The resize page now offers two strategies: Window retains the usual
-width/height controls, while Edge lets you choose an internal pane edge in
-the Splits layout and move its divider in a physical direction.
+kitty windows can now be :ref:`docked <docks>` to an edge of another window or
+of the tab. Docked windows are placed outside the layout, making them perfect
+for status bars, file trees or a shell kept next to your editor. A dock
+attached to a window follows it around, moving with it to other tabs and closing
+when it closes. Create docks with :code:`launch --type=window-dock` or
+:code:`launch --type=tab-dock`. Docks are saved in :doc:`sessions <sessions>` too.
 
-.. figure:: screenshots/resize-edge-select.png
-    :alt: Resize mode showing a middle pane's selectable left and right edges
-    :align: center
-    :width: 100%
+Restore after logout [0.50]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-    Press H to select the middle pane's left edge. Gray edges are outside
-    the layout and cannot be selected.
-
-.. figure:: screenshots/resize-edge-move.png
-    :alt: The selected left divider moved left while the right divider stays in place
-    :align: center
-    :width: 100%
-
-    After selecting H, Alt+H moves the left divider by one third of the
-    remaining resize steps. The right divider stays in place.
-
-Switch strategies with 1/2 inside the page. Each strategy remembers its own
-Alt/Shift modifier and fraction, configurable with M and F. A sole internal
-edge is selected automatically. In Splits, either strategy uses R to restore
-the proportions saved when resize mode opened. See :ref:`window_resizing` for
-the controls and configuration options.
+Like other applications, kitty can now save its state when you log out, restart or
+shut down your computer, and restore it the next time it starts. Simply set
+:opt:`restore_session_after_logout` and every kitty instance comes back with all
+its OS Windows, tabs and windows in place, including their scrollback. On
+macOS, the saved state is encrypted using a key stored in your keychain. See
+:ref:`restore_after_logout` for details.
 
 Custom shaders [0.49]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -228,7 +219,14 @@ you use a decent Wayland compositor.
 Detailed list of changes
 -------------------------------------
 
-0.50.0 [future]
+0.50.1 [unreleased]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- :doc:`choose-files <kittens/choose-files>`: Fix concurrent custom preview
+  commands occasionally receiving the path of a different file.
+
+
+0.50.0 [2026-11-03]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - macOS: Add :opt:`macos_transparent_window_shadow` to allow semi-transparent windows to have the native window shadow
@@ -249,12 +247,6 @@ Detailed list of changes
   alphabetical order and new options for `kitten @ detach-window` and the
   :ac:`detach_window` action to send windows to a named tab, creating it if
   needed (:iss:`10627`)
-
-- Support the `Program Status Protocol (OSC 7501)
-  <https://www.superlogical.com/rex/docs/build/program-status>`__ that lets
-  programs report whether they are working, finished, failed or blocked waiting
-  on the user. Shown in the tab bar via a new :code:`tab.program_status` field
-  for :opt:`tab_title_template`, see :ref:`program_status`
 
 - Wayland: The client side window decorations used on compositors such as
   GNOME now look like native GNOME decorations and follow the desktop titlebar
@@ -284,6 +276,12 @@ Detailed list of changes
   clients to detect support for individual protocol features, such as
   animation and Unicode placeholders, via the new ``e`` query key, see
   :ref:`graphics_query_features` (:iss:`9379`, :iss:`10732`)
+
+- Support the `Program Status Protocol (OSC 7501)
+  <https://www.superlogical.com/rex/docs/build/program-status>`__ that lets
+  programs report whether they are working, finished, failed or blocked waiting
+  on the user. Shown in the tab bar via a new :code:`tab.program_status` field
+  for :opt:`tab_title_template`, see :ref:`program_status`
 
 - :ref:`Automatic color themes <auto_color_scheme>`: When the system switches
   between light and dark, keep colors set by programs running in a window, by
@@ -413,6 +411,9 @@ Detailed list of changes
   early. :ac:`detach_tab` now shows custom titles in the OS Window chooser
   (:pull:`10640`)
 
+- Fix render jitter when scrolled back with a partial line and the client is
+  using the synchronised rendering escape code (:iss:`10794`)
+
 - Fix bold or italic Nerd Font icons sometimes being rendered using glyphs
   from an unrelated font, the cursor trail not always being shown when focus
   moves to a different window, :opt:`watcher` entries not being removed on
@@ -498,9 +499,10 @@ Detailed list of changes
 - macOS: Fix padding rendering black after sleep, OS windows not staying on all
   spaces, a duplicate path when dropping items from Apple Mail, emoji from a
   monochrome emoji font such as Noto Emoji not using the foreground color, a
-  memory leak and kitty freezing when opening a new window while another entry
+  memory leak, reloading config causing Apple injected shortcuts to not work
+  and kitty freezing when opening a new window while another entry
   in :file:`/dev` is stuck (:iss:`10708`, :iss:`10581`, :iss:`10628`,
-  :iss:`10673`, :iss:`10741`, :iss:`10757`)
+  :iss:`10673`, :iss:`10741`, :iss:`10757`, :iss:`10793`)
 
 - zsh: Respect the user's ``descriptions`` format style for completion group
   headings, fixing literal ``%B`` markers appearing with fzf-tab, and fix a
