@@ -125,6 +125,12 @@ Detailed list of changes
 0.50.1 [unreleased]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- Vertical tab bar: Fix clicking the blank line below a tab not activating the tab (:iss:`10810`)
+
+- :doc:`Custom shaders <custom-shaders>`: Add ``screen-shake`` and
+  ``screen-shake-random`` shaders that shake the window in which a bell occurs,
+  for example, to shake the window when a shell command fails
+
 - :doc:`Custom shaders <custom-shaders>`: Add the ``command-start``,
   ``command-finish``, ``alternate-screen-enter`` and ``alternate-screen-exit``
   events and uniforms for whether a command is running and whether the
@@ -137,6 +143,12 @@ Detailed list of changes
 
 - :doc:`choose-files <kittens/choose-files>`: Fix concurrent custom preview
   commands occasionally receiving the path of a different file.
+
+- :doc:`choose-files <kittens/choose-files>`: Avoid decoding video preview
+  thumbnails twice and preserve errors from ffmpeg when generating them.
+
+- :doc:`choose-files <kittens/choose-files>`: Fix previews of videos and
+  previews from custom preview commands not being cached
 
 - macOS: Add a workaround for clicking notifications not focusing the correct
   OS Window when there are multiple kitty instances because of Cocoa
