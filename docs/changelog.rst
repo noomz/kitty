@@ -143,21 +143,17 @@ Detailed list of changes
   groups inside lookarounds that overlap later matches finding no matches at all
   when the text contains non-ASCII characters
 
+- :doc:`choose-files <kittens/choose-files>`: Fix hangs when previewing named
+  pipes and other special files, fix previews of videos and custom preview
+  commands not being cached or receiving the wrong path, and respect the
+  maximum text preview size for symlinks
+
 - Bash integration: Source the system wide profile and bashrc files that bash
   was actually built to use, found by scanning the bash executable, instead of
   guessing their locations in :file:`/etc`. Fixes system startup files not
   being sourced on distros that keep them elsewhere (:iss:`10819`)
 
 - Vertical tab bar: Fix clicking the blank line below a tab not activating the tab (:iss:`10810`)
-
-- :doc:`choose-files <kittens/choose-files>`: Fix concurrent custom preview
-  commands occasionally receiving the path of a different file.
-
-- :doc:`choose-files <kittens/choose-files>`: Avoid decoding video preview
-  thumbnails twice and preserve errors from ffmpeg when generating them.
-
-- :doc:`choose-files <kittens/choose-files>`: Fix previews of videos and
-  previews from custom preview commands not being cached
 
 - macOS: Add a workaround for clicking notifications not focusing the correct
   OS Window when there are multiple kitty instances because of Cocoa
@@ -168,6 +164,26 @@ Detailed list of changes
 - Wayland: Fix kitty hanging when creating a new OS window if an output was
   plugged and unplugged quickly and the compositor never sent its logical
   geometry
+
+- X11: Fix kitty exiting when a program requesting the clipboard or primary
+  selection destroys its window before kitty can reply. X errors no longer
+  cause kitty to exit, they are reported instead (:iss:`9248`)
+
+- ssh kitten: Fix directories such as :file:`~/.terminfo` being created world
+  writable on the remote host on first connect (:iss:`10834`)
+
+- Remote control: Fix ``kitten @ set-colors`` failing on color files containing
+  ``cursor_text_color background`` (:iss:`10832`)
+
+- Remote control: Fix ``kitten @ get-colors`` reporting a window's cursor text
+  color as ``cursor_text`` instead of ``cursor_text_color``
+
+- :doc:`Pointer shapes <pointer-shapes>`: Fix animated mouse pointers restarting
+  their animation on every mouse movement in ``kitten mouse-demo`` and when
+  programs pop and push the same pointer shape in a single write (:iss:`10838`)
+
+- :doc:`Pointer shapes <pointer-shapes>`: Fix the mouse pointer shape not being
+  updated when a program switches to or from the alternate screen
 
 
 0.50.0 [2026-11-03]

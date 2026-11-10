@@ -1681,30 +1681,37 @@ PYWRAP1(patch_global_colors) {
     PyObject *spec;
     int configured;
     if (!PyArg_ParseTuple(args, "Op", &spec, &configured)) return NULL;
-#define P(name)                                                         \
-    {                                                                   \
-        PyObject *val = PyDict_GetItemString(spec, #name);              \
-        if (val) {                                                      \
-            if (val == Py_None) OPT(name) = 0;                          \
-            else if (PyLong_Check(val)) OPT(name) = PyLong_AsLong(val); \
-        }                                                               \
+#define P(name, convert)                                                 \
+    {                                                                    \
+        PyObject *val = PyDict_GetItemString(spec, #name);               \
+        if (val) {                                                       \
+            if (val == Py_None) OPT(name) = 0;                           \
+            else if (PyLong_Check(val)) {                                \
+                const __typeof__(convert(val)) converted = convert(val); \
+                if (PyErr_Occurred()) return NULL;                       \
+                OPT(name) = converted;                                   \
+            }                                                            \
+        }                                                                \
     }
-    P(active_border_color);
-    P(inactive_border_color);
-    P(bell_border_color);
-    P(tab_bar_background);
-    P(tab_bar_margin_color);
-    P(macos_titlebar_color);
-    P(wayland_titlebar_color);
-    P(scrollbar_handle_color);
-    P(scrollbar_track_color);
+    P(active_border_color, PyLong_AsLong);
+    P(inactive_border_color, PyLong_AsLong);
+    P(bell_border_color, PyLong_AsLong);
+    P(tab_bar_background, PyLong_AsLong);
+    P(tab_bar_margin_color, PyLong_AsLong);
+    // Signed because of the negative light/dark sentinels. An RGB payload with
+    // bit 31 set would overflow a 32-bit long, but macOS is 64-bit only.
+    P(macos_titlebar_color, PyLong_AsLong);
+    // The RGB payload of these options can set bit 31.
+    P(wayland_titlebar_color, PyLong_AsUnsignedLong);
+    P(scrollbar_handle_color, PyLong_AsUnsignedLong);
+    P(scrollbar_track_color, PyLong_AsUnsignedLong);
     if (configured) {
-        P(background);
+        P(background, PyLong_AsLong);
         const color_type prev_url_color = OPT(url_color);
-        P(url_color);
+        P(url_color, PyLong_AsLong);
         if (OPT(url_color) != prev_url_color) mark_all_color_profiles_dirty();
     }
-    if (PyErr_Occurred()) return NULL;
+#undef P
     Py_RETURN_NONE;
 }
 
@@ -1910,17 +1917,14 @@ move_cursor_to_mouse_if_in_prompt(id_type os_window_id, id_type tab_id, id_type 
     return moved;
 }
 
-static PyObject *
-pyupdate_pointer_shape(PyObject *self UNUSED, PyObject *args) {
-    id_type os_window_id;
-    PA("K", &os_window_id);
-    WITH_OS_WINDOW(os_window_id);
+void
+update_pointer_shape_for_kitty_window(id_type kitty_window_id) {
+    OSWindow *os_window = os_window_for_kitty_window(kitty_window_id);
+    if (!os_window || !os_window->is_focused) return;
     OSWindow *orig = global_state.callback_os_window;
     global_state.callback_os_window = os_window;
     update_mouse_pointer_shape();
     global_state.callback_os_window = orig;
-    END_WITH_OS_WINDOW;
-    Py_RETURN_NONE;
 }
 
 static PyObject *
@@ -2126,7 +2130,6 @@ static PyMethodDef module_methods[] = {
     M(get_tab_being_dragged, METH_NOARGS),
     M(set_window_being_dragged, METH_VARARGS),
     M(get_window_being_dragged, METH_NOARGS),
-    MW(update_pointer_shape, METH_VARARGS),
     MW(current_os_window, METH_NOARGS),
     MW(next_window_id, METH_NOARGS),
     MW(last_focused_os_window_id, METH_NOARGS),
