@@ -138,9 +138,29 @@ Detailed list of changes
   ``clear_terminal last_command`` not working or moving the view when scrolled
   back (:pull:`10841`)
 
+- Fix images, the cursor and the scrollbar not matching the text during
+  synchronized output when new output arrives while scrolled back (:pull:`10847`)
+
+- Fix jumping back to the last visited prompt and
+  :ac:`show_last_visited_command_output` failing or using the wrong lines after
+  ``clear_terminal last_command`` or after output scrolls only part of the
+  screen
+
+- Fix ``clear_terminal last_command`` erasing the wrong lines when the command
+  being typed is so long that its start has scrolled off the screen
+
+- :ref:`Unscrolling <unscroll>` the screen no longer overwrites the top line of
+  the screen when a top margin is set, the new lines are now blank, as with
+  ``SD``
+
 - :doc:`choose-files <kittens/choose-files>`: Fix hangs previewing special
   files, various preview caching bugs and e-book previews showing the wrong book
   (:pull:`10843`)
+
+- :doc:`choose-files <kittens/choose-files>`: Fix custom previews being shared
+  between different symlinks to the same file and previews not being refreshed
+  when the preview command or the :code:`video_preview` setting is changed
+  (:pull:`10850`)
 
 - :doc:`Pointer shapes <pointer-shapes>`: Fix animated pointers restarting
   unnecessarily (:iss:`10838`) and the shape not updating when switching to or

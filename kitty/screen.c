@@ -246,6 +246,7 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
     if (is_hard_reset) {
         linebuf_clear(self->linebuf, BLANK_CHAR);
         historybuf_clear(self->historybuf);
+        self->last_visited_prompt.is_set = false;
         self->scrolled_by = 0;
         self->pixel_scroll_offset_y = 0;
         self->scroll_changed = true;
@@ -452,6 +453,59 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
     }
 }
 
+static void
+last_visited_prompt_index(Screen *self, index_type top, index_type bottom, bool up, bool via_history) {
+    // Keep the last visited prompt on the same content when the lines in
+    // [top, bottom] of the main screen are scrolled by one. via_history means
+    // the line scrolled off the top goes into the scrollback (up) or the line
+    // scrolled in at the top comes from it (down), so the scrollback rows move too.
+    if (!self->last_visited_prompt.is_set || self->linebuf != self->main_linebuf) return;
+    int *row = &self->last_visited_prompt.row;
+    const int t = top, b = bottom;
+    if (*row > b) return;
+    if (!via_history && *row < t) return;
+    if (up) {
+        if (!via_history && *row == t) self->last_visited_prompt.is_set = false;
+        else {
+            (*row)--;
+            // a full scrollback drops its oldest line when one is added
+            if (*row < -(int)self->historybuf->count) self->last_visited_prompt.is_set = false;
+        }
+    } else {
+        if (*row == b) self->last_visited_prompt.is_set = false;
+        else (*row)++;
+    }
+}
+
+static void
+last_visited_prompt_insert_or_delete_lines(Screen *self, index_type at, index_type bottom, index_type count, bool insert) {
+    // Keep the last visited prompt on the same content when count lines are
+    // inserted or deleted at row at, moving the lines in [at, bottom].
+    if (!self->last_visited_prompt.is_set || self->linebuf != self->main_linebuf) return;
+    int *row = &self->last_visited_prompt.row;
+    if (*row < (int)at || *row > (int)bottom) return;
+    const index_type r = *row;
+    if (insert) {
+        if (count > bottom - r) self->last_visited_prompt.is_set = false; // pushed out of the region
+        else *row += count;
+    } else {
+        if (count > r - at) self->last_visited_prompt.is_set = false; // deleted
+        else *row -= count;
+    }
+}
+
+static bool
+last_visited_prompt_viewport(const Screen *self, index_type *y, unsigned int *scrolled_by) {
+    // Return the viewport position of the last visited prompt, showing it at
+    // the row it was visited at if the scrollback allows it.
+    if (!self->last_visited_prompt.is_set || self->linebuf != self->main_linebuf) return false;
+    const int row = self->last_visited_prompt.row, history_count = self->historybuf->count;
+    if (row < -history_count || row >= (int)self->lines) return false;
+    const int sb = MAX(0, MIN((int)self->last_visited_prompt.preferred_y - row, history_count));
+    *scrolled_by = sb;
+    *y = row + sb;
+    return true;
+}
 
 #define INDEX_GRAPHICS(amtv, histv)                                                          \
     {                                                                                        \
@@ -472,11 +526,7 @@ index_selection(const Screen *self, Selections *selections, bool up, index_type 
 #define INDEX_DOWN(scroll_history)                                                                      \
     linebuf_reverse_index(self->linebuf, top, bottom);                                                  \
     linebuf_clear_line(self->linebuf, top, true);                                                       \
-    if (self->linebuf == self->main_linebuf && self->last_visited_prompt.is_set) {                      \
-        if (self->last_visited_prompt.scrolled_by > 0) self->last_visited_prompt.scrolled_by--;         \
-        else if (self->last_visited_prompt.y < self->lines - 1) self->last_visited_prompt.y++;          \
-        else self->last_visited_prompt.is_set = false;                                                  \
-    }                                                                                                   \
+    last_visited_prompt_index(self, top, bottom, false, scroll_history);                                \
     INDEX_GRAPHICS(1, scroll_history)                                                                   \
     self->is_dirty = true;                                                                              \
     if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, false, top, bottom); \
@@ -2537,29 +2587,26 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
     }
 }
 
-#define INDEX_UP(add_to_history)                                                                                          \
-    linebuf_index(self->linebuf, top, bottom);                                                                            \
-    INDEX_GRAPHICS(-1, add_to_history)                                                                                    \
-    if (add_to_history) {                                                                                                 \
-        /* Only add to history when no top margin has been set */                                                         \
-        linebuf_init_line(self->linebuf, bottom);                                                                         \
-        historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf);                                   \
-        /* Keep a scrolled back viewport anchored on the same content */                                                  \
-        if (self->scrolled_by) {                                                                                          \
-            if (self->scrolled_by < self->historybuf->count) self->scrolled_by++;                                         \
-            if (self->scrolled_by >= self->historybuf->count && self->pixel_scroll_offset_y) {                            \
-                reset_pixel_scroll(self, 0);                                                                              \
-                self->scroll_changed = true;                                                                              \
-            }                                                                                                             \
-        }                                                                                                                 \
-        if (self->last_visited_prompt.is_set) {                                                                           \
-            if (self->last_visited_prompt.scrolled_by < self->historybuf->count) self->last_visited_prompt.scrolled_by++; \
-            else self->last_visited_prompt.is_set = false;                                                                \
-        }                                                                                                                 \
-    }                                                                                                                     \
-    linebuf_clear_line(self->linebuf, bottom, true);                                                                      \
-    self->is_dirty = true;                                                                                                \
-    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, true, top, bottom);                    \
+#define INDEX_UP(add_to_history)                                                                       \
+    linebuf_index(self->linebuf, top, bottom);                                                         \
+    INDEX_GRAPHICS(-1, add_to_history)                                                                 \
+    if (add_to_history) {                                                                              \
+        /* Only add to history when no top margin has been set */                                      \
+        linebuf_init_line(self->linebuf, bottom);                                                      \
+        historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf);                \
+        /* Keep a scrolled back viewport anchored on the same content */                               \
+        if (self->scrolled_by) {                                                                       \
+            if (self->scrolled_by < self->historybuf->count) self->scrolled_by++;                      \
+            if (self->scrolled_by >= self->historybuf->count && self->pixel_scroll_offset_y) {         \
+                reset_pixel_scroll(self, 0);                                                           \
+                self->scroll_changed = true;                                                           \
+            }                                                                                          \
+        }                                                                                              \
+    }                                                                                                  \
+    last_visited_prompt_index(self, top, bottom, true, add_to_history);                                \
+    linebuf_clear_line(self->linebuf, bottom, true);                                                   \
+    self->is_dirty = true;                                                                             \
+    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, true, top, bottom); \
     if (UNLIKELY(self->url_ranges.count || self->url_ranges.in_progress)) clear_selection(&self->url_ranges);
 
 void
@@ -2611,7 +2658,9 @@ static void
 _reverse_scroll(Screen *self, unsigned int count, bool fill_from_scrollback) {
     // Scroll the screen down by count lines, not moving the cursor
     unsigned int top = self->margin_top, bottom = self->margin_bottom;
-    fill_from_scrollback = fill_from_scrollback && self->linebuf == self->main_linebuf;
+    // The scrollback only adjoins the scroll region when the region starts at
+    // the top of the screen, otherwise the lines must come in blank, as with SD
+    fill_from_scrollback = fill_from_scrollback && self->linebuf == self->main_linebuf && top == 0;
     if (fill_from_scrollback) {
         unsigned limit = MAX(self->lines, self->historybuf->count);
         count = MIN(limit, count);
@@ -3081,6 +3130,7 @@ screen_insert_lines(Screen *self, unsigned int count) {
         }
         screen_dirty_line_graphics(self, top, bottom, self->linebuf == self->main_linebuf);
         linebuf_insert_lines(self->linebuf, count, self->cursor->y, bottom);
+        last_visited_prompt_insert_or_delete_lines(self, self->cursor->y, bottom, count, true);
         self->is_dirty = true;
         clear_all_selections(self);
         screen_carriage_return(self);
@@ -3135,6 +3185,7 @@ screen_delete_lines(Screen *self, unsigned int count) {
     if (count == 0) count = 1;
     if (top <= self->cursor->y && self->cursor->y <= bottom) {
         screen_delete_lines_impl(self, self->cursor->y, count, top, bottom);
+        last_visited_prompt_insert_or_delete_lines(self, self->cursor->y, bottom, count, false);
         screen_carriage_return(self);
     }
 }
@@ -3731,15 +3782,17 @@ screen_history_scroll_to_prompt(Screen *self, int num_of_prompts_to_jump, int sc
     if (self->linebuf != self->main_linebuf) return false;
     unsigned int old = self->scrolled_by;
     if (num_of_prompts_to_jump == 0) {
-        if (!self->last_visited_prompt.is_set || self->last_visited_prompt.scrolled_by > self->historybuf->count || self->last_visited_prompt.y >= self->lines)
-            return false;
-        self->scrolled_by = self->last_visited_prompt.scrolled_by;
+        index_type y;
+        unsigned int scrolled_by;
+        if (!last_visited_prompt_viewport(self, &y, &scrolled_by)) return false;
+        self->scrolled_by = scrolled_by;
     } else {
         int delta = num_of_prompts_to_jump < 0 ? -1 : 1;
         num_of_prompts_to_jump = num_of_prompts_to_jump < 0 ? -num_of_prompts_to_jump : num_of_prompts_to_jump;
-        int y = -self->scrolled_by;
+        const int oldest_y = -(int)self->historybuf->count;
+        int y = -(int)self->scrolled_by;
 #define ensure_y_ok \
-    if (y >= (int)self->lines || -y > (int)self->historybuf->count) return false;
+    if (y >= (int)self->lines || y < oldest_y) return false;
         ensure_y_ok;
         y += scroll_offset;
         while (num_of_prompts_to_jump) {
@@ -3747,10 +3800,12 @@ screen_history_scroll_to_prompt(Screen *self, int num_of_prompts_to_jump, int sc
             ensure_y_ok;
             if (range_line_(self, y)->attrs.prompt_kind == PROMPT_START) { num_of_prompts_to_jump--; }
         }
-        y -= scroll_offset;
 #undef ensure_y_ok
-        self->scrolled_by = y >= 0 ? 0 : -y;
-        screen_set_last_visited_prompt(self, 0);
+        const int viewport_top = MAX(oldest_y, MIN(0, y - scroll_offset));
+        self->scrolled_by = -viewport_top;
+        const int prompt_y = y - viewport_top;
+        // The context above the prompt can include another command's output.
+        screen_set_last_visited_prompt(self, prompt_y >= 0 && prompt_y < (int)self->lines ? prompt_y : 0);
     }
     if (old != self->scrolled_by) {
         reset_pixel_scroll(self, 0);
@@ -3919,6 +3974,8 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     self->paused_rendering.expires_at = monotonic() + ms_to_monotonic_t(for_in_ms);
     self->paused_rendering.inverted = self->modes.mDECSCNM;
     self->paused_rendering.scrolled_by = self->scrolled_by;
+    self->paused_rendering.history_count = self->historybuf->count;
+    self->paused_rendering.on_main_screen = self->linebuf == self->main_linebuf;
     self->paused_rendering.cell_data_updated = false;
     self->paused_rendering.cursor_visible = self->modes.mDECTCEM;
     // Preserve the pixel scroll geometry so that pausing does not cause the rendered content to jump, see #10794
@@ -4507,12 +4564,53 @@ screen_is_cell_selected(Screen *self, index_type x, index_type y) {
     return false;
 }
 
+bool
+screen_update_graphics_layers(Screen *self) {
+    // While rendering is paused, the frozen image placements must be positioned using the
+    // scroll position captured with the frozen text, not the live one, which new output may have changed
+    GraphicsManager *grman = self->paused_rendering.expires_at ? self->paused_rendering.grman : self->grman;
+    return grman_update_layers(
+        grman,
+        rendered_scrolled_by(self),
+        scroll_offset_lines_for_screen(self),
+        -1.f,
+        1.f,
+        2.f / self->columns,
+        2.f / self->lines,
+        self->columns,
+        self->lines,
+        self->cell_size);
+}
+
+bool
+screen_has_scrollbar(const Screen *self, bool is_hovering) {
+    if (!rendered_on_main_screen(self) || !rendered_history_count(self)) return false;
+    const bool scrolled = rendered_scrolled_by(self) > 0;
+    switch (OPT(scrollbar)) {
+        case SCROLLBAR_NEVER: return false;
+        case SCROLLBAR_ALWAYS: return true;
+        case SCROLLBAR_ON_SCROLLED: return scrolled;
+        case SCROLLBAR_ON_HOVERED: return is_hovering;
+        case SCROLLBAR_ON_SCROLL_AND_HOVER: return scrolled && is_hovering;
+        case SCROLLBAR_ON_SCROLL_OR_HOVER: return scrolled || is_hovering;
+    }
+    return false;
+}
+
+void
+screen_scrollbar_geometry(const Screen *self, float *handle_position, float *visible_fraction) {
+    // handle_position is 0 at the bottom of the scrollback and 1 at the top
+    const unsigned history_count = rendered_history_count(self);
+    *handle_position = (float)((rendered_scrolled_by(self) + (double)scroll_offset_lines_for_screen(self)) / MAX(1u, history_count));
+    *visible_fraction = (float)self->lines / (float)(self->lines + history_count);
+}
+
 void
 screen_apply_selection(Screen *self, void *address_, size_t size) {
     uint8_t *address = address_;
     memset(address, 0, size);
     const unsigned offset = pixel_scroll_enabled(self);
-    const unsigned scrolled_by = self->paused_rendering.expires_at ? self->paused_rendering.scrolled_by : self->scrolled_by;
+    const unsigned scrolled_by = rendered_scrolled_by(self);
     Selections *sel = self->paused_rendering.expires_at ? &self->paused_rendering.selections : &self->selections;
     for (size_t i = 0; i < sel->count; i++) apply_selection(self, address, sel->items + i, 1, offset, scrolled_by);
     sel->last_rendered_count = sel->count;
@@ -5529,6 +5627,29 @@ find_cmd_output(Screen *self, OutputOffset *oo, index_type start_screen_y, unsig
     return oo->num_lines > 0;
 }
 
+static void
+remove_multicell_fragments_cut_off_above_screen(Screen *self, index_type num_lines_above_screen) {
+    // Lines were deleted from the scrollback leaving num_lines_above_screen
+    // lines between them and the top of the screen. Remove the parts of
+    // multicell chars on screen whose top was in the deleted lines.
+    for (index_type y = 0; y < self->lines; y++) {
+        linebuf_init_line(self->linebuf, y);
+        Line *line = self->linebuf->line;
+        bool found = false;
+        for (index_type x = 0; x < self->columns; x++) {
+            CPUCell *c = line->cpu_cells + x;
+            if (c->is_multicell && c->y > num_lines_above_screen + y) {
+                found = true;
+                cell_set_char(c, 0);
+                c->is_multicell = false;
+                clear_sprite_position(line->gpu_cells[x]);
+            }
+        }
+        if (!found) break; // a multicell char cannot skip a line
+        linebuf_mark_line_dirty(self->linebuf, y);
+    }
+}
+
 static PyObject *
 erase_last_command(Screen *self, PyObject *args UNUSED) {
     if (self->linebuf != self->main_linebuf) Py_RETURN_FALSE;
@@ -5559,44 +5680,46 @@ erase_last_command(Screen *self, PyObject *args UNUSED) {
     }
     if (!found) Py_RETURN_FALSE; // nothing above the current prompt to erase
     const int start = y;
-    const index_type num_lines = (index_type)(live_prompt_start - start);
-    index_type num_lines_to_erase_in_screen = start >= 0 ? num_lines : num_lines + start;
-    num_lines_to_erase_in_screen = MIN(self->cursor->y, num_lines_to_erase_in_screen);
-    const index_type num_deleted_from_history = num_lines - num_lines_to_erase_in_screen;
+    // The erased region is [start, live_prompt_start). Its part in the
+    // scrollback is [start, history_end) and its part on screen is
+    // [screen_start, live_prompt_start). Either can be empty, the screen part
+    // is when a long live prompt has itself scrolled into the scrollback.
+    const int history_end = MIN(live_prompt_start, 0), screen_start = MAX(start, 0);
+    const index_type num_deleted_from_history = start < history_end ? (index_type)(history_end - start) : 0;
+    const index_type num_lines_to_erase_in_screen = live_prompt_start > screen_start ? (index_type)(live_prompt_start - screen_start) : 0;
+    // The lines of the live prompt that are in the scrollback, newer than the erased lines
+    const index_type num_newer_in_history = (index_type)(-history_end);
     if (self->last_visited_prompt.is_set) {
         // Move the last visited prompt with the lines that remain: lines above
         // the erased region move down by the number of lines removed from the
         // scrollback, lines below it move up by the number removed from the screen.
-        int r = (int)self->last_visited_prompt.y - (int)self->last_visited_prompt.scrolled_by;
-        if (start <= r && r < live_prompt_start) self->last_visited_prompt.is_set = false;
-        else {
-            r += r < start ? (int)num_deleted_from_history : -(int)num_lines_to_erase_in_screen;
-            const int new_scrolled_by = (int)self->last_visited_prompt.y - r;
-            if (new_scrolled_by >= 0) self->last_visited_prompt.scrolled_by = new_scrolled_by;
-            else {
-                self->last_visited_prompt.scrolled_by = 0;
-                self->last_visited_prompt.y = r;
-            }
-        }
+        int *r = &self->last_visited_prompt.row;
+        if (start <= *r && *r < live_prompt_start) self->last_visited_prompt.is_set = false;
+        else *r += *r < start ? (int)num_deleted_from_history : -(int)num_lines_to_erase_in_screen;
     }
+    // The line above the erased region no longer wraps into the line after it
+    if ((line = checked_range_line(self, start - 1))) line->cpu_cells[line->xnum - 1].next_char_was_wrapped = false;
     if (num_lines_to_erase_in_screen) {
         // Anchor the on-screen deletion at the top of the region, not at
         // cursor->y - count: a multi-line prompt or rows skipped above would
         // otherwise shift the deletion and leave residual lines on screen.
-        index_type screen_erase_start = start >= 0 ? (index_type)start : 0;
-        screen_delete_lines_impl(self, screen_erase_start, num_lines_to_erase_in_screen, 0, self->lines - 1);
+        screen_delete_lines_impl(self, (index_type)screen_start, num_lines_to_erase_in_screen, 0, self->lines - 1);
         self->cursor->y -= num_lines_to_erase_in_screen;
     }
     if (num_deleted_from_history) {
-        historybuf_delete_newest_lines(self->historybuf, num_deleted_from_history);
-        // The newest lines were removed from the scrollback, so keep a scrolled
-        // back viewport anchored on the same content. If the top of the viewport
-        // was among the removed lines, there is nothing to anchor to, so go to
-        // the bottom. Signal a redraw, otherwise the deletion of off-screen lines
-        // is not reflected until the next scroll event forces the history
-        // viewport to be recomputed.
-        if (self->scrolled_by > num_deleted_from_history) self->scrolled_by -= num_deleted_from_history;
-        else if (self->scrolled_by) {
+        if (num_newer_in_history) historybuf_delete_lines(self->historybuf, num_newer_in_history, num_deleted_from_history);
+        else historybuf_delete_newest_lines(self->historybuf, num_deleted_from_history);
+        if (!num_lines_to_erase_in_screen) remove_multicell_fragments_cut_off_above_screen(self, num_newer_in_history);
+        clear_all_selections(self);
+        // Keep a scrolled back viewport anchored on the same content: lines
+        // above the removed ones move down, lines below them do not move. If
+        // the top of the viewport was among the removed lines, there is
+        // nothing to anchor to, so go to the bottom. Signal a redraw, otherwise
+        // the deletion of off-screen lines is not reflected until the next
+        // scroll event forces the history viewport to be recomputed.
+        const int viewport_top = -(int)self->scrolled_by;
+        if (viewport_top < start) self->scrolled_by -= num_deleted_from_history;
+        else if (viewport_top < history_end) {
             self->scrolled_by = 0;
             reset_pixel_scroll(self, 0);
         }
@@ -5627,11 +5750,11 @@ cmd_output(Screen *self, PyObject *args) {
         case 1: // first on screen
             found = find_cmd_output(self, &oo, 0, self->scrolled_by, 1, true);
             break;
-        case 2: // last visited cmd
-            if (self->last_visited_prompt.scrolled_by <= self->historybuf->count && self->last_visited_prompt.is_set) {
-                found = find_cmd_output(self, &oo, self->last_visited_prompt.y, self->last_visited_prompt.scrolled_by, 0, false);
-            }
-            break;
+        case 2: { // last visited cmd
+            index_type y;
+            unsigned int scrolled_by;
+            if (last_visited_prompt_viewport(self, &y, &scrolled_by)) found = find_cmd_output(self, &oo, y, scrolled_by, 0, false);
+        } break;
         case 3: { // last non-empty output
             int y = self->cursor->y;
             Line *line;
@@ -5673,8 +5796,8 @@ cmd_output(Screen *self, PyObject *args) {
 bool
 screen_set_last_visited_prompt(Screen *self, index_type y) {
     if (y >= self->lines) return false;
-    self->last_visited_prompt.scrolled_by = self->scrolled_by;
-    self->last_visited_prompt.y = y;
+    self->last_visited_prompt.row = (int)y - (int)self->scrolled_by;
+    self->last_visited_prompt.preferred_y = y;
     self->last_visited_prompt.is_set = true;
     return true;
 }
@@ -7210,8 +7333,33 @@ current_selections(Screen *self, PyObject *a UNUSED) {
     PyObject *ans = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)render_lines_for_screen(self) * self->columns);
     if (!ans) return NULL;
     screen_apply_selection(self, PyBytes_AS_STRING(ans), PyBytes_GET_SIZE(ans));
-    self->last_rendered.scrolled_by = self->scrolled_by; // mimic what the renderer does
+    self->last_rendered.scrolled_by = rendered_scrolled_by(self); // mimic what the renderer does
     return ans;
+}
+
+static PyObject *
+update_graphics_layers(Screen *self, PyObject *a UNUSED) {
+    screen_update_graphics_layers(self);
+    return grman_render_data_as_python(self->paused_rendering.expires_at ? self->paused_rendering.grman : self->grman);
+}
+
+static PyObject *
+rendered_scroll_state(Screen *self, PyObject *a UNUSED) {
+    return Py_BuildValue("III", rendered_scrolled_by(self), rendered_pixel_scroll_offset_y(self), rendered_history_count(self));
+}
+
+static PyObject *
+has_scrollbar(Screen *self, PyObject *is_hovering) {
+    const int hovering = PyObject_IsTrue(is_hovering);
+    if (hovering < 0) return NULL;
+    return Py_NewRef(screen_has_scrollbar(self, hovering) ? Py_True : Py_False);
+}
+
+static PyObject *
+scrollbar_geometry(Screen *self, PyObject *a UNUSED) {
+    float handle_position, visible_fraction;
+    screen_scrollbar_geometry(self, &handle_position, &visible_fraction);
+    return Py_BuildValue("ff", handle_position, visible_fraction);
 }
 
 static PyObject *
@@ -7461,8 +7609,10 @@ static PyMethodDef methods[] = {
                             MND(paste, METH_O) MND(paste_bytes, METH_O) MND(focus_changed, METH_O) MND(has_focus, METH_NOARGS)
                                 MND(has_activity_since_last_focus, METH_NOARGS) MND(copy_colors_from, METH_O) MND(set_marker, METH_VARARGS)
                                     MND(marked_cells, METH_NOARGS) MND(scroll_to_next_mark, METH_VARARGS) MND(update_only_line_graphics_data, METH_NOARGS)
-                                        MND(bell, METH_NOARGS) MND(current_selections, METH_NOARGS) MND(is_selection_dirty, METH_NOARGS){
-                                            "select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
+                                        MND(bell, METH_NOARGS) MND(current_selections, METH_NOARGS) MND(update_graphics_layers, METH_NOARGS)
+                                            MND(rendered_scroll_state, METH_NOARGS) MND(scrollbar_geometry, METH_NOARGS) MND(has_scrollbar, METH_O)
+                                                MND(is_selection_dirty,
+                                                    METH_NOARGS){"select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
 
     {NULL} /* Sentinel */
 };
