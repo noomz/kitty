@@ -125,62 +125,61 @@ Detailed list of changes
 0.50.1 [unreleased]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- :doc:`Custom shaders <custom-shaders>`: Add ``screen-shake`` shaders to shake
-  a window on bell, add command start/finish and alternate screen enter/exit
-  events and uniforms, and fix ``bell-in-window`` needing a non-zero
-  :opt:`visual_bell_duration` and firing late for hidden windows
+- Allow docking kitty windows to an edge of the OS window, below the tab bar,
+  with :code:`launch --type=os-window-dock`. The dock is shown in every tab of
+  the OS window, see :ref:`docks` (:iss:`10854`)
 
-- :ac:`save_as_session`: Fix saved sessions opening in a new OS Window or
-  focusing the wrong tab when some OS Windows or tabs had nothing to save,
-  also affecting :ref:`restore_after_logout`
+- :doc:`Custom shaders <custom-shaders>`: Add ``screen-shake`` shaders that shake
+  a window on bell and new events and uniforms for command start/finish and
+  alternate screen enter/exit
 
-- Fix the scrolled back view jumping when new output arrives and
-  ``clear_terminal last_command`` not working or moving the view when scrolled
-  back (:pull:`10841`)
+- :ref:`Watchers <watchers>`: ``on_close`` now reports why the window was
+  closed, a new ``on_cwd_change`` event fires when the working directory changes
+  and ``on_resize``/``on_focus_change`` calls are no longer dropped when many
+  windows are created at once (:disc:`10828`, :iss:`10853`)
 
-- Fix images, the cursor and the scrollbar not matching the text during
-  synchronized output when new output arrives while scrolled back (:pull:`10847`)
+- Sessions: Fix tabs and windows moved with :ac:`detach_tab`,
+  :ac:`detach_window` or drag and drop losing their session. :ac:`save_as_session`
+  no longer opens saved sessions in the wrong OS Window or tab and no longer
+  overwrites the session file with an empty one (:pull:`10851`, :pull:`10852`)
 
-- Fix jumping back to the last visited prompt and
-  :ac:`show_last_visited_command_output` failing or using the wrong lines after
-  ``clear_terminal last_command`` or after output scrolls only part of the
-  screen
+- Fix the scrolled back view jumping, and images, the cursor and the scrollbar
+  getting out of sync with the text, when new output arrives
+  (:pull:`10841`, :pull:`10847`)
 
-- Fix ``clear_terminal last_command`` erasing the wrong lines when the command
-  being typed is so long that its start has scrolled off the screen
-
-- :ref:`Unscrolling <unscroll>` the screen no longer overwrites the top line of
-  the screen when a top margin is set, the new lines are now blank, as with
-  ``SD``
-
-- :doc:`choose-files <kittens/choose-files>`: Fix hangs previewing special
-  files, various preview caching bugs and e-book previews showing the wrong book
-  (:pull:`10843`)
-
-- :doc:`choose-files <kittens/choose-files>`: Fix custom previews being shared
-  between different symlinks to the same file and previews not being refreshed
-  when the preview command or the :code:`video_preview` setting is changed
-  (:pull:`10850`)
-
-- :doc:`Pointer shapes <pointer-shapes>`: Fix animated pointers restarting
-  unnecessarily (:iss:`10838`) and the shape not updating when switching to or
-  from the alternate screen
-
-- Bash integration: Find system wide startup files by scanning the bash
-  executable instead of guessing their location (:iss:`10819`)
-
-- Remote control: Fix ``set-colors`` and ``get-colors`` handling of
-  ``cursor_text_color`` (:iss:`10832`)
+- Fix ``clear_terminal last_command``, jumping to the last visited prompt and
+  :ac:`show_last_visited_command_output` using the wrong lines in various
+  situations
 
 - ssh kitten: Fix remote directories such as :file:`~/.terminfo` being created
   world writable (:iss:`10834`)
 
+- :doc:`dnd kitten <kittens/dnd>`: Fix the kitten failing to start in a directory
+  that is not writable (:iss:`10855`)
+
+- :doc:`choose-files <kittens/choose-files>`: Fix hangs previewing special files
+  and various preview caching bugs (:pull:`10843`, :pull:`10850`)
+
+- :doc:`Pointer shapes <pointer-shapes>`: Fix animated pointers restarting
+  unnecessarily and the shape not updating on alternate screen switches
+  (:iss:`10838`)
+
+- Bash integration: Find system wide startup files by scanning the bash
+  executable instead of guessing their location (:iss:`10819`)
+
+- IME: Move cursor position within pre-edit text (:iss:`10807`)
+
+- Vertical tab bar: Fix clicking the blank line below a tab not activating it
+  (:iss:`10810`)
+
+- Remote control: Fix ``set-colors`` and ``get-colors`` handling of
+  ``cursor_text_color`` (:iss:`10832`)
+
 - :doc:`Hints kitten </kittens/hints>`: Fix some custom regexes with lookarounds
   finding no matches in non-ASCII text
 
-- Vertical tab bar: Fix clicking the blank line below a tab not activating it (:iss:`10810`)
-
-- IME: Move cursor position within pre-edit text (:iss:`10807`)
+- :ref:`Unscrolling <unscroll>` the screen no longer overwrites the top line when
+  a top margin is set
 
 - macOS: Workaround for clicking notifications not focusing the correct OS
   Window with multiple kitty instances (:iss:`10805`)
