@@ -146,6 +146,7 @@ from .fast_data_types import (
 )
 from .key_encoding import get_name_to_functional_number_map
 from .keys import Mappings
+from .launch_wrapper import user_launch_request
 from .layout.base import set_layout_options
 from .notifications import NotificationManager
 from .options.types import Options, nullable_colors
@@ -762,7 +763,7 @@ class Boss:
             sw: SpecialWindowInstance | None = args
         else:
             args = tuple(args)
-            sw = self.args_to_special_window(args, cwd_from) if args else None
+            sw = self.args_to_special_window(args, cwd_from, launch_type='os-window') if args else None
         startup_session = next(create_sessions(get_options(), special_window=sw, cwd_from=cwd_from))
         startup_session.session_name = ''
         ans = self.add_os_window(startup_session)
@@ -801,7 +802,7 @@ class Boss:
         if isinstance(wd, str):
             wd = wd.split(os.pathsep) if str_is_multiple_paths else [wd]
         for path in wd:
-            special_window = SpecialWindow(None, cwd=path)
+            special_window = SpecialWindow(None, cwd=path, launch_request=user_launch_request('os-window'))
             self._new_os_window(special_window)
 
     def add_child(self, window: Window) -> None:
@@ -2718,13 +2719,13 @@ class Boss:
     def edit_file(self, path: str) -> None:
         editor_cmd = get_editor(get_options())
         exe = editor_cmd[0]
+        path = os.path.abspath(os.path.expanduser(path))
         if not os.path.isabs(exe):
             exe = which(exe) or ''
-            if not exe or not os.access(exe, os.X_OK):
-                self.show_error(_('Cannot find editor'), _('Could not edit the file {0} because the editor {1} was not found.').format(editor_cmd[0]))
-                return
-            editor_cmd[0] = exe
-        path = os.path.abspath(os.path.expanduser(path))
+        if not exe or not os.access(exe, os.X_OK):
+            self.show_error(_('Cannot find editor'), _('Could not edit the file {0} because the editor {1} was not found.').format(path, editor_cmd[0]))
+            return
+        editor_cmd[0] = exe
         self.new_os_window(*editor_cmd, path)
 
     def run_kitten_with_metadata(
@@ -3090,7 +3091,7 @@ class Boss:
         cell_height: int,
     ) -> bool:
         if (w := self.window_id_map.get(window_id)) and (tab := w.tabref()):
-            data = tab.current_layout.drag_resize_target_windows(w, x, y, edges, tab.windows)
+            data = tab.drag_resize_target_windows(w, x, y, edges)
             if not edges & (LEFT_EDGE | RIGHT_EDGE):
                 data = data._replace(horizontal_id=None)
             if not edges & (TOP_EDGE | BOTTOM_EDGE):
@@ -3124,20 +3125,21 @@ class Boss:
             step_x = int((x - r.initial_x) / r.cell_width) * mult
             dx = step_x - r.last_step_x
             if dx != 0:
-                if applied := tab.drag_resize_window(h, dx, True):
+                if applied := tab.drag_resize_window(h, dx, True, r.data.is_dock):
                     self.drag_resize_of_window = r = r._replace(last_step_x=r.last_step_x + applied)
         if (v := r.data.vertical_id) is not None:
             mult = 1 if r.data.height_increases_downwards else -1
             step_y = int((y - r.initial_y) / r.cell_height) * mult
             dy = step_y - r.last_step_y
             if dy != 0:
-                if applied := tab.drag_resize_window(v, dy, False):
+                if applied := tab.drag_resize_window(v, dy, False, r.data.is_dock):
                     self.drag_resize_of_window = r._replace(last_step_y=r.last_step_y + applied)
 
     def drag_resize_end(self) -> None:
         if tab := self.tab_for_id(self.drag_resize_of_window.tab_id):
             for cw in tab:
                 cw.pause_resize_notifications_to_child(pause=False)
+            tab.drag_resize_ended(self.drag_resize_of_window.data)
         self.drag_resize_of_window = WindowResizeDrag()
 
     def open_kitty_website(self) -> None:
@@ -3520,7 +3522,7 @@ class Boss:
             self.run_background_process(cmd, cwd_from=cwd_from, stdin=stdin, env=env)
         return None
 
-    def args_to_special_window(self, args: Iterable[str], cwd_from: CwdRequest | None = None) -> SpecialWindowInstance:
+    def args_to_special_window(self, args: Iterable[str], cwd_from: CwdRequest | None = None, launch_type: str = 'window') -> SpecialWindowInstance:
         args = list(args)
         stdin = None
         w = self.active_window
@@ -3539,7 +3541,7 @@ class Boss:
                     continue
                 arg = q
             cmd.append(arg)
-        return SpecialWindow(cmd, stdin, cwd_from=cwd_from)
+        return SpecialWindow(cmd, stdin, cwd_from=cwd_from, launch_request=user_launch_request(launch_type, cwd_from))
 
     def _new_tab(self, args: SpecialWindowInstance | Iterable[str], cwd_from: CwdRequest | None = None, as_neighbor: bool = False) -> Tab | None:
         special_window = None
@@ -3548,7 +3550,7 @@ class Boss:
         else:
             args = tuple(args)
             if args:
-                special_window = self.args_to_special_window(args, cwd_from=cwd_from)
+                special_window = self.args_to_special_window(args, cwd_from=cwd_from, launch_type='tab')
         if not self.os_window_map:
             self.add_os_window()
         tm = self.active_tab_manager
@@ -3584,7 +3586,7 @@ class Boss:
         if isinstance(wd, str):
             wd = wd.split(os.pathsep) if str_is_multiple_paths else [wd]
         for path in wd:
-            special_window = SpecialWindow(None, cwd=path)
+            special_window = SpecialWindow(None, cwd=path, launch_request=user_launch_request('tab'))
             self._new_tab(special_window)
 
     def _new_window(self, args: list[str], cwd_from: CwdRequest | None = None) -> Window | None:
@@ -3607,7 +3609,9 @@ class Boss:
         if args:
             w = tab.new_special_window(self.args_to_special_window(args, cwd_from=cwd_from), location=location, allow_remote_control=allow_remote_control)
         else:
-            w = tab.new_window(cwd_from=cwd_from, location=location, allow_remote_control=allow_remote_control)
+            w = tab.new_window(
+                cwd_from=cwd_from, location=location, allow_remote_control=allow_remote_control, launch_request=user_launch_request('window', cwd_from)
+            )
         if cwd_from is not None and (sw := cwd_from.window):
             w.created_in_session_name = sw.effective_session_name
         return w
@@ -3776,6 +3780,10 @@ class Boss:
         clear_caches()
 
         from .shaders.slang import clear_caches
+
+        clear_caches()
+
+        from .launch_wrapper import clear_caches
 
         clear_caches()
 

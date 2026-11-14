@@ -129,6 +129,12 @@ Detailed list of changes
   with :code:`launch --type=os-window-dock`. The dock is shown in every tab of
   the OS window, see :ref:`docks` (:iss:`10854`)
 
+- Allow resizing docks by dragging their inner border or with the
+  :ac:`resize_window` action and :code:`kitten @ resize-window`, see :ref:`docks`
+  (:iss:`10857`)
+
+- Unicode input kitten: Fix searching by name not finding some characters such as the pound sign (:iss:`10862`)
+
 - :doc:`Custom shaders <custom-shaders>`: Add ``screen-shake`` shaders that shake
   a window on bell and new events and uniforms for command start/finish and
   alternate screen enter/exit
@@ -138,10 +144,34 @@ Detailed list of changes
   and ``on_resize``/``on_focus_change`` calls are no longer dropped when many
   windows are created at once (:disc:`10828`, :iss:`10853`)
 
+- Allow running the programs in new windows via a wrapper command, such as to
+  open new windows inside the same container as the window they are opened
+  from, using a :file:`launch_wrapper.py` file in the kitty config directory,
+  see :ref:`launch_wrapper` (:iss:`10858`)
+
 - Sessions: Fix tabs and windows moved with :ac:`detach_tab`,
   :ac:`detach_window` or drag and drop losing their session. :ac:`save_as_session`
   no longer opens saved sessions in the wrong OS Window or tab and no longer
   overwrites the session file with an empty one (:pull:`10851`, :pull:`10852`)
+
+- Fix out of bounds memory accesses when a multi-line :doc:`text sizing
+  <text-sizing-protocol>` character is partially scrolled off the screen and a
+  combining char is then added to it or the window is resized
+
+- Wayland: Allow using touchscreens with the client side window decorations to
+  close, minimize and maximize the window, and to move and resize it
+  (:pull:`10859`)
+
+- A hard reset (:code:`RIS`) now clears the alternate screen as well
+
+- Fix a program running in the terminal being able to hang kitty by using
+  :doc:`edit-in-kitty </shell-integration>` to set a window logo that is a
+  special file such as :file:`/dev/zero`. Window logos and background images
+  must now be regular files and image conversion is subject to a timeout
+
+- Fix the lower rows of a multi-line :doc:`text sizing <text-sizing-protocol>`
+  character being lost when resizing if the text after it is wrapped onto its
+  first row
 
 - Fix the scrolled back view jumping, and images, the cursor and the scrollbar
   getting out of sync with the text, when new output arrives
@@ -189,6 +219,13 @@ Detailed list of changes
 
 - X11: Report X errors instead of exiting, fixing exits when clipboard
   requestors destroy their window early (:iss:`9248`)
+
+- Treat the ConEmu OSC 9;9 escape code as a report of the current working
+  directory, like OSC 7, and ignore other ConEmu OSC 9 numeric sub-commands
+  instead of showing them as desktop notifications
+
+- Fix an error instead of a helpful message when the configured :opt:`editor`
+  is not found while editing the config file (:iss:`10865`)
 
 
 0.50.0 [2026-11-03]
