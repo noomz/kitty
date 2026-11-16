@@ -1450,6 +1450,7 @@ class Boss:
         window: Window | None = None,  # the window associated with the confirmation
         prompt: str = '> ',
         initial_value: str = '',
+        cwd: str = '',  # the directory relative to which file names are completed
     ) -> None:
         result: str = ''
 
@@ -1464,7 +1465,13 @@ class Boss:
         if initial_value:
             cmd.append('--default=' + initial_value)
         self.run_kitten_with_metadata(
-            'ask', cmd, window=window, custom_callback=callback_, default_data={'response': ''}, action_on_removal=on_popup_overlay_removal
+            'ask',
+            cmd,
+            window=window,
+            custom_callback=callback_,
+            default_data={'response': ''},
+            action_on_removal=on_popup_overlay_removal,
+            cwd=cwd,
         )
 
     def _windows_closed_with_tab(self, tab: Tab) -> tuple[Window, ...]:
@@ -2175,6 +2182,8 @@ class Boss:
     def on_focus(self, os_window_id: int, focused: bool) -> None:
         tm = self.os_window_map.get(os_window_id)
         if tm is not None:
+            if not focused:  # the release that would end a selection in the tab bar may never arrive
+                tm.tab_bar.cancel_selection()
             w = tm.active_window
             if w is not None:
                 w.focus_changed(focused)
@@ -2737,6 +2746,7 @@ class Boss:
         custom_callback: Callable[[dict[str, Any], int, 'Boss'], None] | None = None,
         action_on_removal: Callable[[int, 'Boss'], None] | None = None,
         default_data: dict[str, Any] | None = None,
+        cwd: str = '',
     ) -> Any:
         from kittens.runner import CLIOnlyKitten, KittenMetadata, create_kitten_handler, resolved_kitten
 
@@ -2834,7 +2844,7 @@ class Boss:
                         cmd + args,
                         stdin=data,
                         env=env,
-                        cwd=CwdRequest(w).cwd_of_child or w.cwd_of_child,
+                        cwd=cwd or CwdRequest(w).cwd_of_child or w.cwd_of_child,
                         overlay_for=w.id,
                         overlay_behind=end_kitten.has_ready_notification,
                     ),
@@ -3240,12 +3250,19 @@ class Boss:
     def set_primary_selection(self) -> None:
         w = self.active_window
         if w is not None and not w.destroyed:
-            text = w.text_for_selection()
-            if text:
-                set_primary_selection(text)
-                self.handle_clipboard_loss('primary', w.id)
-                if get_options().copy_on_select:
-                    self.copy_to_buffer(get_options().copy_on_select)
+            self.copy_selected_text(w.text_for_selection(), w.id)
+
+    def cancel_tab_bar_selection(self, os_window_id: int) -> None:
+        if (tm := self.os_window_map.get(os_window_id)) is not None:
+            tm.tab_bar.cancel_selection()
+
+    def copy_selected_text(self, text: str, source_window_id: int = 0) -> None:
+        "Make text that was just selected the primary selection and copy it as per copy_on_select"
+        if text:
+            set_primary_selection(text)
+            self.handle_clipboard_loss('primary', source_window_id)
+            if get_options().copy_on_select:
+                self.copy_text_to_buffer(text, get_options().copy_on_select, source_window_id)
 
     def get_active_selection(self) -> str | None:
         w = self.active_window
@@ -3280,16 +3297,18 @@ class Boss:
     def copy_to_buffer(self, buffer_name: str) -> None:
         w = self.window_for_dispatch or self.active_window
         if w is not None and not w.destroyed:
-            text = w.text_for_selection()
-            if text:
-                if buffer_name == 'clipboard':
-                    set_clipboard_string(text)
-                    self.handle_clipboard_loss('clipboard', w.id)
-                elif buffer_name == 'primary':
-                    set_primary_selection(text)
-                    self.handle_clipboard_loss('primary', w.id)
-                else:
-                    self.set_clipboard_buffer(buffer_name, text)
+            self.copy_text_to_buffer(w.text_for_selection(), buffer_name, w.id)
+
+    def copy_text_to_buffer(self, text: str, buffer_name: str, source_window_id: int = 0) -> None:
+        if text:
+            if buffer_name == 'clipboard':
+                set_clipboard_string(text)
+                self.handle_clipboard_loss('clipboard', source_window_id)
+            elif buffer_name == 'primary':
+                set_primary_selection(text)
+                self.handle_clipboard_loss('primary', source_window_id)
+            else:
+                self.set_clipboard_buffer(buffer_name, text)
 
     @ac(
         'cp',
