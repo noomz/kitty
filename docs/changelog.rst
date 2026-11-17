@@ -168,6 +168,13 @@ Detailed list of changes
   :code:`--base-dir` into account, and file name completion is relative to that
   directory (:pull:`10851`, :pull:`10852`, :disc:`10867`)
 
+- Fix the bell indicator not being shown on the tab when a bell occurs in the
+  active window while the OS window does not have keyboard focus (:iss:`10880`)
+
+- Fix the display not being updated while the OS window is otherwise idle
+  after changes made from timers, such as by a custom tab bar updated from a
+  timer or by actions mapped to mouse clicks (:pull:`10878`)
+
 - Graphics protocol: Fix a newly displayed image sometimes not being rendered
   until something else, such as mouse movement, causes the window to be redrawn
   (:iss:`10875`)
@@ -247,6 +254,13 @@ Detailed list of changes
 
 - X11: Report X errors instead of exiting, fixing exits when clipboard
   requestors destroy their window early (:iss:`9248`)
+
+- Fix glyphs that are slightly wider than their cell, such as the texture
+  healing alternates of the Monaspace and 0xProto fonts, being rendered
+  smaller than the surrounding text at some font sizes
+
+- Fix accents and breathing marks that hang to the left of wide glyphs,
+  such as polytonic Greek capitals, being cut off
 
 
 0.50.0 [2026-11-03]
