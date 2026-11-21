@@ -122,7 +122,46 @@ for seamless and intuitive session file creation.
 Detailed list of changes
 -------------------------------------
 
-0.50.1 [unreleased]
+0.51.1 [future]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Saving sessions: Fix programs running in a window being able to inject arbitrary commands into saved session files via line breaks in the working directory reported with OSC 7 or in user variables. Arguments with line breaks in :code:`launch` lines are now written using ANSI-C (:code:`$'...'`) quoting
+
+- dnd kitten: Fix a malicious remote drop source being able to write files outside the staging directory by sending a directory with the same name as a previously sent symlink (follow up to :cve:`2026-54056`)
+
+- File transfer protocol: Refuse to write files via a symlink created earlier in the same transfer, preventing a malicious sender from redirecting files outside the destination directory through intermediate path components (follow up to :cve:`2026-54055`)
+
+- Remove the limit on the number of simultaneously active timers, which could cause scheduled actions, such as watcher calls, to fail with a "Too many timers added" error when many were pending at once
+
+- Linux: Fix a crash when a timer, such as one scheduled by a watcher or kitten, is removed by another timer that fires at the same time
+
+- Fix a crash when calling :code:`Screen.hyperlink_at()` with coordinates outside the screen, such as from a watcher (:iss:`10890`)
+
+- Fix animated images stopping when switching to a tab without animations and then back (:iss:`10894`)
+
+- Linux: Fix variable fonts that use axis values to substitute glyphs, such as the cursive axis of Annotation Mono, not rendering the substituted glyphs (:iss:`10897`)
+
+- Fix a single window with :opt:`draw_window_borders_for_single_window` having no border, and with :opt:`window_border_radius` being hidden by an extra layer of background, when its margin is narrower than its border. Space for the border is now reserved between the margin and the window contents (:iss:`10899`)
+
+- Fix the :ref:`launch wrapper <launch_wrapper>` not being used for programs run in an already running panel or quick access terminal in single instance mode (:pull:`10900`)
+
+- panel kitten: In single instance mode, run the command in a new panel in the working directory it was invoked from and do not pass internal environment variables such as :code:`XDG_ACTIVATION_TOKEN` to commands run in panels, as for other single instance commands
+
+- :ref:`Launch wrapper <launch_wrapper>`: Allow the wrapper to keep windows created with :option:`launch --hold` open itself, so that the shell runs inside the wrapper, via a new ``hold`` field in ``LaunchContext`` and a new ``LaunchPrefix`` return type (:iss:`10901`)
+
+- Fix the text in window title bars being drawn with the old cell size after changing the font size or moving a window to an OS window with a different font size (:pull:`10903`)
+
+- :opt:`window_title_template`: Add :code:`{window}` with the window id, working directory and size (:pull:`10905`)
+
+- Window drag and drop: In layouts that can only reorder windows, such as Tall and Grid, the whole window being dropped onto is highlighted and the dropped window takes its place, instead of highlighting a half that did not match where the window ended up. In the Splits layout, dropping onto the side of a window that the dragged window is already on swaps them instead of doing nothing (:pull:`10908`)
+
+- Preserve non-ASCII hyperlink IDs and URLs when exporting terminal text with ANSI formatting. Also replace invalid UTF-8 in hyperlinks with U+FFFD and control characters with their graphical alternatives, and do not split multi-byte characters when truncating very long hyperlinks, which could cause errors when clicking them (:pull:`10909`)
+
+- macOS: Fix multiple font files sharing the same PostScript name causing incorrect variant to be loaded sometimes (:iss:`10906`)
+
+- :doc:`launch <launch>`: Run the program as requested instead of resolving it to a full path first, so that wrappers such as the :ref:`launch wrapper <launch_wrapper>` look it up in their own :envvar:`PATH` and the program sees itself invoked by name, as when run from a shell. Programs that would not be found in :envvar:`PATH`, such as ones found via :opt:`exe_search_path`, are still run via their full path (:iss:`10914`)
+
+0.51.0 [2026-11-18]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - Allow docking kitty windows to an edge of the OS window, below the tab bar,
@@ -133,10 +172,7 @@ Detailed list of changes
 
 - :doc:`Custom shaders <custom-shaders>`: Add ``screen-shake`` shaders that shake
   a window on bell and new events and uniforms for command start/finish and
-  alternate screen enter/exit. Also fix groups started or stopped by OS window
-  focus changes ending up in the wrong state when focus changes more than once
-  before the window is next drawn, for example, when the window is hidden and
-  shown again (:iss:`10871`)
+  alternate screen enter/exit (:iss:`10871`)
 
 - Allow running the programs in new windows via a wrapper command, such as to
   open new windows inside the same container as the window they are opened
@@ -148,126 +184,93 @@ Detailed list of changes
   and ``on_resize``/``on_focus_change`` calls are no longer dropped when many
   windows are created at once (:disc:`10828`, :iss:`10853`)
 
-- Allow selecting and copying text drawn in the tab bar outside the tabs, for
-  example by a custom :file:`tab_bar.py`, by dragging the mouse over it
-  (:iss:`10869`)
-
-- Wayland: Allow using touchscreens with the client side window decorations to
-  close, minimize and maximize the window, and to move and resize it
-  (:pull:`10859`)
-
-- Wayland: Fix the client side window decorations sometimes showing the wrong
-  focus state, for example, after switching between tabbed windows on niri
-  (:pull:`10873`)
+- Tab bar: Allow selecting and copying text drawn outside the tabs, for example
+  by a custom :file:`tab_bar.py`, by dragging the mouse over it. Fix the bell
+  indicator not being shown for the active window when the OS window is not
+  focused and clicking the blank line below a tab in the vertical tab bar not
+  activating it (:iss:`10869`, :iss:`10880`, :iss:`10810`)
 
 - Sessions: Fix tabs and windows moved with :ac:`detach_tab`,
-  :ac:`detach_window` or drag and drop losing their session. :ac:`save_as_session`
-  no longer opens saved sessions in the wrong OS Window or tab and no longer
-  overwrites the session file with an empty one. Its prompt for the session
-  file name now shows the directory the session will be saved in, taking
-  :code:`--base-dir` into account, and file name completion is relative to that
-  directory (:pull:`10851`, :pull:`10852`, :disc:`10867`)
+  :ac:`detach_window` or drag and drop losing their session.
+  :ac:`save_as_session` no longer opens saved sessions in the wrong OS Window
+  or tab or overwrites the session file with an empty one, and its file name
+  prompt now shows and completes relative to the directory the session will be
+  saved in (:pull:`10851`, :pull:`10852`, :disc:`10867`)
 
-- Fix the bell indicator not being shown on the tab when a bell occurs in the
-  active window while the OS window does not have keyboard focus (:iss:`10880`)
+- Security: Fix a program running in the terminal being able to hang kitty by
+  using :doc:`edit-in-kitty </shell-integration>` to set a window logo that is
+  a special file such as :file:`/dev/zero`, window logos and background images
+  must now be regular files. Fix the ssh kitten creating remote directories
+  such as :file:`~/.terminfo` world writable (:iss:`10834`)
 
-- Fix the display not being updated while the OS window is otherwise idle
-  after changes made from timers, such as by a custom tab bar updated from a
-  timer or by actions mapped to mouse clicks (:pull:`10878`)
+- :doc:`choose-files <kittens/choose-files>`: Sanitize file names, archive
+  member names, ebook metadata and previewer output so they cannot inject
+  escape codes into the terminal. Fix hangs previewing special files and
+  various preview caching bugs (:pull:`10843`, :pull:`10850`)
 
-- Graphics protocol: Fix a newly displayed image sometimes not being rendered
-  until something else, such as mouse movement, causes the window to be redrawn
-  (:iss:`10875`)
+- kittens: Fix a crash and changed colors when wrapping text that contains
+  extended SGR colors, such as the output of custom preview commands in
+  :doc:`choose-files <kittens/choose-files>`
+
+- Fix the display sometimes not being updated, for example after changes made
+  from timers or mouse actions while the OS window is idle, or for newly
+  displayed images until something else causes a redraw (:pull:`10878`,
+  :iss:`10875`)
 
 - Fix the scrolled back view jumping, and images, the cursor and the scrollbar
   getting out of sync with the text, when new output arrives
   (:pull:`10841`, :pull:`10847`)
 
-- Fix a program running in the terminal being able to hang kitty by using
-  :doc:`edit-in-kitty </shell-integration>` to set a window logo that is a
-  special file such as :file:`/dev/zero`. Window logos and background images
-  must now be regular files and image conversion is subject to a timeout
+- Fix crashes and memory errors with multi-line characters from the
+  :doc:`text sizing protocol <text-sizing-protocol>` being partially scrolled
+  off screen or resized, and with the VS15 variation selector after a soft
+  wrapped wide emoji
 
-- ssh kitten: Fix remote directories such as :file:`~/.terminfo` being created
-  world writable (:iss:`10834`)
+- Fix ``clear_terminal last_command``, jumping to the last visited prompt and
+  :ac:`show_last_visited_command_output` using the wrong lines in various
+  situations
 
-- :doc:`choose-files <kittens/choose-files>`: Sanitize file names, archive member
-  names, ebook metadata and previewer output everywhere they are displayed so
-  they cannot inject escape codes into the terminal. Fix hangs previewing
-  special files and various preview caching bugs (:pull:`10843`, :pull:`10850`)
+- Treat the ConEmu OSC 9;9 escape code as a report of the current working
+  directory, like OSC 7, instead of showing it as a desktop notification. A
+  hard reset (:code:`RIS`) now clears the alternate screen as well
 
-- :doc:`choose-files <kittens/choose-files>`: Fix incorrect cached previews
-  when a file or symlink changes during rendering.
+- Fix glyphs that are slightly wider than their cell, such as the texture
+  healing alternates of the Monaspace and 0xProto fonts, being rendered
+  smaller than surrounding text and accents that hang to the left of wide
+  glyphs, such as polytonic Greek capitals, being cut off
+
+- Fix an invalid value for :opt:`shell`, such as one with an unterminated
+  quote, causing errors when opening or saving windows, instead fall back to
+  the login shell and report the error (:pull:`10888`)
 
 - IME: Move cursor position within pre-edit text (:iss:`10807`)
 
 - Bash integration: Find system wide startup files by scanning the bash
   executable instead of guessing their location (:iss:`10819`)
 
-- Treat the ConEmu OSC 9;9 escape code as a report of the current working
-  directory, like OSC 7, and ignore other ConEmu OSC 9 numeric sub-commands
-  instead of showing them as desktop notifications
-
-- A hard reset (:code:`RIS`) now clears the alternate screen as well
-
-- :doc:`Text sizing <text-sizing-protocol>`: Fix out of bounds memory accesses
-  when a multi-line character is partially scrolled off the screen and a
-  combining char is then added to it or the window is resized. Fix the lower
-  rows of a multi-line character being lost when resizing if the text after it
-  is wrapped onto its first row
-
-- Fix a crash when the VS15 variation selector is received with the cursor at
-  the start of a line, after a wide emoji that was soft wrapped from the
-  previous line
-
-- Fix ``clear_terminal last_command``, jumping to the last visited prompt and
-  :ac:`show_last_visited_command_output` using the wrong lines in various
-  situations
-
-- Unicode input kitten: Fix searching by name not finding some characters such
-  as the pound sign (:iss:`10862`)
-
-- :doc:`dnd kitten <kittens/dnd>`: Fix the kitten failing to start in a directory
-  that is not writable (:iss:`10855`)
+- Fix minor issues in various kittens: Unicode input not finding some
+  characters such as the pound sign when searching by name, dnd failing to
+  start in a non-writable directory and ask selecting the wrong choice on mouse
+  click when the dialog does not fit in the window (:iss:`10862`,
+  :iss:`10855`, :pull:`10883`)
 
 - :doc:`Pointer shapes <pointer-shapes>`: Fix animated pointers restarting
   unnecessarily and the shape not updating on alternate screen switches
   (:iss:`10838`)
 
-- Vertical tab bar: Fix clicking the blank line below a tab not activating it
-  (:iss:`10810`)
-
 - Remote control: Fix ``set-colors`` and ``get-colors`` handling of
   ``cursor_text_color`` (:iss:`10832`)
 
-- :doc:`Hints kitten </kittens/hints>`: Fix some custom regexes with lookarounds
-  finding no matches in non-ASCII text
-
-- :ref:`Unscrolling <unscroll>` the screen no longer overwrites the top line when
-  a top margin is set
-
-- Fix an error instead of a helpful message when the configured :opt:`editor`
-  is not found while editing the config file (:iss:`10865`)
-
-- macOS: Workaround for clicking notifications not focusing the correct OS
-  Window with multiple kitty instances (:iss:`10805`)
-
-- Wayland: Fix a hang creating OS windows after an output is quickly plugged and
-  unplugged
+- Wayland: Allow using touchscreens with the client side window decorations.
+  Fix the decorations sometimes showing the wrong focus state and a hang
+  creating OS windows after an output is quickly plugged and unplugged
+  (:pull:`10859`, :pull:`10873`)
 
 - X11: Report X errors instead of exiting, fixing exits when clipboard
   requestors destroy their window early (:iss:`9248`)
 
-- Fix glyphs that are slightly wider than their cell, such as the texture
-  healing alternates of the Monaspace and 0xProto fonts, being rendered
-  smaller than the surrounding text at some font sizes
-
-- Fix accents and breathing marks that hang to the left of wide glyphs,
-  such as polytonic Greek capitals, being cut off
-
-- ask kitten: Fix mouse clicks selecting the wrong choice,
-  or nothing, when the dialog does not fit in the window, and allow clicking
-  the hidden text placeholder when it wraps over multiple lines (:pull:`10883`)
+- macOS: Workaround for clicking notifications not focusing the correct OS
+  Window with multiple kitty instances (:iss:`10805`)
 
 
 0.50.0 [2026-11-03]

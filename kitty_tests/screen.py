@@ -1873,6 +1873,25 @@ class TestScreen(BaseTest):
         s.draw('bcdef')
         self.ae(as_text(s, True), f'{sgr0}a{hl("moo")}bcde{sgr0}f{hl()}\n\n\n')
 
+    def test_serialize_unicode_hyperlink(self):
+        from kitty.window import as_text
+
+        screen = self.create_screen(cols=20, lines=3)
+        opening = '\x1b]8;id=链接;file:///tmp/中文🙂.txt\x1b\\'
+        closing = '\x1b]8;;\x1b\\'
+        link = f'{opening}X{closing}'
+        parse_bytes(screen, link.encode('utf-8'))
+        self.assertIn(link, as_text(screen, as_ansi=True).encode('utf-8').decode('utf-8'))
+
+        parse_bytes(screen, b'\r\ntext' * 4)
+        self.assertNotIn('X', as_text(screen))
+        self.assertIn(link, as_text(screen, as_ansi=True, add_history=True).encode('utf-8').decode('utf-8'))
+
+        # invalid UTF-8 is replaced by U+FFFD
+        screen = self.create_screen(cols=20, lines=3)
+        parse_bytes(screen, b'\x1b]8;id=a\xffb;http://x/\xffa\xe4\xb8b\xe4\xb8\x1b\\X\x1b]8;;\x1b\\')
+        self.assertIn('\x1b]8;id=a\ufffdb;http://x/\ufffda\ufffdb\ufffd\x1b\\X' + closing, as_text(screen, as_ansi=True))
+
     def test_wrapping_serialization(self):
         from kitty.window import as_text
 
@@ -2087,6 +2106,36 @@ class TestScreen(BaseTest):
         set_link('u' * 2048, 'i' * 300)
         s.draw('a')
         self.ae({('i' * 256 + ':' + 'u' * (2045 - 256), 1)}, s.hyperlinks_as_set())
+        # truncation must not split multi-byte UTF-8 sequences
+        s = self.create_screen()
+        set_link('u' * 2048, '链' * 86)
+        s.draw('a')
+        self.ae({('链' * 85 + ':' + 'u' * (2045 - 255), 1)}, s.hyperlinks_as_set())
+        s = self.create_screen()
+        set_link('u' + '中' * 700)
+        s.draw('a')
+        self.ae({(':u' + '中' * 681, 1)}, s.hyperlinks_as_set())
+        s = self.create_screen()
+        set_link('🙂' * 600)
+        s.draw('a')
+        self.ae({(':' + '🙂' * 511, 1)}, s.hyperlinks_as_set())
+        # invalid UTF-8 is replaced by U+FFFD when stored
+        s = self.create_screen()
+        parse_bytes(s, b'\x1b]8;id=a\xffb;http://x/\xffa\xe4\xb8b\xe4\xb8\x1b\\')
+        s.draw('a')
+        self.ae({('a\ufffdb:http://x/\ufffda\ufffdb\ufffd', 1)}, s.hyperlinks_as_set())
+        self.ae(s.hyperlink_for_id(1), 'http://x/\ufffda\ufffdb\ufffd')
+        # control characters are replaced by their graphical alternatives
+        s = self.create_screen()
+        parse_bytes(s, b'\x1b]8;id=a\tb;x\ny\rz\x7fw\xc2\x9cv\x1b\\')
+        s.draw('a')
+        self.ae({('a\u2409b:x\u240ay\u240dz\u2421w\ufffdv', 1)}, s.hyperlinks_as_set())
+        # replacement characters count towards the length limit
+        for n, expected in ((2041, 'u' * 2041 + '\ufffd'), (2042, 'u' * 2042)):
+            s = self.create_screen()
+            parse_bytes(s, b'\x1b]8;id=i;' + b'u' * n + b'\xff\x1b\\')
+            s.draw('a')
+            self.ae({('i:' + expected, 1)}, s.hyperlinks_as_set())
 
         s = self.create_screen()
         set_link('1'), s.draw('1')
@@ -2127,6 +2176,10 @@ class TestScreen(BaseTest):
         self.ae(s.current_url_text(), '123abcxyz')
         self.ae('2', s.hyperlink_at(1, 3))
         self.ae(s.current_url_text(), 'Z Z')
+        # out of bounds coordinates must not crash
+        self.assertIsNone(s.hyperlink_at(0, s.lines))
+        self.assertIsNone(s.hyperlink_at(71, 54))
+        self.assertIsNone(s.hyperlink_at(s.columns, 0))
 
     def test_automatic_hyperlink_collection(self) -> None:
         s = self.create_screen()
@@ -4223,6 +4276,8 @@ class TestScreen(BaseTest):
         delivered = []
 
         class FakeWindow:
+            _title_bar_screen = None
+
             def __init__(self):
                 self.watchers = Watchers()
                 self.watchers.on_cwd_change.append(lambda boss, window, data: None)

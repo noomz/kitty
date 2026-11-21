@@ -188,6 +188,32 @@ class Selection(BaseTest):
             self.ae(face_from_descriptor(ff['medium']).applied_features(), {'dlig': 'dlig', 'test': 'test=3'})
             self.ae(face_from_descriptor(ff['bold']).applied_features(), {'dlig': 'dlig', 'test': 'test=3'})
 
+    def test_face_loaded_from_descriptor_path(self):
+        # Fonts in different files can share a PostScript name, for example the
+        # default named instance of a variable font and the corresponding static
+        # font. The face must be loaded from the file the descriptor came from.
+        if not is_macos:
+            self.skipTest('Only CoreText looks up fonts by name')
+        from kitty.fast_data_types import CTFace, add_font_file, coretext_all_fonts
+
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ComfyCode-Regular.ttf')
+        with tempfile.TemporaryDirectory() as tdir:
+            names = 'a.ttf', 'b.ttf'
+            for name in names:
+                p = os.path.join(tdir, name)
+                with open(src, 'rb') as s, open(p, 'wb') as d:
+                    d.write(s.read())
+                self.assertTrue(add_font_file(p))
+            # CoreText reports paths without resolving symlinks such as /var -> /private/var
+            descriptors = [d for d in coretext_all_fonts(False) if d['family'] == 'Comfy Code' and os.path.basename(d['path']) in names]
+            self.ae(len(descriptors), len(names))
+            self.ae(len({d['postscript_name'] for d in descriptors}), 1)
+            for d in descriptors:
+                self.ae(CTFace(descriptor=d).path, d['path'])
+            # A descriptor whose file no longer exists falls back to matching by name
+            d = dict(descriptors[0], path=os.path.join(tdir, 'missing.ttf'))
+            self.ae(CTFace(descriptor=d).postscript_name(), descriptors[0]['postscript_name'])
+
     def test_invalid_font_feature(self):
         with self.assertRaises(ValueError) as cm:
             ParsedFontFeature('!!bad!!')
@@ -484,6 +510,28 @@ class Rendering(FontBaseTest):
             _, w, h = f.render_codepoint(ord(char))
             self.assertGreater(w, 64)
             self.assertGreater(h, 64)
+
+    @unittest.skipIf(is_macos, 'fontconfig descriptors are not used on macOS')
+    def test_shaping_uses_variation_axes(self):
+        # Annotation Mono switches to cursive glyphs via GSUB FeatureVariations
+        # conditioned on its CRSV axis, so shaping must use the variation
+        # coordinates set on the face, see https://github.com/kovidgoyal/kitty/issues/10897
+        path = self.path_for_font('AnnotationMono-VF-subset.ttf')
+        plain, cursive = [1, 3, 6, 8], [2, 4, 7, 9]  # a f k l and a.ital f.ital k.ital l.ital
+
+        def shaped_glyphs(**extra):
+            descriptor = {'descriptor_type': 'fontconfig', 'path': path, 'index': 0, 'hinting': True, 'hint_style': 3, **extra}
+            with setup_for_testing(size=self.font_size, dpi=self.dpi, main_face_descriptor=descriptor):
+                s = Screen(None, 1, 8)
+                s.draw('afkl')
+                return [g for group in test_shape(s.line(0), None) for g in group[3]]
+
+        # axes are in the order: wght, slnt, CRSV
+        self.ae(shaped_glyphs(axes=(250.0, 0.0, 0.0)), plain)
+        self.ae(shaped_glyphs(axes=(250.0, 0.0, 1.0)), cursive)
+        self.ae(shaped_glyphs(axes=(250.0, -15.0, 0.5)), cursive)
+        self.ae(shaped_glyphs(named_style=5), plain)  # DemiBold
+        self.ae(shaped_glyphs(named_style=35), cursive)  # DemiBold Upright Italic
 
     def test_color_emoji_not_shrunk(self):
         # Regression test for https://github.com/kovidgoyal/kitty/issues/10144.

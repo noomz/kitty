@@ -113,6 +113,7 @@ from .typing_compat import BossType, ChildType, EdgeLiteral, TabType, TypedDict
 from .utils import (
     color_as_int,
     docs_url,
+    is_same_executable,
     key_val_matcher,
     kitty_ansi_sanitizer_pat,
     log_error,
@@ -200,7 +201,7 @@ class CwdRequest:
         if reported_cwd:
             ssh_kitten_cmdline = window.ssh_kitten_cmdline()
             if ssh_kitten_cmdline:
-                run_shell = argv[0] == resolved_shell(get_options())[0]
+                run_shell = is_same_executable(argv[0], resolved_shell(get_options())[0])
                 server_args = [] if run_shell else list(argv)
                 from kittens.ssh.utils import set_cwd_in_cmdline, set_env_in_cmdline, set_server_args_in_cmdline
 
@@ -448,8 +449,9 @@ class DeferredWatcherCalls:
     Deliver watcher calls on the next main loop tick, in order, using a single
     timer. Deferring prevents infinite recursion when a watcher causes the
     event it is watching (for example, resizing in on_resize). Using a single
-    timer prevents bursts of events from exhausting the fixed size timer table.
-    Calls made during delivery are delivered in the next batch.
+    queue guarantees delivery order, which separate timers with the same
+    trigger time do not. Calls made during delivery are delivered in the next
+    batch.
     """
 
     def __init__(self) -> None:
@@ -466,8 +468,6 @@ class DeferredWatcherCalls:
     def schedule(self) -> None:
         if not self.timer_id and self.pending:
             self.timer_id = add_timer(self.deliver, 0, False)
-            if not self.timer_id:
-                log_error(f'Failed to schedule delivery of {len(self.pending)} watcher calls, will retry on the next watched event')
 
     def deliver(self, timer_id: int | None) -> None:
         self.timer_id = 0
@@ -1236,7 +1236,7 @@ class Window:
             if self._title_bar_screen is None:
                 from .window_title_bar import WindowTitleBarScreen
 
-                self._title_bar_screen = WindowTitleBarScreen(self.os_window_id, cell_width, cell_height)
+                self._title_bar_screen = WindowTitleBarScreen(cell_width, cell_height)
             tb_geom = WindowGeometry(
                 left=g.left,
                 top=tb_top,
@@ -1245,7 +1245,7 @@ class Window:
                 xnum=0,
                 ynum=1,
             )
-            self._title_bar_screen.layout(tb_geom)
+            self._title_bar_screen.layout(tb_geom, cell_width)
             set_window_title_bar_render_data(
                 self.os_window_id,
                 self.tab_id,
@@ -1700,6 +1700,9 @@ class Window:
             self.title_updated()
 
     def on_cwd_change(self, raw_url: bytes) -> None:
+        if self._title_bar_screen is not None and (t := self.tabref()) is not None:
+            # {window.wd} in the title bar template may have changed
+            self.update_title_bar(is_active=t.active_window is self)
         if self.watchers.on_cwd_change:
             url = raw_url.decode('utf-8', 'replace')
             host = ''

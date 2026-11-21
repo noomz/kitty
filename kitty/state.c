@@ -536,6 +536,11 @@ move_window_to_tab(id_type os_window_id, id_type src_tab_id, id_type dest_tab_id
     return false;
 }
 
+static bool
+cell_size_differs(const OSWindow *os_window, const Screen *screen) {
+    return screen->cell_size.width != os_window->fonts_data->fcm.cell_width || screen->cell_size.height != os_window->fonts_data->fcm.cell_height;
+}
+
 static void
 resize_screen(OSWindow *os_window, Screen *screen, bool has_graphics) {
     if (screen) {
@@ -558,9 +563,7 @@ attach_window(id_type os_window_id, id_type tab_id, id_type id) {
             remove_i_from_array(detached_windows.windows, i, detached_windows.num_windows);
             make_os_window_context_current(osw);
             create_gpu_resources_for_window(w);
-            if (w->render_data.screen->cell_size.width != osw->fonts_data->fcm.cell_width ||
-                w->render_data.screen->cell_size.height != osw->fonts_data->fcm.cell_height)
-                resize_screen(osw, w->render_data.screen, true);
+            if (cell_size_differs(osw, w->render_data.screen)) resize_screen(osw, w->render_data.screen, true);
             else screen_dirty_sprite_positions(w->render_data.screen);
             w->render_data.screen->reload_all_gpu_data = true;
             screen_visibility_changed(w->render_data.screen, is_os_window_potentially_visible(osw) && t == osw->active_tab && w->visible);
@@ -666,6 +669,10 @@ set_active_tab(id_type os_window_id, unsigned int idx) {
     WITH_OS_WINDOW(os_window_id)
     os_window->active_tab = idx;
     os_window->needs_render = true;
+    // Animations are only scanned in windows of the active tab, so if the
+    // previously active tab had none, scanning stopped and must be restarted
+    // for the newly active tab, see https://github.com/kovidgoyal/kitty/issues/10894
+    global_state.check_for_active_animated_images = true;
     update_os_window_visibility_reports(os_window);
     END_WITH_OS_WINDOW
 }
@@ -770,10 +777,16 @@ pyset_borders_rects(PyObject *self UNUSED, PyObject *args) {
         unsigned long color;
         long long border_type;
         BorderRect *r = br->rect_buf + i;
-        int horizontal, render;
-        if (!PyArg_ParseTuple(
-                pr, "IIIIkLppII", &r->px.left, &r->px.top, &r->px.right, &r->px.bottom, &color, &border_type, &horizontal, &render, &r->radius, &r->thickness))
+        int horizontal, render, left, top, right, bottom;
+        if (!PyArg_ParseTuple(pr, "iiiikLppII", &left, &top, &right, &bottom, &color, &border_type, &horizontal, &render, &r->radius, &r->thickness))
             return NULL;
+        // Borders can extend past the edges of the OS window, for instance when
+        // a window's margin is smaller than its border, so clip them to it.
+        const int vw = (int)osw->viewport_width, vh = (int)osw->viewport_height;
+        r->px.left = MIN(MAX(left, 0), vw);
+        r->px.top = MIN(MAX(top, 0), vh);
+        r->px.right = MIN(MAX(right, (int)r->px.left), vw);
+        r->px.bottom = MIN(MAX(bottom, (int)r->px.top), vh);
         r->left = gl_pos_x(r->px.left, osw->viewport_width);
         r->top = gl_pos_y(r->px.top, osw->viewport_height);
         r->right = r->left + gl_size(r->px.right - r->px.left, osw->viewport_width);
@@ -1241,6 +1254,8 @@ PYWRAP1(set_window_title_bar_render_data) {
     PA("KKKOIIII", &os_window_id, &tab_id, &window_id, &screen, &g.left, &g.top, &g.right, &g.bottom);
     WITH_WINDOW(os_window_id, tab_id, window_id)
     init_window_render_data(&window->window_title_render_data, g, screen);
+    // window may have moved to an OS window with a different font size
+    if (cell_size_differs(osw, screen)) resize_screen(osw, screen, false);
     screen->reload_all_gpu_data = true;
     END_WITH_WINDOW
     Py_RETURN_NONE;
@@ -1578,6 +1593,7 @@ PYWRAP1(os_window_font_size) {
             for (size_t wi = 0; wi < tab->num_windows; wi++) {
                 Window *w = tab->windows + wi;
                 resize_screen(os_window, w->render_data.screen, true);
+                resize_screen(os_window, w->window_title_render_data.screen, false);
             }
         }
         // On Wayland with CSD title needs to be re-rendered in a different font size

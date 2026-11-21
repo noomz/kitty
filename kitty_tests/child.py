@@ -6,13 +6,14 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from contextlib import suppress
 from select import select
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from kitty.child import Child, KittyWrapper, children_of_process, cmdline_of_pid, cwd_of_process, memory_used_by_process_tree_rooted_at
-from kitty.constants import is_macos, kitty_exe
+from kitty.constants import is_macos, kitten_exe, kitty_exe
 
 from .base import BaseTest
 
@@ -279,7 +280,7 @@ class LaunchWrapperTest(BaseTest):
         load_prefix_func.clear_override()
         super().tearDown()
 
-    def _fork(self, argv=('/bin/prog', 'arg'), launch_request=None, hold=False, user_func=None):
+    def _fork(self, argv=('/bin/prog', 'arg'), launch_request=None, hold=False, user_func=None, cwd='/', env=None):
         # Fork a Child with spawning faked, returning the Child and the
         # exe and argv that would have been spawned
         from kitty import child as child_module
@@ -293,7 +294,7 @@ class LaunchWrapperTest(BaseTest):
             return 1234567
 
         boss = SimpleNamespace(encryption_public_key='key', listening_on='', window_id_map={})
-        c = Child(list(argv), '/', env={'KITTY_WINDOW_ID': '7'}, hold=hold, launch_request=launch_request)
+        c = Child(list(argv), cwd, env={'KITTY_WINDOW_ID': '7', **(env or {})}, hold=hold, launch_request=launch_request)
         with (
             patch.object(child_module.fast_data_types, 'spawn', spawn),
             patch.object(child_module.fast_data_types, 'get_boss', return_value=boss),
@@ -389,6 +390,23 @@ class LaunchWrapperTest(BaseTest):
             with suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
 
+    def _assert_root_pid_settles(self, c: Child, expected: int, timeout: float = 5) -> None:
+        # Reading the process tree from /proc is not atomic, so on a heavily
+        # loaded machine root_pid can transiently fail to resolve all the way
+        # down to the command. Such results are never cached, so wait for it
+        # to settle, while a wrong result that is cached still fails.
+        end_time = time.monotonic() + timeout
+        while (actual := c.root_pid) != expected and time.monotonic() < end_time:
+            time.sleep(0.01)
+        if actual != expected:
+            tree = {}
+            for pid in [c.pid] + _descendants(c.pid):
+                try:
+                    tree[pid] = cmdline_of_pid(pid), children_of_process(pid)
+                except Exception as err:
+                    tree[pid] = err
+            self.fail(f'root_pid: {actual} != {expected} wrappers: {c.kitty_wrappers} resolved: {c.resolved_root_pid} process tree: {tree}')
+
     def _send_line(self, p: subprocess.Popen) -> None:
         p.stdin.write(b'\n')
         p.stdin.flush()
@@ -473,15 +491,28 @@ read -r _
 
         if not shutil.which('timeout'):
             self.skipTest('No timeout program')
+        from kitty.launch_wrapper import LaunchPrefix, hold_prefix
+
         command = ('/bin/sh', '-c', self.report_pid, 'arg')
-        c, exe, argv = self._fork(argv=command, launch_request=LaunchRequest('tab'), hold=True, user_func=lambda ctx: ['timeout', '100'])
-        with subprocess.Popen(argv, executable=exe, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0) as p:
-            c.pid = p.pid
-            try:
-                command_pid = int(self._read_line(p))
-                self.ae(c.root_pid, command_pid)
-            finally:
-                self._stop_tree(p)
+        for kind, user_func in (
+            ('kitty holds', lambda ctx: ['timeout', '100']),
+            # The wrapper holds the window inside itself
+            ('wrapper holds', lambda ctx: LaunchPrefix(argv=['timeout', '100'] + hold_prefix(), handles_hold=True)),
+        ):
+            with self.subTest(kind=kind):
+                c, exe, argv = self._fork(argv=command, launch_request=LaunchRequest('tab'), hold=True, user_func=user_func)
+                self.ae(argv[0] == 'timeout', kind == 'wrapper holds')
+                with subprocess.Popen(argv, executable=exe, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0) as p:
+                    c.pid = p.pid
+                    try:
+                        command_pid = int(self._read_line(p))
+                        if cmdline_of_pid(command_pid)[0] != command[0]:
+                            # Under emulation, such as qemu-user via binfmt_misc, the
+                            # cmdline of processes starts with the emulator
+                            self.skipTest('Running under emulation')
+                        self._assert_root_pid_settles(c, command_pid)
+                    finally:
+                        self._stop_tree(p)
 
     def test_launch_wrapper(self):
         from kitty.launch_wrapper import LaunchRequest
@@ -512,25 +543,232 @@ read -r _
         self.ae(dict(ctx.user_vars), {'a': 'b'})
         self.ae(ctx.env['KITTY_WINDOW_ID'], '7')
         self.assertFalse(ctx.is_default_shell)
+        self.assertFalse(ctx.hold)
         with self.assertRaises(TypeError):
             ctx.env['x'] = 'y'
         # The hold wrapper runs outside the user's wrapper
         c, exe, argv = self._fork(launch_request=req, hold=True, user_func=self._recording(['/bin/wrapper']))
         self.ae(argv[-2:], ('/bin/prog', 'arg'))
         self.ae(argv[-3], '/bin/wrapper')
+        self.assertTrue(self.contexts[-1].hold)
         self.ae(c.kitty_wrappers[-1], KittyWrapper(('/bin/wrapper',), True, ('/bin/prog', 'arg')))
         self.ae(len(c.kitty_wrappers), 2)
         self.ae(c.kitty_wrappers[0].argv, argv[: len(c.kitty_wrappers[0].argv)])
+        # The full form of the return value
+        from kitty.launch_wrapper import LaunchPrefix, hold_prefix
+
+        c, exe, argv = self._fork(launch_request=req, user_func=self._recording(LaunchPrefix(argv=['/bin/wrapper', '-x'])))
+        self.ae(argv, ('/bin/wrapper', '-x', '/bin/prog', 'arg'))
+        self.ae(c.kitty_wrappers, (KittyWrapper(('/bin/wrapper', '-x'), True, ('-x', '/bin/prog', 'arg')),))
+        # The wrapper can hold the window itself
+        c, exe, argv = self._fork(launch_request=req, hold=True, user_func=self._recording(LaunchPrefix(argv=['/bin/wrapper'], handles_hold=True)))
+        self.ae(argv, ('/bin/wrapper', '/bin/prog', 'arg'))
+        self.ae(c.kitty_wrappers, (KittyWrapper(('/bin/wrapper',), True, ('/bin/prog', 'arg')),))
+        # using the same helper as kitty, which is then skipped over
+        hp = tuple(hold_prefix())
+        c, exe, argv = self._fork(launch_request=req, hold=True, user_func=self._recording(LaunchPrefix(argv=('/bin/wrapper',) + hp, handles_hold=True)))
+        self.ae(argv, ('/bin/wrapper',) + hp + ('/bin/prog', 'arg'))
+        self.ae(c.kitty_wrappers, (KittyWrapper(('/bin/wrapper',), True, hp + ('/bin/prog', 'arg')), KittyWrapper(hp, True)))
+        # handles_hold is ignored with no prefix, as nothing could hold the window
+        c, exe, argv = self._fork(launch_request=req, hold=True, user_func=self._recording(LaunchPrefix(handles_hold=True)))
+        self.ae(argv, hp + ('/bin/prog', 'arg'))
+        # and does nothing when the window is not held
+        c, exe, argv = self._fork(launch_request=req, user_func=self._recording(LaunchPrefix(argv=['/bin/wrapper'], handles_hold=True)))
+        self.ae(argv, ('/bin/wrapper', '/bin/prog', 'arg'))
+        with self.assertRaises(TypeError):
+            LaunchPrefix(['/bin/wrapper'])  # type: ignore
         # Failures and invalid return values result in no prefix
         from kitty import launch_wrapper
 
         errors = []
         with patch.object(launch_wrapper, 'log_error', lambda *a: errors.append(a)):
-            for bad in (ValueError('oops'), 'a string', ['ok', 1], 3):
+            for bad in (ValueError('oops'), 'a string', ['ok', 1], 3, LaunchPrefix(argv='a string'), LaunchPrefix(argv=['ok'], handles_hold=1)):
                 c, exe, argv = self._fork(launch_request=req, user_func=self._recording(bad))
                 self.ae(argv, ('/bin/prog', 'arg'))
                 self.ae(c.kitty_wrappers, ())
             for empty in (None, [], ()):
                 c, exe, argv = self._fork(launch_request=req, user_func=self._recording(empty))
                 self.ae(argv, ('/bin/prog', 'arg'))
-        self.ae(len(errors), 4)
+        self.ae(len(errors), 6)
+
+    def test_launch_wrapper_unresolved_argv(self):
+        # The program is run as requested, so that the wrapper looks it up in
+        # PATH, unless PATH would not find what kitty found
+        from kitty import child as child_module
+        from kitty.launch_wrapper import LaunchRequest
+
+        req = LaunchRequest('tab')
+        with tempfile.TemporaryDirectory() as tdir:
+            on_path, off_path, alt_path = os.path.join(tdir, 'on'), os.path.join(tdir, 'off'), os.path.join(tdir, 'alt')
+            for d, name in ((on_path, 'kitty-test-prog'), (off_path, 'kitty-test-other'), (alt_path, 'kitty-test-prog')):
+                os.makedirs(d, exist_ok=True)
+                exe = os.path.join(d, name)
+                with open(exe, 'w') as f:
+                    f.write('#!/bin/sh\n')
+                os.chmod(exe, 0o755)
+            path = os.pathsep.join((on_path, os.environ.get('PATH', os.defpath)))
+            self.set_options({'shell_integration': frozenset({'disabled'}), 'exe_search_path': {off_path: off_path}})
+            prog, other = os.path.join(on_path, 'kitty-test-prog'), os.path.join(off_path, 'kitty-test-other')
+            with patch.dict(os.environ, {'PATH': path}):
+                wrapper = self._recording(['/bin/wrapper'])
+                # Found in PATH, kept as requested
+                c, exe, argv = self._fork(argv=('kitty-test-prog', 'arg'), launch_request=req, user_func=wrapper)
+                self.ae(self.contexts[-1].argv, ('kitty-test-prog', 'arg'))
+                self.ae(argv, ('/bin/wrapper', 'kitty-test-prog', 'arg'))
+                self.ae(c.resolved_exe, prog)
+                # and without a wrapper, the resolved executable is run
+                c, exe, argv = self._fork(argv=('kitty-test-prog', 'arg'))
+                self.ae(argv, ('kitty-test-prog', 'arg'))
+                self.ae(exe, prog)
+                # Found only via exe_search_path, not in the PATH the child
+                # gets, so the full path is used
+                c, exe, argv = self._fork(argv=('kitty-test-other', 'arg'), launch_request=req, user_func=wrapper)
+                self.ae(self.contexts[-1].argv, (other, 'arg'))
+                self.ae(argv, ('/bin/wrapper', other, 'arg'))
+                # PATH in the child environment finds a different executable
+                # than kitty does
+                c, exe, argv = self._fork(argv=('kitty-test-prog',), launch_request=req, user_func=wrapper, env={'PATH': alt_path})
+                self.ae(self.contexts[-1].argv, (prog,))
+                # Relative entries in PATH are relative to the working
+                # directory of the child
+                c, exe, argv = self._fork(argv=('kitty-test-prog',), launch_request=req, user_func=wrapper, env={'PATH': '.'}, cwd=on_path)
+                self.ae(self.contexts[-1].argv, ('kitty-test-prog',))
+                c, exe, argv = self._fork(argv=('kitty-test-prog',), launch_request=req, user_func=wrapper, env={'PATH': '.'}, cwd=off_path)
+                self.ae(self.contexts[-1].argv, (prog,))
+                # Not found at all, left as is
+                c, exe, argv = self._fork(argv=('kitty-test-missing',), launch_request=req, user_func=wrapper)
+                self.ae(self.contexts[-1].argv, ('kitty-test-missing',))
+                # Paths are never modified
+                c, exe, argv = self._fork(argv=(prog,), launch_request=req, user_func=wrapper)
+                self.ae(self.contexts[-1].argv, (prog,))
+                # The default shell is recognized when requested by name
+                self.set_options({'shell_integration': frozenset({'disabled'}), 'shell': prog})
+                with patch.object(child_module, 'shell_path', prog):
+                    c, exe, argv = self._fork(argv=('kitty-test-prog',), launch_request=req, user_func=wrapper)
+                    self.assertTrue(c.is_default_shell)
+                    self.assertTrue(self.contexts[-1].is_default_shell)
+                    c, exe, argv = self._fork(argv=('kitty-test-prog', 'arg'), launch_request=req, user_func=wrapper)
+                    self.assertFalse(self.contexts[-1].is_default_shell)
+                # The shell is recognized when it is found via a different
+                # path to the same file
+                link = os.path.join(tdir, 'kitty-test-link')
+                os.symlink(prog, link)
+                self.set_options({'shell_integration': frozenset({'disabled'}), 'shell': link})
+                with patch.object(child_module, 'shell_path', link):
+                    c, exe, argv = self._fork(argv=('kitty-test-prog',), launch_request=req, user_func=wrapper)
+                    self.assertTrue(c.is_default_shell)
+                    self.assertTrue(self.contexts[-1].is_default_shell)
+
+    def test_launch_wrapper_default_bash_with_shell_integration(self):
+        from kitty.launch_wrapper import LaunchRequest
+
+        self.set_options({'shell': '/bin/bash', 'shell_integration': frozenset({'enabled'})})
+        req = LaunchRequest('tab')
+        # Exercise in-process shell integration even when Bash is the macOS login shell.
+        with patch('kitty.child.shell_path', '/bin/sh'):
+            for argv, is_default_shell in ((('/bin/bash',), True), (('/bin/bash', '--posix'), False)):
+                with self.subTest(argv=argv):
+                    self._fork(argv=argv, launch_request=req, user_func=self._recording(None))
+                    self.ae(self.contexts[-1].argv, ('/bin/bash', '--posix'))
+                    self.ae(self.contexts[-1].is_default_shell, is_default_shell)
+
+    def test_launch_wrapper_invalid_shell(self):
+        # An invalid shell option falls back to the login shell, with the
+        # wrapper still applied
+        from kitty import utils
+        from kitty.constants import shell_path
+        from kitty.launch_wrapper import LaunchRequest
+
+        opts = self.set_options({'shell': '"unterminated', 'shell_integration': frozenset({'disabled'})})
+        req = LaunchRequest('tab')
+        utils.report_invalid_shell.cache_clear()
+        with patch.object(utils, 'log_error') as log_error:
+            self.ae(utils.resolved_shell(opts), [shell_path])
+            c, exe, argv = self._fork(launch_request=req, user_func=self._recording(['/bin/wrapper']))
+            self.ae(argv, ('/bin/wrapper', '/bin/prog', 'arg'))
+            self.ae(c.kitty_wrappers, (KittyWrapper(('/bin/wrapper',), True, ('/bin/prog', 'arg')),))
+            self.assertFalse(self.contexts[-1].is_default_shell)
+            c, exe, argv = self._fork(argv=(shell_path,), launch_request=req, user_func=self._recording(['/bin/wrapper']))
+            if is_macos:
+                # On macOS the default shell is run via /usr/bin/login and the
+                # run-shell kitten, with the wrapper inside login
+                login_argv = c.kitty_wrappers[0].argv
+                self.ae(login_argv[0], '/usr/bin/login')
+                self.ae(argv[: len(login_argv)], login_argv)
+                rest = argv[len(login_argv) :]
+                self.ae(rest[:3], ('/bin/wrapper', kitten_exe(), 'run-shell'))
+                self.ae(rest[3:5], ('--shell', shell_path))
+            else:
+                self.ae(argv, ('/bin/wrapper', shell_path))
+            self.assertTrue(self.contexts[-1].is_default_shell)
+        utils.report_invalid_shell.cache_clear()
+        # Reported only once
+        log_error.assert_called_once()
+        self.assertIn('Unterminated string', log_error.call_args.args[0])
+
+    def test_launch_wrapper_for_panel_commands(self):
+        # Commands sent to a running panel via single instance are user
+        # launches, not run from any window in the panel
+        from kittens.panel import main as panel
+        from kitty.fast_data_types import get_options
+        from kitty.utils import resolved_shell
+
+        cmd = ['/bin/prog', 'arg']
+        cwd = os.path.realpath(tempfile.gettempdir())
+        cases = (
+            # toggle-visibility, if-running, has active tab, hold, launch type
+            (True, 'new-tab', True, False, 'tab'),
+            (True, 'new-window', True, True, 'window'),
+            (True, 'new-window', False, False, 'tab'),
+            (False, 'new-tab', True, True, 'os-window'),
+        )
+        for toggle, mode, has_active_tab, hold, launch_type in cases:
+            with self.subTest(toggle=toggle, mode=mode, has_active_tab=has_active_tab, hold=hold):
+                # The panel has an active window, which must not be used as the source
+                tab = SimpleNamespace(active_window_for_cwd=SimpleNamespace(id=2), new_special_window=Mock())
+                tm = SimpleNamespace(os_window_id=1, active_tab=tab if has_active_tab else None, new_tab=Mock())
+                boss = Mock(os_window_map={1: tm}, os_window_death_actions={}, window_id_map={})
+                boss.add_os_panel.return_value = 1
+                sys_args = ['panel', f'--if-running={mode}', *(['--toggle-visibility'] if toggle else []), *(['--hold'] if hold else []), *cmd]
+                with (
+                    patch.object(panel, 'args', panel.parse_panel_args([])[0]),
+                    patch.object(panel, 'mtime_map', {}),
+                    patch.object(panel, 'current_focused_os_window_id', return_value=0),
+                    patch.object(panel, 'layer_shell_config_for_os_window', return_value=None),
+                    patch.object(panel, 'set_layer_shell_config'),
+                    patch.object(panel, 'toggle_os_window_visibility'),
+                ):
+                    panel.handle_single_instance_command(boss, sys_args, {'X': 'y', 'XDG_ACTIVATION_TOKEN': 't', 'VTE_VERSION': '1'}, cwd=cwd)
+                launch = tab.new_special_window if launch_type == 'window' else tm.new_tab
+                launch.assert_called_once()
+                sw = launch.call_args.args[0]
+                # Cleaned up as for other single instance commands
+                self.ae(sw.env, {'X': 'y'})
+                self.ae(sw.hold, hold)
+                self.ae(sw.cwd, cwd)
+                wrapper = self._recording(['/bin/wrapper'])
+                _, _, argv = self._fork(argv=sw.cmd, launch_request=sw.launch_request, hold=sw.hold, cwd=sw.cwd or '/', user_func=wrapper)
+                self.ae(argv[-3:], ('/bin/wrapper', *cmd))
+                if hold:
+                    self.assertNotEqual(argv[0], '/bin/wrapper')
+                ctx = self.contexts[-1]
+                self.ae(ctx.launch_type, launch_type)
+                # The command does not come from the active window of the panel
+                self.assertIsNone(ctx.source_window_id)
+                self.assertIsNone(ctx.source_pid)
+        # A new panel without a command runs the default shell, not kitty's
+        # internal run-shell kitten, so the wrapper sees the actual shell
+        boss = Mock(os_window_map={1: tm}, os_window_death_actions={}, window_id_map={})
+        boss.add_os_panel.return_value = 1
+        tm.new_tab.reset_mock()
+        with patch.object(panel, 'args', panel.parse_panel_args([])[0]), patch.object(panel, 'mtime_map', {}):
+            panel.handle_single_instance_command(boss, ['panel'], {})
+        sw = tm.new_tab.call_args.args[0]
+        shell = resolved_shell(get_options())
+        self.ae(sw.cmd, shell)
+        self.ae(sw.launch_request.launch_type, 'os-window')
+        # No cwd sent by the client, so the default is used
+        self.assertIsNone(sw.cwd)
+        self._fork(argv=sw.cmd, launch_request=sw.launch_request, user_func=self._recording(None))
+        self.ae(self.contexts[-1].argv, tuple(shell))
+        self.assertTrue(self.contexts[-1].is_default_shell)
