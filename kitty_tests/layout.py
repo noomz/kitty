@@ -1713,6 +1713,42 @@ class TestProportionalSplits(BaseTest):
 
 
 class TestWindowHelpers(BaseTest):
+    def test_clear_bell_indicators(self):
+        from kitty.boss import Boss
+        from kitty.window import Window
+
+        class Tab(list):
+            def relayout_borders(self):
+                pass
+
+            def mark_tab_bar_dirty(self):
+                pass
+
+        boss = Boss.__new__(Boss)
+        boss.window_for_dispatch = None
+        boss.os_window_map, boss.window_id_map = {}, {}
+        for os_window_id in (1, 2):
+            tab = Tab()
+            boss.os_window_map[os_window_id] = [tab]
+            for wid in (10 * os_window_id + 1, 10 * os_window_id + 2):
+                w = Window.__new__(Window)
+                w.id, w.os_window_id, w.tabref, w.needs_attention = wid, os_window_id, weakref.ref(tab), True
+                boss.window_id_map[wid] = w
+                tab.append(w)
+
+        with patch('kitty.boss.cancel_bell_attention') as cancel:
+            boss.clear_bell_indicators('id:11')
+            cancel.assert_not_called()  # window 12 still rings in OS window 1
+            boss.clear_bell_indicators('id:12')
+            cancel.assert_called_once_with(1)
+            cancel.reset_mock()
+            boss.os_window_map[2][0].pop()  # close window 22
+            boss.cancel_bell_attention_if_idle((2,))
+            cancel.assert_not_called()  # window 21 still rings in OS window 2
+            boss.clear_bell_indicators()
+            self.assertFalse(any(w.needs_attention for w in boss.all_windows))
+            self.ae({c.args[0] for c in cancel.call_args_list}, {1, 2})
+
     def test_edge_widths_launch_args(self):
         ew = EdgeWidths({'left': 1, 'right': 2, 'top': 3, 'bottom': 4})
         for prefix in ('padding', 'margin'):

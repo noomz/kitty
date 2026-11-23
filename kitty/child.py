@@ -496,23 +496,30 @@ class Child:
         self.should_run_via_run_shell_kitten = is_macos and self.is_default_shell
         self.hold = hold
 
-    def use_resolved_exe_if_not_in_path(self, path: str) -> None:
+    def use_resolved_exe_if_not_in_path(self, path: str | None) -> None:
         # The command is run as requested, so that it is looked up in PATH
         # by any wrapper that runs it and sees itself as invoked, the way a
         # shell would run it. Unless PATH would not find the executable kitty
         # found, for example, via exe_search_path, in which case the full path
-        # to the executable is used.
+        # to the executable is used. A path of None means the lookup cannot be
+        # predicted, so the full path is always used.
         if not self.argv:
             return
         name = self.argv[0]
         if os.sep in name or self.resolved_exe == name:
             return
+        if path is None:
+            self.argv[0] = self.resolved_exe
+            return
         import shutil
 
-        # Relative entries in PATH are relative to the working directory of
-        # the child, not of kitty
-        path = os.pathsep.join(os.path.join(self.cwd, x) for x in path.split(os.pathsep)) if path else ''
-        found = shutil.which(name, path=path) if path else None
+        if path:
+            # Resolve relative PATH entries from the child's working directory.
+            path = os.pathsep.join(os.path.join(self.cwd, x) for x in path.split(os.pathsep))
+            found = shutil.which(name, path=path)
+        else:
+            # An empty PATH searches the child's working directory.
+            found = shutil.which(os.path.join(self.cwd, name))
         if found is not None:
             try:
                 if os.path.samefile(found, self.resolved_exe):
@@ -558,7 +565,15 @@ class Child:
         elif opts.terminfo_type == 'direct':
             env['TERMINFO'] = base64_terminfo_data()
         env['KITTY_INSTALLATION_DIR'] = kitty_base_dir
-        self.use_resolved_exe_if_not_in_path(env.get('PATH', os.defpath))
+        path: str | None = env.get('PATH', DELETE_ENV_VAR)
+        if self.hold and (not path or path is DELETE_ENV_VAR):
+            # The hold kitten looks up the program in Go, which does not search
+            # the working directory for an empty PATH and uses its own default
+            # search path for an unset PATH
+            path = None
+        elif path is DELETE_ENV_VAR:
+            path = os.defpath
+        self.use_resolved_exe_if_not_in_path(path)
         self.unmodified_argv = list(self.argv)
         if not self.should_run_via_run_shell_kitten and 'disabled' not in opts.shell_integration:
             from .shell_integration import modify_shell_environ

@@ -87,6 +87,7 @@ from .fast_data_types import (
     add_timer,
     apply_options_update,
     background_opacity_of,
+    cancel_bell_attention,
     change_background_opacity,
     change_drag_thumbnail,
     cocoa_hide_app,
@@ -1209,6 +1210,8 @@ class Boss:
             if tab is not None:
                 tab.remove_window(window)
                 self._cleanup_tab_after_window_removal(tab)
+            if window.needs_attention:
+                self.cancel_bell_attention_if_idle((os_window_id,))
             for removal_action in window.actions_on_removal:
                 try:
                     removal_action(window)
@@ -2108,7 +2111,7 @@ class Boss:
 
         if key_action is not None:
             f = getattr(self, key_action.func, None)
-            if f is not None:
+            if callable(f):
                 orig, self.window_for_dispatch = self.window_for_dispatch, window_for_dispatch
                 try:
                     report_match(f)
@@ -2126,7 +2129,8 @@ class Boss:
         if tab is None or window is None:
             return False
         if key_action is not None:
-            f = getattr(tab, key_action.func, getattr(window, key_action.func, None))
+            # Only call methods, not data attributes that happen to share the action's name
+            f = next((x for x in (getattr(tab, key_action.func, None), getattr(window, key_action.func, None)) if callable(x)), None)
             if f is not None:
                 passthrough = f(*key_action.args)
                 report_match(f)
@@ -3204,7 +3208,7 @@ class Boss:
         def callback(timer_id: int | None) -> None:
             self.dispatch_action(actions.pop(0), window_for_dispatch, dispatch_type)
             if actions:
-                self.drain_actions(actions)
+                self.drain_actions(actions, window_for_dispatch, dispatch_type)
 
         add_timer(callback, 0, False)
 
@@ -4355,6 +4359,50 @@ class Boss:
         tm = self.active_tab_manager_with_dispatch
         if tm is not None:
             tm.toggle_tab(match_expression)
+
+    @ac(
+        'win',
+        """
+        Clear the bell indicators of windows
+
+        Clears the visual indicators of a rung bell, such as :opt:`bell_border_color`
+        and :opt:`bell_on_tab`, without needing to focus the windows that rang
+        the bell. By default, clears them for all windows. Optionally, specify
+        an expression to only clear them for matching windows. See
+        :ref:`search_syntax` for details on the match expression.
+
+        The system attention request from :opt:`window_alert_on_bell` is
+        dismissed once all bell indicators in its OS window have been cleared.
+        Not supported on Wayland, where such requests cannot be withdrawn.
+
+        For example::
+
+            # Clear bell indicators in all windows
+            map f1 clear_bell_indicators
+            # Clear bell indicators only in the windows of the currently active tab
+            map f2 clear_bell_indicators state:parent_focused
+            # Clear bell indicators only in the windows of the focused OS window
+            map f3 clear_bell_indicators state:focused_os_window
+        """,
+    )
+    def clear_bell_indicators(self, match_expression: str = '') -> None:
+        if match_expression:
+            try:
+                windows = list(self.match_windows(match_expression, self.window_for_dispatch or self.active_window))
+            except Exception as e:
+                self.show_error(_('Invalid match expression'), f'{match_expression}\n{e}')
+                return
+        else:
+            windows = list(self.all_windows)
+        for w in windows:
+            w.clear_needs_attention()
+        self.cancel_bell_attention_if_idle({w.os_window_id for w in windows})
+
+    def cancel_bell_attention_if_idle(self, os_window_ids: Iterable[int]) -> None:
+        """Cancel the system attention request of the specified OS windows, if none of their windows need attention"""
+        pending = {w.os_window_id for w in self.all_windows if w.needs_attention}
+        for os_window_id in set(os_window_ids) - pending:
+            cancel_bell_attention(os_window_id)
 
     def update_progress_in_dock(self) -> None:
         if not is_macos:

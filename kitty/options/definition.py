@@ -1635,6 +1635,8 @@ Some text or a Unicode symbol to show on the tab if a window in the tab that
 does not have focus has a bell. If you want to use leading or trailing
 spaces, surround the text with quotes. See :opt:`tab_title_template` for how
 this is rendered.
+The bell indicator is cleared when the window is focused or by
+the :ac:`clear_bell_indicators` action.
 
 For backwards compatibility, values of :code:`yes`, :code:`y` and :code:`true`
 are converted to the default bell symbol and :code:`no`, :code:`n`,
@@ -1848,10 +1850,11 @@ opt(
     option_type='optional_edge_width',
     long_text="""
 The window margin to use when only a single window is visible (in pts). Negative
-values will cause the value of :opt:`window_margin_width` to be used instead. A
-single value sets all four sides. Two values set the vertical and horizontal
-sides. Three values set top, horizontal and bottom. Four values set top, right,
-bottom and left.
+values will cause the value of :opt:`window_margin_width` to be used instead.
+A tab that has docks, including the docks of its OS window, never counts as
+showing a single window, see :ref:`docks`. A single value sets all four sides.
+Two values set the vertical and horizontal sides. Three values set top,
+horizontal and bottom. Four values set top, right, bottom and left.
 """,
 )
 
@@ -1887,10 +1890,11 @@ opt(
     option_type='optional_edge_width',
     long_text="""
 The window padding to use when only a single window is visible (in pts). Negative
-values will cause the value of :opt:`window_padding_width` to be used instead. A
-single value sets all four sides. Two values set the vertical and horizontal
-sides. Three values set top, horizontal and bottom. Four values set top, right,
-bottom and left.
+values will cause the value of :opt:`window_padding_width` to be used instead.
+A tab that has docks, including the docks of its OS window, never counts as
+showing a single window, see :ref:`docks`. A single value sets all four sides.
+Two values set the vertical and horizontal sides. Three values set top,
+horizontal and bottom. Four values set top, right, bottom and left.
 """,
 )
 
