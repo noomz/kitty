@@ -19,7 +19,7 @@ static void
 dealloc(Line *self) {
     if (self->needs_free) {
         PyMem_Free(self->cpu_cells);
-        PyMem_Free(self->gpu_cells);
+        PyMem_Free(self->render_cells);
     }
     tc_decref(self->text_cache);
     Py_TYPE(self)->tp_free((PyObject *)self);
@@ -198,20 +198,26 @@ is_url_lc(const ListOfChars *lc) {
     return true;
 }
 
+// The extent of chars is found from the cells that actually continue them, as
+// a multicell char can be split by a horizontally scrolled smooth scroll
+// region, so that the x of a cell does not give the position of the first cell
+// of its char, and every step moves by at least one cell.
+
 index_type
 next_char_pos(const Line *self, index_type x, index_type num) {
-    const CPUCell *ans = self->cpu_cells + x, *limit = self->cpu_cells + self->xnum;
-    while (num-- && ans < limit) ans += ans->is_multicell ? mcd_x_limit(ans) - ans->x : 1;
-    return ans - self->cpu_cells;
+    while (num-- && x < self->xnum) x = multicell_char_columns(self->cpu_cells, self->xnum, x).limit;
+    return x;
 }
 
 index_type
 prev_char_pos(const Line *self, index_type x, index_type num) {
-    const CPUCell *ans = self->cpu_cells + x, *limit = self->cpu_cells - 1;
-    if (ans->is_multicell) ans -= ans->x;
-    while (num-- && --ans > limit)
-        if (ans->is_multicell) ans -= ans->x;
-    return ans > limit ? (index_type)(ans - self->cpu_cells) : self->xnum;
+    if (x >= self->xnum) return self->xnum;
+    x = multicell_char_columns(self->cpu_cells, self->xnum, x).start;
+    while (num--) {
+        if (!x) return self->xnum;
+        x = multicell_char_columns(self->cpu_cells, self->xnum, x - 1).start;
+    }
+    return x;
 }
 
 
@@ -303,8 +309,8 @@ index_type
 line_url_start_at(Line *self, index_type x, ListOfChars *lc) {
     // Find the starting cell for a URL that contains the position x. A URL is defined as
     // known-prefix://url-chars. If no URL is found self->xnum is returned.
-    if (self->cpu_cells[x].is_multicell && self->cpu_cells[x].x) x = x > self->cpu_cells[x].x ? x - self->cpu_cells[x].x : 0;
     if (x >= self->xnum || self->xnum <= MIN_URL_LEN + 3) return self->xnum;
+    x = multicell_char_columns(self->cpu_cells, self->xnum, x).start;
     index_type ds_pos = 0, t, scale = cell_scale(self->cpu_cells + x);
     // First look for :// ahead of x
     ds_pos = find_colon_slash(self, x + OPT(url_prefixes).max_prefix_len + 3, x < 2 ? 0 : x - 2, lc, scale);
@@ -525,8 +531,11 @@ sprite_at(Line *self, PyObject *x) {
         PyErr_SetString(PyExc_IndexError, "Column number out of bounds");
         return NULL;
     }
-    GPUCell *c = self->gpu_cells + xval;
-    return Py_BuildValue("I", (unsigned int)c->sprite_idx);
+    if (!self->render_cells) {
+        PyErr_SetString(PyExc_ValueError, "This line has no render data");
+        return NULL;
+    }
+    return Py_BuildValue("I", (unsigned int)self->render_cells[xval].sprite_idx);
 }
 
 static void
@@ -616,6 +625,33 @@ write_mark_to_ansi_buf(ANSILineState *s, const char *m) {
     write_mark(m, s->output_buf);
 }
 
+static void
+write_ascii_to_ansi_buf(ANSILineState *s, const char *x) {
+    const size_t n = strlen(x);
+    ensure_space_in_ansi_output_buf(s, n);
+    for (size_t i = 0; i < n; i++) s->output_buf->buf[s->output_buf->len++] = x[i];
+    s->escape_code_written = true;
+}
+
+// The controls that differ from their defaults: BDSM, CSI ? 2501 and SCP
+void
+ansi_bidi_write_prefix(ANSILineState *s) {
+    const LineAttrs a = {.val = s->bidi_prefix};
+    s->bidi_prefix = 0;
+    write_ascii_to_ansi_buf(s, "\x1b[8h");
+    if (a.bidi_auto) write_ascii_to_ansi_buf(s, "\x1b[?2501h");
+    if (a.bidi_rtl) write_ascii_to_ansi_buf(s, "\x1b[2 k");
+}
+
+void
+ansi_bidi_close(ANSILineState *s) {
+    const LineAttrs a = {.val = s->bidi_open};
+    s->bidi_open = s->bidi_prefix = 0;
+    write_ascii_to_ansi_buf(s, "\x1b[8l");
+    if (a.bidi_auto) write_ascii_to_ansi_buf(s, "\x1b[?2501l");
+    if (a.bidi_rtl) write_ascii_to_ansi_buf(s, "\x1b[0 k");
+}
+
 bool
 line_as_ansi(Line *self, ANSILineState *s, index_type start_at, index_type stop_before, char_type prefix_char, bool skip_multiline_non_zero_lines) {
     s->limit = MIN(stop_before, xlimit_for_line(self));
@@ -631,32 +667,34 @@ line_as_ansi(Line *self, ANSILineState *s, index_type start_at, index_type stop_
             case OUTPUT_START: write_mark_to_ansi_buf(s, "C"); break;
         }
     }
+    // after the mark, so that output cut at the mark keeps it
+    if (UNLIKELY(s->bidi_prefix)) ansi_bidi_write_prefix(s);
     if (s->limit <= start_at) {
         if (s->output_buf->active_hyperlink_id && start_at == 0 && !self->cpu_cells[0].hyperlink_id) write_hyperlink_to_ansi_buf(s, 0);
         return s->escape_code_written;
     }
 
-    static const GPUCell blank_cell = {0};
-    GPUCell *cell;
-    if (s->prev_gpu_cell == NULL) s->prev_gpu_cell = &blank_cell;
-    const CellAttrs mask_for_sgr = {.val = SGR_MASK};
-
-#define CMP_ATTRS (cell->attrs.val & mask_for_sgr.val) != (s->prev_gpu_cell->attrs.val & mask_for_sgr.val)
-#define CMP(x) (cell->x != s->prev_gpu_cell->x)
+    const CellStyleTable *style_table = line_style_table(self);
+    uint32_t prev_style_idx = UINT32_MAX;
 
     for (s->pos = start_at; s->pos < s->limit; s->pos++) {
         if (s->output_buf->hyperlink_pool) {
             hyperlink_id_type hid = self->cpu_cells[s->pos].hyperlink_id;
             if (hid != s->output_buf->active_hyperlink_id) write_hyperlink_to_ansi_buf(s, hid);
         }
-        cell = &self->gpu_cells[s->pos];
-        if (CMP_ATTRS || CMP(fg) || CMP(bg) || CMP(decoration_fg)) {
-            const char *sgr = cell_as_sgr(cell, s->prev_gpu_cell);
-            if (*sgr) write_sgr_to_ansi_buf(s, sgr);
+        const uint32_t style_idx = self->cpu_cells[s->pos].style_idx;
+        if (style_idx != prev_style_idx) {
+            // consecutive cells usually have the same style
+            prev_style_idx = style_idx;
+            const CellStyle *cs = style_table_get(style_table, style_idx);
+            if (!style_eq(cs, &s->prev_style)) {
+                const char *sgr = style_as_sgr(cs, &s->prev_style);
+                if (*sgr) write_sgr_to_ansi_buf(s, sgr);
+                s->prev_style = *cs;
+            }
         }
 
         index_type num_cells_to_skip_for_tab = text_in_cell_ansi(s, self->cpu_cells + s->pos, self->text_cache, skip_multiline_non_zero_lines);
-        s->prev_gpu_cell = cell;
         const CPUCell *next = self->cpu_cells + s->pos + 1;
         while (num_cells_to_skip_for_tab && s->pos + 1 < s->limit && cell_is_char(next, ' ')) {
             num_cells_to_skip_for_tab--;
@@ -667,16 +705,17 @@ line_as_ansi(Line *self, ANSILineState *s, index_type start_at, index_type stop_
     close_multicell(s);
     if (s->output_buf->active_hyperlink_id && s->limit < self->xnum && !self->cpu_cells[s->limit].hyperlink_id) write_hyperlink_to_ansi_buf(s, 0);
     return s->escape_code_written;
-#undef CMP_ATTRS
-#undef CMP
 }
 
 static PyObject *
 as_ansi(Line *self, PyObject *a UNUSED) {
 #define as_ansi_doc "Return the line's contents with ANSI (SGR) escape codes for formatting"
+    if (!line_styles_are_valid(self)) return NULL;
     ANSIBuf output = {0};
     ANSILineState s = {.output_buf = &output};
+    ansi_bidi_row_start(&s, self);
     line_as_ansi(self, &s, 0, self->xnum, 0, true);
+    if (s.bidi_open) ansi_bidi_close(&s);
     PyObject *ans = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, output.buf, output.len);
     free(output.buf);
     return ans;
@@ -744,7 +783,7 @@ add_combining_char(Line *self, PyObject *args) {
     text_in_cell(cell, self->text_cache, &lc);
     ensure_space_for_chars(&lc, lc.count + 1);
     lc.chars[lc.count++] = new_char;
-    cell->ch_or_idx = tc_get_or_insert_chars(self->text_cache, &lc);
+    cell->ch_or_idx = tc_get_or_insert_chars_with_glyph(self->text_cache, &lc, cell_registered_glyph(cell, self->text_cache));
     cell->ch_is_idx = true;
     Py_RETURN_NONE;
 }
@@ -760,6 +799,7 @@ set_text(Line *self, PyObject *args) {
     void *buf;
 
     if (!PyArg_ParseTuple(args, "UnnO!", &src, &offset, &sz, &Cursor_Type, &cursor)) return NULL;
+    if (!line_styles_are_valid(self)) return NULL;
     if (PyUnicode_READY(src) != 0) {
         PyErr_NoMemory();
         return NULL;
@@ -771,17 +811,11 @@ set_text(Line *self, PyObject *args) {
         PyErr_SetString(PyExc_ValueError, "Out of bounds offset/sz");
         return NULL;
     }
-    CellAttrs attrs = cursor_to_attrs(cursor);
-    color_type fg = (cursor->sgr.fg & COL_MASK), bg = cursor->sgr.bg & COL_MASK;
-    color_type dfg = cursor->sgr.decoration_fg & COL_MASK;
+    const uint32_t style_idx = style_table_intern_cached(line_style_table(self), &cursor->style, &cursor->style_idx);
 
     for (index_type i = cursor->x; offset < limit && i < self->xnum; i++, offset++) {
-        self->cpu_cells[i] = (CPUCell){0};
+        self->cpu_cells[i] = (CPUCell){.style_idx = style_idx};
         self->cpu_cells[i].ch_or_idx = PyUnicode_READ(kind, buf, offset);
-        self->gpu_cells[i].attrs = attrs;
-        self->gpu_cells[i].fg = fg;
-        self->gpu_cells[i].bg = bg;
-        self->gpu_cells[i].decoration_fg = dfg;
     }
 
     Py_RETURN_NONE;
@@ -795,6 +829,7 @@ cursor_from(Line *self, PyObject *args) {
     unsigned int x, y = 0;
     Cursor *ans;
     if (!PyArg_ParseTuple(args, "I|I", &x, &y)) return NULL;
+    if (!line_styles_are_valid(self)) return NULL;
     if (x >= self->xnum) {
         PyErr_SetString(PyExc_ValueError, "Out of bounds x");
         return NULL;
@@ -806,19 +841,15 @@ cursor_from(Line *self, PyObject *args) {
     }
     ans->x = x;
     ans->y = y;
-    attrs_to_cursor(self->gpu_cells[x].attrs, ans);
-    ans->sgr.fg = self->gpu_cells[x].fg;
-    ans->sgr.bg = self->gpu_cells[x].bg;
-    ans->sgr.decoration_fg = self->gpu_cells[x].decoration_fg & COL_MASK;
+    ans->style = *line_cell_style(self, x);
 
     return (PyObject *)ans;
 }
 
 void
 line_clear_text(Line *self, unsigned int at, unsigned int num, char_type ch) {
-    const CPUCell cc = {.ch_or_idx = ch};
     if (at + num > self->xnum) num = self->xnum > at ? self->xnum - at : 0;
-    memset_array(self->cpu_cells + at, cc, num);
+    for (CPUCell *c = self->cpu_cells + at, *limit = c + num; c < limit; c++) *c = (CPUCell){.ch_or_idx = ch, .style_idx = c->style_idx};
 }
 
 static PyObject *
@@ -833,20 +864,16 @@ clear_text(Line *self, PyObject *args) {
 
 void
 line_apply_cursor(Line *self, const Cursor *cursor, unsigned int at, unsigned int num, bool clear_char) {
-    GPUCell gc = cursor_as_gpu_cell(cursor);
+    const uint32_t style_idx = cursor_style_idx_in(line_style_table(self), cursor);
     if (clear_char) {
 #if BLANK_CHAR != 0
 #error This implementation is incorrect for BLANK_CHAR != 0
 #endif
         if (at + num > self->xnum) { num = at < self->xnum ? self->xnum - at : 0; }
-        memset(self->cpu_cells + at, 0, num * sizeof(CPUCell));
-        memset_array(self->gpu_cells + at, gc, num);
+        fill_blank_cpu_cells(self->cpu_cells + at, num, style_idx);
+        if (self->render_cells) memset(self->render_cells + at, 0, num * sizeof(RenderCell));
     } else {
-        for (index_type i = at; i < self->xnum && i < at + num; i++) {
-            gc.attrs.mark = self->gpu_cells[i].attrs.mark;
-            gc.sprite_idx = self->gpu_cells[i].sprite_idx;
-            memcpy(self->gpu_cells + i, &gc, sizeof(gc));
-        }
+        for (index_type i = at; i < self->xnum && i < at + num; i++) self->cpu_cells[i].style_idx = style_idx;
     }
 }
 
@@ -858,6 +885,7 @@ apply_cursor(Line *self, PyObject *args) {
     unsigned int at = 0, num = 1;
     int clear_char = 0;
     if (!PyArg_ParseTuple(args, "O!|IIp", &Cursor_Type, &cursor, &at, &num, &clear_char)) return NULL;
+    if (!line_styles_are_valid(self)) return NULL;
     line_apply_cursor(self, cursor, at, num, clear_char & 1);
     Py_RETURN_NONE;
 }
@@ -874,10 +902,11 @@ resolve_color(const ColorProfile *cp, color_type val, color_type defval) {
 bool
 colors_for_cell(Line *self, const ColorProfile *cp, index_type *x, color_type *fg, color_type *bg, bool *reversed) {
     if (*x >= self->xnum) return false;
-    while (self->cpu_cells[*x].is_multicell && self->cpu_cells[*x].x && *x) (*x)--;
-    *fg = resolve_color(cp, self->gpu_cells[*x].fg, *fg);
-    *bg = resolve_color(cp, self->gpu_cells[*x].bg, *bg);
-    if (self->gpu_cells[*x].attrs.reverse) {
+    *x = multicell_char_columns(self->cpu_cells, self->xnum, *x).start;
+    const CellStyle *st = line_cell_style(self, *x);
+    *fg = resolve_color(cp, st->fg, *fg);
+    *bg = resolve_color(cp, st->bg, *bg);
+    if (st->attrs.reverse) {
         color_type t = *fg;
         *fg = *bg;
         *bg = t;
@@ -899,21 +928,17 @@ line_get_char(Line *self, index_type at) {
 
 static void
 line_set_char(Line *self, unsigned int at, uint32_t ch, Cursor *cursor, hyperlink_id_type hyperlink_id) {
-    GPUCell *g = self->gpu_cells + at;
-    if (cursor != NULL) {
-        g->attrs = cursor_to_attrs(cursor);
-        g->fg = cursor->sgr.fg & COL_MASK;
-        g->bg = cursor->sgr.bg & COL_MASK;
-        g->decoration_fg = cursor->sgr.decoration_fg & COL_MASK;
-    }
+    CellStyleTable *t = line_style_table(self);
     CPUCell *c = self->cpu_cells + at;
+    CellStyle st = cursor ? cursor->style : *style_table_get(t, c->style_idx);
     *c = (CPUCell){0};
     cell_set_char(c, ch);
     c->hyperlink_id = hyperlink_id;
     if (OPT(underline_hyperlinks) == UNDERLINE_ALWAYS && hyperlink_id) {
-        g->decoration_fg = ((OPT(url_color) & COL_MASK) << 8) | 2;
-        g->attrs.decoration = OPT(url_style);
+        st.decoration_fg = ((OPT(url_color) & COL_MASK) << 8) | 2;
+        st.attrs.decoration = OPT(url_style);
     }
+    c->style_idx = style_table_intern(t, &st);
 }
 
 static PyObject *
@@ -927,6 +952,7 @@ set_char(Line *self, PyObject *args) {
     unsigned int hyperlink_id = 0;
 
     if (!PyArg_ParseTuple(args, "IC|IO!I", &at, &ch, &width, &Cursor_Type, &cursor, &hyperlink_id)) return NULL;
+    if (!line_styles_are_valid(self)) return NULL;
     if (at >= self->xnum) {
         PyErr_SetString(PyExc_ValueError, "Out of bounds");
         return NULL;
@@ -945,7 +971,8 @@ set_attribute(Line *self, PyObject *args) {
     unsigned int val;
     char *which;
     if (!PyArg_ParseTuple(args, "sI", &which, &val)) return NULL;
-    if (!set_named_attribute_on_line(self->gpu_cells, which, val, self->xnum)) {
+    if (!line_styles_are_valid(self)) return NULL;
+    if (!set_named_attribute_on_line(line_style_table(self), self->cpu_cells, self->render_cells, which, val, self->xnum)) {
         PyErr_SetString(PyExc_KeyError, "Unknown cell attribute");
         return NULL;
     }
@@ -978,7 +1005,7 @@ decoration_as_sgr(uint8_t decoration) {
 
 
 const char *
-cell_as_sgr(const GPUCell *cell, const GPUCell *prev) {
+style_as_sgr(const CellStyle *cell, const CellStyle *prev) {
     static char buf[128];
 #define SZ sizeof(buf) - (p - buf) - 2
 #define P(s)                    \
@@ -1028,14 +1055,24 @@ __len__(PyObject *self) {
 
 static int
 __eq__(Line *a, Line *b) {
-    return a->xnum == b->xnum && memcmp(a->cpu_cells, b->cpu_cells, sizeof(CPUCell) * a->xnum) == 0 &&
-           memcmp(a->gpu_cells, b->gpu_cells, sizeof(GPUCell) * a->xnum) == 0;
+    if (a->xnum != b->xnum) return false;
+    if (a->text_cache == b->text_cache) return memcmp(a->cpu_cells, b->cpu_cells, sizeof(CPUCell) * a->xnum) == 0;
+    // Lines from different screens, compare styles by value
+    const CellStyleTable *ta = line_style_table(a), *tb = line_style_table(b);
+    for (index_type x = 0; x < a->xnum; x++) {
+        CPUCell ca = a->cpu_cells[x], cb = b->cpu_cells[x];
+        if (!style_eq(style_table_get(ta, ca.style_idx), style_table_get(tb, cb.style_idx))) return false;
+        ca.style_idx = 0;
+        cb.style_idx = 0;
+        if (memcmp(&ca, &cb, sizeof(ca)) != 0) return false;
+    }
+    return true;
 }
 
 bool
 line_has_mark(Line *line, uint16_t mark) {
     for (index_type x = 0; x < line->xnum; x++) {
-        const uint16_t m = line->gpu_cells[x].attrs.mark;
+        const uint16_t m = line->render_cells ? line->render_cells[x].mark : 0;
         if (m && (!mark || mark == m)) return true;
     }
     return false;
@@ -1052,7 +1089,7 @@ report_marker_error(PyObject *marker) {
 static void
 apply_mark(Line *line, const uint16_t mark, index_type *cell_pos, unsigned int *match_pos) {
 #define MARK \
-    { line->gpu_cells[x].attrs.mark = mark; }
+    { line->render_cells[x].mark = mark; }
     index_type x = *cell_pos;
     MARK;
     (*match_pos)++;
@@ -1105,27 +1142,36 @@ apply_marker(PyObject *marker, Line *line, const PyObject *text) {
         while (x < line->xnum && match_pos <= r) { apply_mark(line, am, &x, &match_pos); }
     }
     Py_DECREF(iter);
-    while (x < line->xnum) line->gpu_cells[x++].attrs.mark = 0;
+    while (x < line->xnum) line->render_cells[x++].mark = 0;
     if (PyErr_Occurred()) report_marker_error(marker);
 }
 
 void
 mark_text_in_line(PyObject *marker, Line *line, ANSIBuf *buf) {
+    if (!line->render_cells) return; // marks are render data
     if (!marker) {
-        for (index_type i = 0; i < line->xnum; i++) line->gpu_cells[i].attrs.mark = 0;
+        for (index_type i = 0; i < line->xnum; i++) line->render_cells[i].mark = 0;
         return;
     }
     PyObject *text = line_as_unicode(line, false, buf);
     if (PyUnicode_GET_LENGTH(text) > 0) {
         apply_marker(marker, line, text);
     } else {
-        for (index_type i = 0; i < line->xnum; i++) line->gpu_cells[i].attrs.mark = 0;
+        for (index_type i = 0; i < line->xnum; i++) line->render_cells[i].mark = 0;
     }
     Py_DECREF(text);
 }
 
 PyObject *
-as_text_generic(PyObject *args, void *container, get_line_func get_line, index_type lines, ANSIBuf *ansibuf, bool add_trailing_newline) {
+as_text_generic(
+    PyObject *args,
+    void *container,
+    get_line_func get_line,
+    index_type lines,
+    ANSIBuf *ansibuf,
+    bool add_trailing_newline,
+    ansi_bidi_above_func *bidi_above,
+    bool continues_previous) {
 #define APPEND(x)                                                           \
     {                                                                       \
         PyObject *retval = PyObject_CallFunctionObjArgs(callback, x, NULL); \
@@ -1144,8 +1190,11 @@ as_text_generic(PyObject *args, void *container, get_line_func get_line, index_t
         Py_DECREF(retval);                                                  \
     }
     PyObject *callback;
-    int as_ansi = 0, insert_wrap_markers = 0;
-    if (!PyArg_ParseTuple(args, "O|pp", &callback, &as_ansi, &insert_wrap_markers)) return NULL;
+    // continues_previous: the output is appended to that of the lines above, so a bidi paragraph it opened stays open, see
+    // ansi_bidi_continue(). continued_by_next: the output of the lines below is appended to it, so a paragraph they continue is
+    // left open.
+    int as_ansi = 0, insert_wrap_markers = 0, continues_previous_arg = 0, continued_by_next = 0;
+    if (!PyArg_ParseTuple(args, "O|pppp", &callback, &as_ansi, &insert_wrap_markers, &continues_previous_arg, &continued_by_next)) return NULL;
     PyObject *t = NULL;
     RAII_PyObject(nl, PyUnicode_FromString("\n"));
     RAII_PyObject(cr, PyUnicode_FromString("\r"));
@@ -1153,7 +1202,9 @@ as_text_generic(PyObject *args, void *container, get_line_func get_line, index_t
     if (nl == NULL || cr == NULL || sgr_reset == NULL) return NULL;
     ANSILineState s = {.output_buf = ansibuf};
     ansibuf->active_hyperlink_id = 0;
-    bool need_newline = false;
+    // before any line is got, as the lines may be views that reading the lines above changes
+    if (as_ansi && bidi_above && lines) ansi_bidi_continue(&s, bidi_above(container), continues_previous || continues_previous_arg);
+    bool need_newline = false, last_continued = false;
     for (index_type y = 0; y < lines; y++) {
         Line *line = get_line(container, y);
         if (!line) {
@@ -1168,8 +1219,11 @@ as_text_generic(PyObject *args, void *container, get_line_func get_line, index_t
             // pretty sad performance wise, but I guess it will remain as it
             // makes writing pagers easier.
             // see https://github.com/kovidgoyal/kitty/issues/2381
-            s.prev_gpu_cell = NULL;
+            zero_at_ptr(&s.prev_style);
+            ansi_bidi_row_start(&s, line);
             line_as_ansi(line, &s, 0, line->xnum, 0, true);
+            // the paragraph is cut by the end of the lines unless the output below continues it
+            ansi_bidi_row_end(&s, line->cpu_cells[line->xnum - 1].next_char_was_wrapped && (y + 1 < lines || continued_by_next));
             t = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, ansibuf->buf, ansibuf->len);
             if (t && ansibuf->len > 0) APPEND(sgr_reset);
         } else {
@@ -1177,7 +1231,15 @@ as_text_generic(PyObject *args, void *container, get_line_func get_line, index_t
         }
         APPEND_AND_DECREF(t);
         if (insert_wrap_markers) APPEND(cr);
-        need_newline = !line->cpu_cells[line->xnum - 1].next_char_was_wrapped;
+        last_continued = line->cpu_cells[line->xnum - 1].next_char_was_wrapped;
+        need_newline = !last_continued;
+    }
+    // A paragraph cut by a line that could not be got
+    if (s.bidi_open && !(continued_by_next && last_continued)) {
+        ansibuf->len = 0;
+        ansi_bidi_close(&s);
+        t = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, ansibuf->buf, ansibuf->len);
+        APPEND_AND_DECREF(t);
     }
     if (need_newline && add_trailing_newline) APPEND(nl);
     if (ansibuf->active_hyperlink_id) {
@@ -1236,7 +1298,17 @@ alloc_line(TextCache *tc) {
     return ans;
 }
 
-RICHCMP(Line)
+static PyObject *
+richcmp(PyObject *obj1, PyObject *obj2, int op) {
+    // Like RICHCMP() but fails for copies whose formatting is no longer valid
+    if (op != Py_EQ && op != Py_NE) Py_RETURN_NOTIMPLEMENTED;
+    if (!PyObject_TypeCheck(obj1, &Line_Type) || !PyObject_TypeCheck(obj2, &Line_Type)) Py_RETURN_FALSE;
+    Line *a = (Line *)obj1, *b = (Line *)obj2;
+    if (!line_styles_are_valid(a) || !line_styles_are_valid(b)) return NULL;
+    const bool eq = __eq__(a, b);
+    return Py_NewRef((op == Py_EQ) == eq ? Py_True : Py_False);
+}
+
 INIT_TYPE(Line)
 // }}}
 
@@ -1245,11 +1317,13 @@ copy_char(Line *self, PyObject *args) {
     unsigned int src, dest;
     Line *to;
     if (!PyArg_ParseTuple(args, "IO!I", &src, &Line_Type, &to, &dest)) return NULL;
+    if (!line_styles_are_valid(self) || !line_styles_are_valid(to)) return NULL;
     if (src >= self->xnum || dest >= to->xnum) {
         PyErr_SetString(PyExc_ValueError, "Out of bounds");
         return NULL;
     }
     COPY_CELL(self, src, to, dest);
+    if (self->text_cache != to->text_cache) remap_style_idx_range(line_style_table(to), line_style_table(self), to->cpu_cells + dest, 1);
     Py_RETURN_NONE;
 }
 

@@ -5,7 +5,7 @@ import os
 import re
 import tempfile
 
-from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, SCROLL_LINE, VT_PARSER_BUFFER_SIZE, Color, ColorProfile, Cursor
+from kitty.fast_data_types import DECAWM, DECCOLM, DECOM, IRM, SCROLL_LINE, VT_PARSER_BUFFER_SIZE, Color, ColorProfile, Cursor, test_set_batched_non_ascii_draw
 from kitty.marks import marker_from_function, marker_from_regex, marker_from_text
 from kitty.utils import path_from_osc7_url
 from kitty.window import is_conemu_osc9_command, pagerhist
@@ -170,6 +170,17 @@ class TestScreen(BaseTest):
         s.draw('ab')
         self.ae(str(s.line(0)), 'X')
         self.ae((s.cursor.x, s.cursor.y), (4, 1))
+
+        # a line scrolled in by a line feed is known to have no multicell
+        # chars, which must stop being assumed once one is drawn on it, all
+        # in a single draw
+        s = self.create_screen()
+        parse_bytes(s, b'x\r\n' * s.lines + 'ニチ\ra'.encode())
+        self.ae(str(s.line(s.lines - 1)), 'a チ')
+        self.ae((s.cursor.x, s.cursor.y), (1, s.lines - 1))
+        s = self.create_screen()
+        parse_bytes(s, b'x\r\n' * s.lines + 'ニチ\r\t\ra'.encode())
+        self.ae(str(s.line(s.lines - 1)), 'a チ')
 
         # REP must repeat the last char of a batched run
         s = self.create_screen()
@@ -942,6 +953,157 @@ class TestScreen(BaseTest):
         finally:
             test_set_history_reuse(True)
 
+    def test_erase_in_line_removes_intersecting_multicell_chars(self):
+        for how, wide_expected in ((0, 'ab'), (1, '    cd'), (2, '')):
+            s = self.create_screen(cols=8, lines=3)
+            s.draw('ab日cd')
+            s.cursor.x = 3  # second cell of the wide char
+            parse_bytes(s, f'\x1b[{how}K'.encode())
+            self.ae(str(s.line(0)), wide_expected, f'how={how}')
+            self.assertFalse(any(c['mcd'] for c in s.cpu_cells(0)), f'how={how}')
+            # Erasing part of a char that spans two lines must remove all of it
+            s = self.create_screen(cols=8, lines=3)
+            s.draw('ab')
+            draw_multicell(s, 'X', scale=2)
+            s.draw('cd')
+            s.cursor.x, s.cursor.y = 3, 1
+            parse_bytes(s, f'\x1b[{how}K'.encode())
+            self.ae(str(s.line(0)), 'ab  cd', f'how={how}')
+            self.assertFalse(any(c['mcd'] for y in range(2) for c in s.cpu_cells(y)), f'how={how}')
+
+    def test_batched_non_ascii_draw(self):
+        import random
+
+        from kitty.fast_data_types import test_set_batched_non_ascii_draw
+
+        texts = (
+            '日本語の文字列',
+            'éàüñ',
+            'αβγ',
+            'é',
+            '😀',
+            '👍🏽',
+            '👨‍👩‍👧',
+            '❤️',
+            '😀︎',
+            '\U0001f1fa\U0001f1f8',
+            'กำ',
+            '각',
+            '\U0010eeee̅',
+            'abc',
+            ' ',
+            '̀',
+            '‍',
+            '\x85',
+            '\x9b',
+            '￿',
+            '\U000e0001',
+            # runs of combining chars, including more than fit in a cell
+            'a\u0300\u0301',
+            'e\u0301\u0302\u0303\u0304',
+            'x' + '\u0300\u0310\u0320' * 10,
+            '日\u0300\u0301',
+            '\u0301\u0302',
+            '\u0300\ufe0f\u0301',
+            '👍\u0300\u200d',
+            'ก\u0e33\u0300',
+        )
+
+        def ops_for(seed, cols):
+            rng = random.Random(seed)
+            ops = []
+            for i in range(rng.randint(20, 100)):
+                r = rng.random()
+                if r < 0.5:
+                    ops.append(('draw', ''.join(rng.choice(texts) for _ in range(rng.randint(1, 2 * cols)))))
+                elif r < 0.6:
+                    ops.append(
+                        (
+                            'bytes',
+                            rng.choice(
+                                (
+                                    b'\x1b[1;31m',
+                                    b'\x1b[4:3;48;2;1;2;3m',
+                                    b'\x1b[m',
+                                    b'\x1b]8;;http://x\x1b\\',
+                                    b'\x1b]8;;\x1b\\',
+                                )
+                            ),
+                        )
+                    )
+                elif r < 0.65:
+                    ops.append(('bytes', rng.choice((b'\x1b[4h', b'\x1b[4l', b'\x1b(0', b'\x1b(B', b'\x1b[3b'))))
+                elif r < 0.75:
+                    ops.append(('bytes', f'\x1b[{rng.randint(1, 3)}{rng.choice("CDAB")}'.encode()))
+                elif r < 0.8:
+                    ops.append(('mc', rng.choice('A日'), rng.randint(2, 3)))
+                elif r < 0.85:
+                    ops.append(('bytes', f'\x1b[{rng.randint(1, 4)};{rng.randint(1, cols)}H'.encode()))
+                else:
+                    ops.append(('nl',))
+            return ops
+
+        def build(ops, cols, lines):
+            s = self.create_screen(cols=cols, lines=lines, scrollback=20)
+            for op in ops:
+                if op[0] == 'draw':
+                    s.draw(op[1])
+                elif op[0] == 'bytes':
+                    parse_bytes(s, op[1])
+                elif op[0] == 'mc':
+                    draw_multicell(s, op[1], scale=op[2])
+                else:
+                    s.carriage_return(), s.linefeed()
+            # makes last_graphic_char observable
+            parse_bytes(s, b'\x1b[4l\x1b(B\x1b[2b')
+            return s
+
+        def compare(a, b, msg):
+            # Cells are compared by content rather than raw value, as cells with
+            # multiple codepoints store indices into the text cache, which can
+            # differ, since batched drawing does not add the intermediate texts
+            # of runs of combining chars to the cache.
+            self.ae((a.cursor.x, a.cursor.y), (b.cursor.x, b.cursor.y), msg)
+            self.ae(a.historybuf.count, b.historybuf.count, msg)
+            for i in range(a.historybuf.count):
+                self.ae(a.historybuf.line(i).as_ansi(), b.historybuf.line(i).as_ansi(), f'{msg} history line {i}')
+                self.ae(a.cpu_cells(-1 - i), b.cpu_cells(-1 - i), f'{msg} history line {i}')
+            for i in range(a.lines):
+                self.ae(a.linebuf.line(i).as_ansi(), b.linebuf.line(i).as_ansi(), f'{msg} line {i}')
+                self.ae(a.cpu_cells(i), b.cpu_cells(i), f'{msg} line {i}')
+                self.ae(a.linebuf.is_continued(i), b.linebuf.is_continued(i), f'{msg} line {i}')
+            self.ae(a.linebuf.dirty_lines(), b.linebuf.dirty_lines(), msg)
+
+        # A run drawn up to an existing multicell char must leave the grapheme
+        # segmentation state as it is after the last char drawn: here an unpaired
+        # regional indicator precedes the run and another one is drawn onto the
+        # wide char by the scalar path
+        ri_a, ri_b = '\U0001f1fa', '\U0001f1f8'
+        fixed = []
+        for prefix in ('', 'é', 'éü', '日'):
+            for x in range(1, 6):
+                fixed.append(
+                    (10, 2, [('bytes', f'\x1b[1;{x + 1}H'.encode()), ('draw', '日'), ('bytes', b'\x1b[H'), ('draw', ri_a), ('draw', prefix + ri_b + 'é')])
+                )
+        try:
+            for i, (cols, lines, ops) in enumerate(fixed):
+                test_set_batched_non_ascii_draw(True)
+                a = build(ops, cols, lines)
+                test_set_batched_non_ascii_draw(False)
+                b = build(ops, cols, lines)
+                compare(a, b, f'fixed={i} ops={ops}')
+            for seed in range(400):
+                rng = random.Random(seed)
+                cols, lines = rng.randint(1, 14), rng.randint(1, 6)
+                ops = ops_for(seed, cols)
+                test_set_batched_non_ascii_draw(True)
+                a = build(ops, cols, lines)
+                test_set_batched_non_ascii_draw(False)
+                b = build(ops, cols, lines)
+                compare(a, b, f'seed={seed} cols={cols} lines={lines}')
+        finally:
+            test_set_batched_non_ascii_draw(True)
+
     def test_tab_stops(self):
         # Taken from vttest/main.c
         s = self.create_screen(cols=80, lines=2)
@@ -1166,6 +1328,18 @@ class TestScreen(BaseTest):
         s.erase_characters(2)
         self.ae(s.linebuf.dirty_lines(), [0, 1, 2])
 
+        # combining chars written at the start of a soft wrapped line are
+        # added to the last cell of the row above, which must be redrawn
+        for combining in ('́', '́̂'):
+            s = self.create_screen()
+            s.draw('a' * (s.columns + 2))
+            s.carriage_return()
+            s.update_only_line_graphics_data()  # marks all lines clean
+            self.assertFalse(s.linebuf.dirty_lines())
+            s.draw(combining)
+            self.ae(str(s.line(0)), 'a' * (s.columns - 1) + 'a' + combining)
+            self.ae(s.linebuf.dirty_lines(), [0, 1])
+
     def test_selection_as_text(self):
         s = self.create_screen()
         for i in range(2 * s.lines):
@@ -1227,6 +1401,107 @@ class TestScreen(BaseTest):
         self.ae(s.text_for_selection(), ('1234 ', '5'))
         self.ae(s.text_for_selection(False, True), ('1234 ', '5'))
         self.ae(s.text_for_selection(True, True), ('1234 ', '5', ''))
+
+    def test_selection_during_partial_scroll(self):
+        # Scrolling only part of the screen must leave selections on the rows
+        # outside the scroll region alone and move the ones inside it with their text
+        def screen(start, end=None, alt=False):
+            s = self.create_screen(cols=10, lines=6)
+            if alt:
+                parse_bytes(s, b'\x1b[?1049h')
+            parse_bytes(s, b'11111\r\n22222\r\n33333\r\n44444\r\n55555\r\n66666')
+            s.start_selection(0, start)
+            s.update_selection(5, start if end is None else end, True)
+            return s
+
+        def check(start, end, scroll, moved, alt=False):
+            s = screen(start, end, alt)
+            before = s.text_for_selection()
+            parse_bytes(s, scroll)
+            self.ae(s.text_for_selection(), before if moved else ())
+            return s
+
+        # Append a line above a fixed area at the bottom of the screen, pushing
+        # the top line into the scrollback, as done by programs such as Codex
+        append_history = b'\x1b[1;3r\x1b[3;1H\x1bDnew\x1b[r'
+        for row in range(6):
+            with self.subTest(scroll='up via history', row=row):
+                check(row, None, append_history, True)
+        # A selection entirely inside the region and the scrollback moves with
+        # it, one spanning moving and stationary rows cannot follow both
+        for start, end, moved in ((0, 2, True), (2, 3, False)):
+            with self.subTest(scroll='spanning via history', start=start, end=end):
+                check(start, end, append_history, moved)
+        # A selection moved into the scrollback keeps following its text
+        with self.subTest(scroll='further into scrollback'):
+            s = check(1, None, append_history, True)
+            parse_bytes(s, b'\x1b[6;1H\x1bD')
+            self.ae(s.text_for_selection(), ('22222',))
+
+        for alt in (False, True):
+            # Scroll a region not touching the top of the screen up, discarding its top line
+            for row in range(6):
+                with self.subTest(scroll='up', row=row, alt=alt):
+                    check(row, None, b'\x1b[2;5r\x1b[1S', row != 1, alt)
+            # Scroll a region down, discarding its bottom line
+            for row in range(6):
+                with self.subTest(scroll='down', row=row, alt=alt):
+                    check(row, None, b'\x1b[3;5r\x1b[1T', row != 4, alt)
+            for start, end, moved in ((1, 2, False), (4, 5, False), (2, 3, True), (0, 1, True)):
+                with self.subTest(scroll='spanning', start=start, end=end, alt=alt):
+                    check(start, end, b'\x1b[3;5r\x1b[1T', moved, alt)
+
+        # Lines pulled back from the scrollback carry their selection back onto the screen
+        for row in (0, 1, 5):
+            with self.subTest(scroll='down via history', row=row):
+                s = check(row, None, append_history, True)
+                before = s.text_for_selection()
+                parse_bytes(s, b'\x1b[1;3r\x1b[1+T')
+                self.ae(s.text_for_selection(), before)
+                self.ae(str(s.line(0)), '11111')
+        # A selection spanning the bottom of a region filled from the scrollback
+        with self.subTest(scroll='spanning bottom of region filled from scrollback'):
+            check(4, 5, append_history + b'\x1b[1;5r\x1b[1+T', False)
+
+        for alt in (False, True):
+            # Reverse index at the top of the region, discarding its bottom line
+            for row in range(6):
+                with self.subTest(scroll='reverse index', row=row, alt=alt):
+                    check(row, None, b'\x1b[2;4r\x1b[2;1H\x1bM', row != 3, alt)
+            # On the alternate screen there is no scrollback for the top line to go into
+            if alt:
+                for row in range(6):
+                    with self.subTest(scroll='up from top of alt screen', row=row):
+                        check(row, None, b'\x1b[1;4r\x1b[1S', row != 0, alt)
+            # Full screen scrolls that discard a line
+            for row in range(6):
+                with self.subTest(scroll='full down', row=row, alt=alt):
+                    check(row, None, b'\x1b[1T', row != 5, alt)
+            if alt:
+                for row in range(6):
+                    with self.subTest(scroll='full up on alt screen', row=row):
+                        check(row, None, b'\x1b[1S', row != 0, alt)
+
+        # Selections in a scrollback that does not move stay on their text
+        for scroll in (b'\x1b[H\x1bM', b'\x1b[1T', b'\x1b[3;5r\x1b[1T'):
+            with self.subTest(scroll='scrollback stays', seq=scroll):
+                s = self.create_screen(cols=10, lines=6)
+                parse_bytes(s, b'aaaaa\r\nbbbbb\r\n11111\r\n22222\r\n33333\r\n44444\r\n55555\r\n66666')
+                s.scroll(SCROLL_LINE, True)
+                s.scroll(SCROLL_LINE, True)
+                s.start_selection(0, 0)
+                s.update_selection(5, 0, True)
+                self.ae(s.text_for_selection(), ('aaaaa',))
+                parse_bytes(s, scroll)
+                self.ae(s.text_for_selection(), ('aaaaa',))
+
+        # An empty, in progress selection follows its text and the selection can then be extended
+        with self.subTest(scroll='empty selection'):
+            s = screen(2)
+            s.start_selection(0, 2)
+            parse_bytes(s, b'\x1b[2;5r\x1b[1S')
+            s.update_selection(5, 1, True)
+            self.ae(s.text_for_selection(), ('33333',))
 
     def test_scrollback_anchored_against_new_output(self):
         # When scrolled back, lines added to the scrollback must not move the
@@ -1450,6 +1725,40 @@ class TestScreen(BaseTest):
         s.scroll(4, True)
         parse_bytes(s, b'\x1b[?2026h')
         self.ae(s.rendered_scroll_state(), (4, 0, s.historybuf.count))
+
+    def test_line_for_cursor_with_paused_rendering(self):
+        # The cursor is sized and colored from the cell under it as rendered.
+        # While rendering is paused that is in the snapshot, which has an extra
+        # leading row with pixel scroll and shows the scrollback when scrolled
+        # back, so screen row y is not snapshot row y.
+        def screen(pixel_scroll, scrolled_by=0):
+            s = self.create_screen(cols=10, lines=3, scrollback=50, options={'pixel_scroll': pixel_scroll})
+            for i in range(10):
+                parse_bytes(s, f'row{i:03d}\r\n'.encode())
+            parse_bytes(s, b'last')
+            if scrolled_by:
+                s.scroll(scrolled_by, True)
+            self.ae(s.scrolled_by, scrolled_by)
+            return s
+
+        def lines(s):
+            return [s.test_text_of_line_for_cursor(0, y) for y in range(s.lines)]
+
+        for pixel_scroll in (False, True):
+            for scrolled_by in (0, 2):
+                msg = f'{pixel_scroll=} {scrolled_by=}'
+                s = screen(pixel_scroll, scrolled_by)
+                live = [str(s.line(y)) for y in range(s.lines)]
+                self.ae(lines(s), live, msg)
+                self.assertTrue(s.pause_rendering(True, 5000))
+                parse_bytes(s, b'\x1b[H\x1b[2JXXXX')  # the live screen changes, the snapshot must not
+                # rows scrolled off the bottom of the frozen frame are not rendered
+                expected = [text if y + scrolled_by < s.lines else None for y, text in enumerate(live)]
+                self.ae(lines(s), expected, msg)
+                self.assertIsNone(s.test_text_of_line_for_cursor(s.columns, 0), msg)
+                self.assertIsNone(s.test_text_of_line_for_cursor(0, s.lines), msg)
+                self.assertTrue(s.pause_rendering(False))
+                self.ae(lines(s), ['XXXX', '', ''], msg)
 
     def test_selection_uses_rendered_scroll_state(self):
         # A selection rendered during a pause must match the frozen frame even
@@ -4146,6 +4455,47 @@ class TestScreen(BaseTest):
         self.assertFalse(s.cursor.italic)
         self.ae(s.cursor.decoration, before.decoration)
         self.ae(s.cursor.decoration_fg, before.decoration_fg)
+
+    def test_ime_preedit_stays_on_its_row(self):
+        # Only the pre-edit row is restored after the pre-edit text is drawn into it, so the draw must not change other rows
+        # A combining mark at column 0 does not join the wrapped last cell of the row above
+        s = self.create_screen(cols=2, lines=3)
+        s.draw('你b')
+        s.test_draw_overlay_line('\u064e1', 0, 1)
+        self.ae(str(s.line(0)), '你')
+        # nor one at the start of the text, the cell before it
+        s = self.create_screen(cols=5, lines=3)
+        s.draw('ab')
+        s.test_draw_overlay_line('\u0301x', 2, 0)
+        self.ae(str(s.line(0))[:2], 'ab')
+        # The text over the lower row of a scaled char is not moved to the next row, and the char keeps its other rows
+        s = self.create_screen(cols=4, lines=4)
+        parse_bytes(s, b'\x1b]66;s=2;ab\x07')
+        s.test_draw_overlay_line('xy', 0, 1)
+        self.ae(str(s.line(2)), '')
+        self.ae(str(s.line(0)), 'ab')
+        self.ae(str(s.line(1))[:2], 'xy')
+        # A control char does not act on the screen
+        s = self.create_screen(cols=5, lines=3)
+        s.draw('top')
+        s.test_draw_overlay_line('a\nb', 0, 2)
+        self.ae(str(s.line(0)), 'top')
+        self.ae(str(s.line(2)), 'ab')
+
+    def test_widened_char_moved_by_a_scroll(self):
+        # A char widened by VS16 that moves past a multiline char at the bottom row scrolls the screen: the text after it is
+        # drawn on the cursor's row, not the row above
+        for batched in (False, True):
+            with self.subTest(batched=batched):
+                test_set_batched_non_ascii_draw(batched)
+                try:
+                    s = self.create_screen(cols=3, lines=4, scrollback=20)
+                    s.draw('a1😀')
+                    s.draw('\n😀☺️ا')
+                finally:
+                    test_set_batched_non_ascii_draw(True)
+                self.assertIn('ا', str(s.line(s.cursor.y)))
+                self.ae(s.cursor.x, str(s.line(s.cursor.y)).index('ا') + 1)
 
     def test_ime_preedit_cursor(self):
         # The cursor is placed where the IME says it is inside the pre-edit

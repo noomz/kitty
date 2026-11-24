@@ -91,7 +91,6 @@ typedef VkResult(APIENTRY *PFN_vkCreateMetalSurfaceEXT)(VkInstance, const VkMeta
 
 #include "posix_thread.h"
 #include "cocoa_joystick.h"
-#include "nsgl_context.h"
 
 #define _glfw_dlopen(name) dlopen(name, RTLD_LAZY | RTLD_LOCAL)
 #define _glfw_dlclose(handle) dlclose(handle)
@@ -277,7 +276,6 @@ unsigned _glfwCreateDisplayLink(CGDirectDisplayID);
 void _glfwRequestRenderFrame(_GLFWwindow *w);
 
 // event loop
-void _glfwDispatchTickCallback(void);
 void _glfwCocoaPostEmptyEvent(void);
 
 uint32_t vk_to_unicode_key_with_current_layout(uint16_t keycode);

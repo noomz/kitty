@@ -50,18 +50,34 @@ typedef struct {
 
 typedef struct {
     ImageRect src_rect, dest_rect;
-    uint32_t texture_id, group_count;
+    gpu_texture_t texture_id;
+    uint32_t group_count;
     int z_index;
     // Zero for normal images, otherwise the number of bytes per pixel of an indexed color image
     uint8_t indexed_px_sz;
     // True for indexed color images drawn at their natural size, which can use
     // a cheaper shader. Always false for normal images.
     bool is_unscaled;
+    // One plus the index of the smooth scroll region the image is drawn with,
+    // clipped to its rectangle, zero if none. See ImageLayerRegion.
+    uint8_t smooth_scroll_region;
     id_type image_id, ref_id;
 } ImageRenderData;
 
+#define MAX_IMAGE_LAYER_REGIONS 4u
+// A smooth scroll region of the screen, images moving with it are drawn
+// shifted by its offset and clipped to its rectangle
+typedef struct ImageLayerRegion {
+    uint32_t id;
+    // The offset in rows, or in columns when horizontal
+    float offset;
+    bool horizontal;
+    // The rectangle of the region [left, right) x [top, bottom), in cells
+    int32_t left, top, right, bottom;
+} ImageLayerRegion;
+
 typedef struct {
-    uint32_t texture_id;
+    gpu_texture_t texture_id;
     unsigned int height, width;
     uint8_t *bitmap;
     uint32_t refcnt, id;
@@ -84,6 +100,10 @@ typedef struct {
     // Virtual refs are not displayed but they can be used as prototypes for
     // refs placed using unicode placeholders.
     bool is_virtual_ref;
+    // The id of the smooth scroll region of the screen this image is moving
+    // with, zero if none. Images moving with a region can be partially or
+    // entirely outside its rectangle, in its overflow buffers.
+    uint32_t smooth_scroll_region;
 
     struct {
         id_type img, ref;
@@ -103,7 +123,8 @@ typedef struct {
 typedef enum { ANIMATION_STOPPED = 0, ANIMATION_LOADING = 1, ANIMATION_RUNNING = 2 } AnimationState;
 
 typedef struct TextureRef {
-    uint32_t id, refcnt;
+    gpu_texture_t id;
+    uint32_t refcnt;
 } TextureRef;
 
 #define NAME ref_map
@@ -175,6 +196,10 @@ typedef struct {
     size_t num_of_indexed_refs;
     unsigned int last_scrolled_by;
     float last_scroll_offset_lines;
+    ImageLayerRegion last_layer_regions[MAX_IMAGE_LAYER_REGIONS];
+    unsigned last_num_layer_regions;
+    // The number of visible refs drawn clipped to a smooth scroll region
+    size_t num_of_smooth_scroll_refs;
     size_t used_storage;
     PyObject *disk_cache;
     bool has_images_needing_animation, context_made_current_for_this_command;
@@ -194,6 +219,22 @@ typedef struct {
     // The history scrolls with the screen: lines move into it (amt < 0) or are popped back from it (amt > 0)
     bool scroll_history;
 } ScrollData;
+
+typedef struct SmoothScrollImageData {
+    uint32_t region_id;
+    // -1 when the rows (columns) of the region move up (left), 1 when they move down (right)
+    int32_t amt;
+    // Whether the columns rather than the rows of the region move
+    bool horizontal;
+    // The rectangle of the region [left, right) x [top, bottom)
+    int32_t left, right, top, bottom;
+    // Images that move entirely before (above or left of) before_limit or to
+    // after_limit or after it are removed. When the scrollback is the overflow
+    // buffer above the region, images above before_limit are in the
+    // scrollback, they are only removed when they move above history_limit.
+    int32_t before_limit, after_limit, history_limit;
+    bool uses_history;
+} SmoothScrollImageData;
 
 
 static inline float
@@ -216,19 +257,14 @@ tex_pos_x(const int px_from_left_margin, const unsigned texture_width) {
 
 static inline float
 gl_pos_y(const int px_from_top_margin, const unsigned int viewport_size) {
+    // NDC y increases downwards from -1 at the top, see gpu/api.h
     const float px = 2.f / viewport_size;
-    return 1.f - px_from_top_margin * px;
-}
-
-static inline float
-tex_pos_y(const int px_from_top_margin, const unsigned texture_height) {
-    const int px_from_bottom_margin = texture_height - px_from_top_margin;
-    return px_from_bottom_margin / (float)texture_height;
+    return -1.f + px_from_top_margin * px;
 }
 
 
 typedef struct GraphicsRenderData {
-    size_t count, capacity, num_of_below_refs, num_of_negative_refs, num_of_positive_refs, num_of_indexed_refs;
+    size_t count, capacity, num_of_below_refs, num_of_negative_refs, num_of_positive_refs, num_of_indexed_refs, num_of_smooth_scroll_refs;
     ImageRenderData *images;
 } GraphicsRenderData;
 
@@ -256,8 +292,13 @@ bool grman_update_layers(
     float dy,
     unsigned int num_cols,
     unsigned int num_rows,
-    CellPixelSize);
+    CellPixelSize,
+    const ImageLayerRegion *regions,
+    unsigned num_regions);
 void grman_scroll_images(GraphicsManager *self, const ScrollData *, CellPixelSize fg);
+void grman_smooth_scroll_images(GraphicsManager *self, const SmoothScrollImageData *data, CellPixelSize cell);
+void grman_smooth_scroll_release_images(
+    GraphicsManager *self, uint32_t region_id, int32_t left, int32_t top, int32_t right, int32_t bottom, bool horizontal, bool clip_before, CellPixelSize cell);
 bool grman_has_any_images(GraphicsManager *self);
 void grman_resize(GraphicsManager *, index_type, index_type, index_type, index_type, index_type, index_type);
 void grman_rescale(GraphicsManager *self, CellPixelSize fg);

@@ -4,9 +4,11 @@ package benchmark
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/kovidgoyal/kitty/tools/tui/graphics"
 	"github.com/kovidgoyal/kitty/tools/tui/loop"
 	"github.com/kovidgoyal/kitty/tools/utils"
+	"github.com/kovidgoyal/kitty/tools/wcswidth"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,9 +26,25 @@ import (
 var _ = fmt.Print
 
 type Options struct {
-	Repetitions    int
-	WithScrollback bool
-	Render         bool
+	Repetitions int
+	Output      string
+}
+
+// How a benchmark is run
+type run_settings struct {
+	repetitions int
+	// Use the main screen instead of the alternate screen, so that lines
+	// scrolled off the screen go into the scrollback
+	main_screen bool
+	// Allow the terminal to render while the data is being sent
+	render bool
+	// Turn on bidi mode (CSI 8 h) before the data, and off again in the
+	// reset that ends each loop
+	bidi bool
+}
+
+func default_settings() run_settings {
+	return run_settings{repetitions: opts.Repetitions}
 }
 
 const reset = "\x1b]\x1b\\\x1bc"
@@ -44,7 +63,7 @@ const misc_unicode = "‘’“”‹›«»‚„ 😀😛😇😈😉😍😎�
 
 var opts Options
 
-func benchmark_data(description string, data string, opts Options) (duration time.Duration, sent_data_size int, reps int, err error) {
+func benchmark_data(description string, data string, settings run_settings) (duration time.Duration, sent_data_size int, reps int, err error) {
 	term, err := tty.OpenControllingTerm(tty.SetRaw)
 	if err != nil {
 		return 0, 0, 0, err
@@ -53,7 +72,7 @@ func benchmark_data(description string, data string, opts Options) (duration tim
 	write_with_retry := func(data string) (err error) {
 		return term.WriteAllString(data)
 	}
-	state := loop.TerminalStateOptions{Alternate_screen: !opts.WithScrollback}
+	state := loop.TerminalStateOptions{Alternate_screen: !settings.main_screen}
 	if err = write_with_retry(state.SetStateEscapeCodes() + loop.DECTCEM.EscapeCodeToReset()); err != nil {
 		return
 	}
@@ -64,18 +83,22 @@ func benchmark_data(description string, data string, opts Options) (duration tim
 	desc := clear_screen + "Running: " + description + "\r\n"
 	const pause_rendering = "\x1b[?2026h"
 	const resume_rendering = "\x1b[?2026l"
-	if !opts.Render {
+	if !settings.render {
 		if err = write_with_retry(desc + pause_rendering); err != nil {
 			return
 		}
 	}
 
-	start := time.Now()
 	end_of_loop_reset := desc
-	if !opts.Render {
+	if settings.bidi {
+		data = "\x1b[8h" + data
+		end_of_loop_reset += "\x1b[8l"
+	}
+	start := time.Now()
+	if !settings.render {
 		end_of_loop_reset += resume_rendering + pause_rendering
 	}
-	for reps < opts.Repetitions {
+	for reps < settings.repetitions {
 		if err = write_with_retry(data); err != nil {
 			return
 		}
@@ -86,7 +109,7 @@ func benchmark_data(description string, data string, opts Options) (duration tim
 		}
 	}
 	finalize := clear_screen + "Waiting for response indicating parsing finished\r\n"
-	if !opts.Render {
+	if !settings.render {
 		finalize += resume_rendering
 	}
 	finalize += "\x1b[6n" + strings.Repeat("\x1b[5n", count)
@@ -120,30 +143,134 @@ func random_string_of_bytes(n int, alphabet string) string {
 }
 
 type result struct {
-	desc        string
+	name, desc  string
 	data_sz     int
 	duration    time.Duration
 	repetitions int
+	// The number of cells drawn per repetition, for text benchmarks, zero otherwise
+	cells int
+}
+
+// The ASCII and Unicode text benchmarks use text with the same structure: the
+// same lines, of the same widths in cells, ending in CRLF and with tabs at the
+// same positions. They differ only in the characters used to fill the lines,
+// so that they are comparable. Since non-ASCII characters are encoded in more
+// bytes, compare them by the rate at which cells are drawn rather than bytes.
+type text_line struct {
+	width, tab_at int // tab_at is -1 for lines without a tab
+}
+
+const num_text_lines = 16000
+
+func text_layout() []text_line {
+	r := rand.New(rand.NewPCG(1, 2)) // the same layout every time
+	lines := make([]text_line, num_text_lines)
+	for i := range lines {
+		// Lines wider than the screen wrap
+		lines[i] = text_line{width: r.IntN(101), tab_at: -1}
+		if lines[i].width > 8 && r.IntN(4) == 0 {
+			lines[i].tab_at = r.IntN(lines[i].width)
+		}
+	}
+	return lines
+}
+
+// next returns a character, which may be a multi-codepoint grapheme, and its
+// width in cells, which must not be more than remaining
+func text_with_layout(next func(remaining int) (string, int)) (text string, cells int) {
+	var b strings.Builder
+	b.Grow(num_text_lines * 128)
+	for _, line := range text_layout() {
+		tab_done := line.tab_at < 0
+		for filled := 0; filled < line.width; {
+			if !tab_done && filled >= line.tab_at {
+				b.WriteByte('\t')
+				tab_done = true
+			}
+			limit := line.width
+			if !tab_done {
+				limit = line.tab_at // do not let a wide char step over the tab position
+			}
+			ch, w := next(limit - filled)
+			b.WriteString(ch)
+			filled += w
+		}
+		b.WriteString("\r\n")
+		cells += line.width
+	}
+	return b.String(), cells
+}
+
+func text_benchmark(desc string, data string, cells int, settings run_settings) (r result, err error) {
+	duration, data_sz, reps, err := benchmark_data(desc, data, settings)
+	if err != nil {
+		return result{}, err
+	}
+	return result{"", desc, data_sz, duration, reps, cells}, nil
+}
+
+func ascii_text() (string, int) {
+	return text_with_layout(func(int) (string, int) {
+		i := rand.IntN(len(ascii_printable))
+		return ascii_printable[i : i+1], 1
+	})
 }
 
 func simple_ascii() (r result, err error) {
-	const desc = "Only ASCII chars"
-	data := random_string_of_bytes(1024*2048+13, ascii_printable+control_chars)
-	duration, data_sz, reps, err := benchmark_data(desc, data, opts)
-	if err != nil {
-		return result{}, err
+	data, cells := ascii_text()
+	return text_benchmark("ASCII text", data, cells, default_settings())
+}
+
+func ascii_with_scrollback() (r result, err error) {
+	data, cells := ascii_text()
+	s := default_settings()
+	s.main_screen = true
+	return text_benchmark("ASCII text with scrollback", data, cells, s)
+}
+
+func ascii_with_rendering() (r result, err error) {
+	data, cells := ascii_text()
+	s := default_settings()
+	s.render = true
+	return text_benchmark("ASCII text with rendering", data, cells, s)
+}
+
+func ascii_with_bidi() (r result, err error) {
+	data, cells := ascii_text()
+	s := default_settings()
+	s.render = true
+	s.bidi = true
+	return text_benchmark("ASCII text with rendering in bidi mode", data, cells, s)
+}
+
+func unicode_text() (string, int) {
+	// Half the characters are wide: CJK and emoji, half narrow: accented
+	// letters, symbols and letters with combining marks
+	var narrow, wide []string
+	for _, g := range wcswidth.SplitIntoGraphemes(chinese_lorem_ipsum + misc_unicode) {
+		switch wcswidth.Stringwidth(g) {
+		case 1:
+			if g != " " {
+				narrow = append(narrow, g)
+			}
+		case 2:
+			wide = append(wide, g)
+		}
 	}
-	return result{desc, data_sz, duration, reps}, nil
+	return text_with_layout(func(remaining int) (string, int) {
+		if remaining > 1 && rand.IntN(2) == 0 {
+			return wide[rand.IntN(len(wide))], 2
+		}
+		if rand.IntN(16) == 0 {
+			return " ", 1
+		}
+		return narrow[rand.IntN(len(narrow))], 1
+	})
 }
 
 func unicode() (r result, err error) {
-	const desc = "Unicode chars"
-	data := strings.Repeat(chinese_lorem_ipsum+misc_unicode+control_chars, 1024)
-	duration, data_sz, reps, err := benchmark_data(desc, data, opts)
-	if err != nil {
-		return result{}, err
-	}
-	return result{desc, data_sz, duration, reps}, nil
+	data, cells := unicode_text()
+	return text_benchmark("Unicode text", data, cells, default_settings())
 }
 
 func unique_unicode() (r result, err error) {
@@ -160,11 +287,11 @@ func unique_unicode() (r result, err error) {
 		}
 	}
 	const desc = "Unique multi-codepoint Unicode cells"
-	duration, data_sz, reps, err := benchmark_data(desc, data.String(), opts)
+	duration, data_sz, reps, err := benchmark_data(desc, data.String(), default_settings())
 	if err != nil {
 		return result{}, err
 	}
-	return result{desc, data_sz, duration, reps}, nil
+	return result{"", desc, data_sz, duration, reps, 0}, nil
 }
 
 func ascii_with_csi() (r result, err error) {
@@ -193,11 +320,70 @@ func ascii_with_csi() (r result, err error) {
 	}
 	out = append(out, "\x1b[m"...)
 	const desc = "CSI codes with few chars"
-	duration, data_sz, reps, err := benchmark_data(desc, utils.UnsafeBytesToString(out), opts)
+	duration, data_sz, reps, err := benchmark_data(desc, utils.UnsafeBytesToString(out), default_settings())
 	if err != nil {
 		return result{}, err
 	}
-	return result{desc, data_sz, duration, reps}, nil
+	return result{"", desc, data_sz, duration, reps, 0}, nil
+}
+
+type rgb struct{ r, g, b int }
+
+func random_color() rgb {
+	// Components in [100, 255] so that every color has the same encoded length
+	return rgb{100 + rand.IntN(156), 100 + rand.IntN(156), 100 + rand.IntN(156)}
+}
+
+func colored_text_benchmark(desc string, next_color func() rgb) (r result, err error) {
+	alphabet := ascii_printable + control_chars
+	var b strings.Builder
+	b.Grow(2 * 1024 * 1024)
+	for b.Len() < 2*1024*1024 {
+		c := next_color()
+		fmt.Fprintf(&b, "\x1b[38;2;%d;%d;%dm%c", c.r, c.g, c.b, alphabet[rand.IntN(len(alphabet))])
+	}
+	b.WriteString("\x1b[m")
+	duration, data_sz, reps, err := benchmark_data(desc, b.String(), default_settings())
+	if err != nil {
+		return result{}, err
+	}
+	return result{"", desc, data_sz, duration, reps, 0}, nil
+}
+
+func truecolor_text() (r result, err error) {
+	// Every char has a random 24-bit foreground, like lolcat output, so nearly every
+	// cell has a distinct style and terminals that intern styles cannot reuse them.
+	return colored_text_benchmark("Truecolor text", random_color)
+}
+
+func palette16_text() (r result, err error) {
+	// The same as truecolor_text except that only 16 distinct colors are used, so
+	// styles can be reused. Comparing the two isolates the cost of many distinct styles.
+	colors := make([]rgb, 16)
+	for i := range colors {
+		colors[i] = random_color()
+	}
+	return colored_text_benchmark("16 color text", func() rgb { return colors[rand.IntN(len(colors))] })
+}
+
+func halfblocks() (r result, err error) {
+	// Rows of upper half blocks each with random 24-bit foreground and background,
+	// as written by terminal image viewers that use half blocks.
+	var b strings.Builder
+	b.Grow(2 * 1024 * 1024)
+	for b.Len() < 2*1024*1024 {
+		for range 200 {
+			fg, bg := random_color(), random_color()
+			fmt.Fprintf(&b, "\x1b[38;2;%d;%d;%d;48;2;%d;%d;%dm\u2580", fg.r, fg.g, fg.b, bg.r, bg.g, bg.b)
+		}
+		b.WriteString("\x1b[m\r\n")
+	}
+	const desc = "Truecolor half blocks"
+	duration, data_sz, reps, err := benchmark_data(desc, b.String(), default_settings())
+	if err != nil {
+		return result{}, err
+	}
+	return result{"", desc, data_sz, duration, reps, 0}, nil
 }
 
 func images() (r result, err error) {
@@ -218,11 +404,11 @@ func images() (r result, err error) {
 	_ = g.WriteWithPayloadTo(&b, nil)
 	data := b.String()
 	const desc = "Images"
-	duration, data_sz, reps, err := benchmark_data(desc, data, opts)
+	duration, data_sz, reps, err := benchmark_data(desc, data, default_settings())
 	if err != nil {
 		return result{}, err
 	}
-	return result{desc, data_sz, duration, reps}, nil
+	return result{"", desc, data_sz, duration, reps, 0}, nil
 }
 
 func long_escape_codes() (r result, err error) {
@@ -230,11 +416,11 @@ func long_escape_codes() (r result, err error) {
 	// OSC 6 is document reporting or XTerm special color which kitty ignores after parsing
 	data = strings.Repeat("\x1b]6;"+data+"\x07", 1024)
 	const desc = "Long escape codes"
-	duration, data_sz, reps, err := benchmark_data(desc, data, opts)
+	duration, data_sz, reps, err := benchmark_data(desc, data, default_settings())
 	if err != nil {
 		return result{}, err
 	}
-	return result{desc, data_sz, duration, reps}, nil
+	return result{"", desc, data_sz, duration, reps, 0}, nil
 }
 
 var divs = []time.Duration{
@@ -256,13 +442,40 @@ func present_result(r result, col_width int) {
 	rate := float64(r.data_sz) / r.duration.Seconds()
 	rate /= 1024. * 1024.
 	f := fmt.Sprintf("%%-%ds", col_width)
-	fmt.Printf("  "+f+" : %-10v @ \x1b[32m%-7.1f\x1b[m MB/s\n", r.desc, round(r.duration, 2), rate)
+	cells := ""
+	if r.cells > 0 {
+		cells = fmt.Sprintf(" @ \x1b[32m%.1f\x1b[m Mcells/s", float64(r.cells*r.repetitions)/r.duration.Seconds()/1e6)
+	}
+	fmt.Printf("  "+f+" : %-10v @ \x1b[32m%-7.1f\x1b[m MB/s%s\n", r.desc, round(r.duration, 2), rate, cells)
 }
 
-func all_benchamrks() []string {
-	return []string{
-		"ascii", "unicode", "unique_unicode", "csi", "images", "long_escape_codes",
+type benchmark struct {
+	name, help string
+	run        func() (result, error)
+}
+
+func all_benchmarks() []benchmark {
+	return []benchmark{
+		{"ascii", "lines of ASCII text", simple_ascii},
+		{"unicode", "lines of non-ASCII text, the same lines, in cells, as ascii", unicode},
+		{"scrollback", "the ascii text, on the main screen so lines scrolled off the screen go into the scrollback", ascii_with_scrollback},
+		{"render", "the ascii text, with rendering allowed while it is processed", ascii_with_rendering},
+		{"bidi", "the ascii text, with rendering allowed while it is processed, in bidi mode", ascii_with_bidi},
+		{"unique_unicode", "cells with many distinct multi-codepoint graphemes", unique_unicode},
+		{"csi", "ASCII text mixed with many CSI escape codes", ascii_with_csi},
+		{"long_escape_codes", "long OSC escape codes", long_escape_codes},
+		{"truecolor_text", "text with a random 24-bit color for every char", truecolor_text},
+		{"palette16_text", "text with one of 16 colors for every char", palette16_text},
+		{"halfblocks", "half block characters with random 24-bit foreground and background colors", halfblocks},
+		{"images", "images sent using the kitty graphics protocol", images},
 	}
+}
+
+func benchmark_names() (ans []string) {
+	for _, b := range all_benchmarks() {
+		ans = append(ans, b.name)
+	}
+	return
 }
 
 func warmup_data() string {
@@ -288,68 +501,37 @@ func warmup_data() string {
 
 func main(args []string) (err error) {
 	if len(args) == 0 {
-		args = all_benchamrks()
+		args = benchmark_names()
+	}
+	for _, a := range args {
+		if slices.Index(benchmark_names(), a) < 0 {
+			return fmt.Errorf("Unknown benchmark: %s, choose from: %s", a, strings.Join(benchmark_names(), ", "))
+		}
 	}
 	var results []result
-	var r result
 	// First warm up the terminal by getting it to render all chars so that font rendering
 	// time is not polluting the benchmarks.
-	w := Options{Repetitions: 1}
-	if _, _, _, err = benchmark_data("Warmup", warmup_data(), w); err != nil {
+	if _, _, _, err = benchmark_data("Warmup", warmup_data(), run_settings{repetitions: 1}); err != nil {
 		return err
 	}
 	time.Sleep(time.Second / 2)
 
-	if slices.Index(args, "ascii") >= 0 {
-		if r, err = simple_ascii(); err != nil {
+	for _, b := range all_benchmarks() {
+		if slices.Index(args, b.name) < 0 {
+			continue
+		}
+		r, err := b.run()
+		if err != nil {
 			return err
 		}
-		results = append(results, r)
-	}
-
-	if slices.Index(args, "unicode") >= 0 {
-		if r, err = unicode(); err != nil {
-			return err
-		}
-		results = append(results, r)
-	}
-
-	if slices.Index(args, "unique_unicode") >= 0 {
-		if r, err = unique_unicode(); err != nil {
-			return err
-		}
-		results = append(results, r)
-	}
-
-	if slices.Index(args, "csi") >= 0 {
-		if r, err = ascii_with_csi(); err != nil {
-			return err
-		}
-		results = append(results, r)
-	}
-
-	if slices.Index(args, "long_escape_codes") >= 0 {
-		if r, err = long_escape_codes(); err != nil {
-			return err
-		}
-		results = append(results, r)
-	}
-
-	if slices.Index(args, "images") >= 0 {
-		if r, err = images(); err != nil {
-			return err
-		}
+		r.name = b.name
 		results = append(results, r)
 	}
 
 	fmt.Print(reset)
 	fmt.Println(
 		"These results measure the time it takes the terminal to fully parse all the data sent to it.")
-	if opts.Render {
-		fmt.Println("Note that not all data transmitted will be displayed as input parsing is typically asynchronous with rendering in high performance terminals.")
-	} else {
-		fmt.Println("Note that \x1b[31mrendering is suppressed\x1b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.")
-	}
+	fmt.Println("Note that \x1b[31mrendering is suppressed\x1b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance, except in the render and bidi benchmarks.")
 	fmt.Println()
 	fmt.Println("Results:")
 	mlen := 10
@@ -359,14 +541,60 @@ func main(args []string) (err error) {
 	for _, r := range results {
 		present_result(r, mlen)
 	}
+	if opts.Output != "" {
+		if err = write_results(opts.Output, results); err != nil {
+			return fmt.Errorf("Failed to write results to %s with error: %w", opts.Output, err)
+		}
+	}
 	return
+}
+
+type json_result struct {
+	Name           string  `json:"name"`
+	Description    string  `json:"description"`
+	Duration       float64 `json:"duration_seconds"`
+	DataSize       int     `json:"data_size_bytes"`
+	Repetitions    int     `json:"repetitions"`
+	MBPerSecond    float64 `json:"mb_per_second"`
+	CellsPerSecond float64 `json:"cells_per_second,omitempty"`
+}
+
+func write_results(path string, results []result) error {
+	ans := make([]json_result, len(results))
+	for i, r := range results {
+		ans[i] = json_result{
+			Name: r.name, Description: r.desc, Duration: r.duration.Seconds(), DataSize: r.data_sz, Repetitions: r.repetitions,
+			MBPerSecond: float64(r.data_sz) / r.duration.Seconds() / (1024. * 1024.),
+		}
+		if r.cells > 0 {
+			ans[i].CellsPerSecond = float64(r.cells*r.repetitions) / r.duration.Seconds()
+		}
+	}
+	data, err := json.MarshalIndent(ans, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func help_text() string {
+	var b strings.Builder
+	b.WriteString("Benchmarking works by sending large amounts of data to the TTY device and waiting for the terminal to process the data and respond to queries sent to it in the data. ")
+	b.WriteString("Rendering is suppressed during benchmarking to focus on parser performance, using the synchronized output escape code, except in the render and bidi benchmarks. ")
+	b.WriteString("Note that rendering in modern terminals is typically asynchronous so it wont be properly benchmarked by this kitten. ")
+	b.WriteString("All benchmarks use the alternate screen, except the scrollback benchmark.\n\n")
+	b.WriteString("To run only particular benchmarks, specify them on the command line. The available benchmarks are:\n\n")
+	for _, bm := range all_benchmarks() {
+		fmt.Fprintf(&b, "* :code:`%s`: %s\n\n", bm.name, bm.help)
+	}
+	return b.String()
 }
 
 func EntryPoint(root *cli.Command) {
 	sc := root.AddSubCommand(&cli.Command{
 		Name:             "__benchmark__",
 		ShortDescription: "Run various benchmarks",
-		HelpText:         "To run only particular benchmarks, specify them on the command line from the set: " + strings.Join(all_benchamrks(), ", ") + ". Benchmarking works by sending large amount of data to the TTY device and waiting for the terminal to process the data and respond to queries sent to it in the data. By default rendering is suppressed during benchmarking to focus on parser performance. Use the --render flag to enable it, but be aware that rendering in modern terminals is typically asynchronous so it wont be properly benchmarked by this kitten.",
+		HelpText:         help_text(),
 		Usage:            "[options] [optional benchmark to run ...]",
 		Hidden:           true,
 		Run: func(cmd *cli.Command, args []string) (ret int, err error) {
@@ -387,14 +615,7 @@ func EntryPoint(root *cli.Command) {
 		Help:    "The number of repetitions of each benchmark",
 	})
 	sc.Add(cli.OptionSpec{
-		Name: "--with-scrollback",
-		Type: "bool-set",
-		Help: "Use the main screen instead of the alt screen so speed of scrollback is also tested",
+		Name: "--output -o",
+		Help: "Also write the results to the specified file, as JSON. For every benchmark, the file has its name, description, duration, the amount of data sent, the number of repetitions, the throughput in MB per second and, for the text benchmarks, the number of cells drawn per second.",
 	})
-	sc.Add(cli.OptionSpec{
-		Name: "--render",
-		Type: "bool-set",
-		Help: "Allow rendering of the data sent during tests. Note that modern terminals render asynchronously, so timings do not generally reflect render performance.",
-	})
-
 }

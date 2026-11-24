@@ -289,12 +289,32 @@
     },
 
     {
+        "name": "fribidi 1.0.18",
+        "unix": {
+            "file_extension": "tar.xz",
+            "hash": "sha256:1de5e8073d035388b71d0b2d452b1da1f8caeea8a7702997b401fe1b6250727f",
+            "urls": ["https://github.com/fribidi/fribidi/releases/download/v{version}/fribidi-{version}.tar.xz"]
+        }
+    },
+
+
+    {
         "name": "wayland 1.26.0",
         "os": "linux",
         "unix": {
             "file_extension": "tar.xz",
             "hash": "sha256:64176eaa46e4969903e286f8e5ef8331affc17fdf03ac9b58381d2b23162b7a3",
             "urls": ["https://gitlab.freedesktop.org/wayland/wayland/-/releases/{version}/downloads/{filename}"]
+        }
+    },
+
+    {
+        "name": "vulkan-headers 1.4.363",
+        "os": "linux",
+        "unix": {
+            "file_extension": "tar.gz",
+            "hash": "sha256:cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68",
+            "urls": ["https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v{version}.{file_extension}"]
         }
     },
 

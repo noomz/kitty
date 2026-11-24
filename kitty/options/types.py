@@ -12,7 +12,7 @@ from kitty.fonts import FontSpec
 import kitty.fonts
 from kitty.options.utils import (
     AliasMap, KeyDefinition, KeyFallbackType, KeyMapOptions, KeyboardModeMap, MouseHideWait, MouseMap,
-    MouseMapping, NotifyOnCmdFinish, TabBarMarginHeight, URLMappings
+    MouseMapping, NotifyOnCmdFinish, RenderInterval, TabBarMarginHeight, URLMappings
 )
 import kitty.options.utils
 from kitty.types import FloatEdges
@@ -375,6 +375,7 @@ option_names = (
     'force_ltr',
     'foreground',
     'forward_stdio',
+    'gpu_driver',
     'hide_window_decorations',
     'hyperlink_target_position',
     'inactive_border_color',
@@ -384,7 +385,6 @@ option_names = (
     'inactive_text_alpha',
     'initial_window_height',
     'initial_window_width',
-    'input_delay',
     'italic_font',
     'kitten_alias',
     'kitty_mod',
@@ -435,7 +435,7 @@ option_names = (
     'remember_window_position',
     'remember_window_size',
     'remote_control_password',
-    'repaint_delay',
+    'render_interval',
     'resize_debounce_time',
     'resize_in_steps',
     'restore_session_after_logout',
@@ -469,7 +469,6 @@ option_names = (
     'startup_session',
     'strip_trailing_spaces',
     'symbol_map',
-    'sync_to_monitor',
     'tab_activity_symbol',
     'tab_bar_align',
     'tab_bar_background',
@@ -602,6 +601,7 @@ class Options:
     force_ltr: bool = False
     foreground: Color = Color(221, 221, 221)
     forward_stdio: bool = False
+    gpu_driver: tuple[str, ...] = ('metal', 'vulkan', 'opengl', 'software')
     hide_window_decorations: int = 0
     hyperlink_target_position: choices_for_hyperlink_target_position = 'top'
     inactive_border_color: Color = Color(204, 204, 204)
@@ -611,7 +611,6 @@ class Options:
     inactive_text_alpha: float = 1.0
     initial_window_height: tuple[int, str] = (400, 'px')
     initial_window_width: tuple[int, str] = (640, 'px')
-    input_delay: int = 3
     italic_font: FontSpec = FontSpec(family=None, style=None, postscript_name=None, full_name=None, system='auto', axes=(), variable_name=None, features=(), created_from_string='auto')
     kitty_mod: int = 5
     linux_bell_theme: str = '__custom'
@@ -655,7 +654,7 @@ class Options:
     remap_modifiers: dict[int, int] = {}
     remember_window_position: bool = False
     remember_window_size: bool = True
-    repaint_delay: int = 10
+    render_interval: RenderInterval = RenderInterval(sync_to_monitor=True, min_interval=0.0)
     resize_debounce_time: tuple[float, float] = (0.1, 0.5)
     resize_in_steps: bool = False
     restore_session_after_logout: bool = False
@@ -688,7 +687,6 @@ class Options:
     single_window_padding_width: FloatEdges = FloatEdges(left=-1.0, top=-1.0, right=-1.0, bottom=-1.0)
     startup_session: str | None = None
     strip_trailing_spaces: choices_for_strip_trailing_spaces = 'never'
-    sync_to_monitor: bool = True
     tab_activity_symbol: str = ''
     tab_bar_align: choices_for_tab_bar_align = 'start'
     tab_bar_background: kitty.fast_data_types.Color | None = None

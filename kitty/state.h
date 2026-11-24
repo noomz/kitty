@@ -84,7 +84,12 @@ typedef struct Options {
     char_type *select_by_word_characters_forward;
     color_type url_color, background, foreground, active_border_color, inactive_border_color, bell_border_color, tab_bar_background, tab_bar_margin_color,
         window_title_bar_active_foreground, window_title_bar_active_background, window_title_bar_inactive_foreground, window_title_bar_inactive_background;
-    monotonic_t repaint_delay, input_delay;
+    struct {
+        // When true redraws are paced by render frames from the windowing system
+        bool sync_to_monitor;
+        // The minimum time between redraws of an OS window, zero for no limit
+        monotonic_t min_interval;
+    } render_interval;
     struct {
         bool on_cross, on_drop;
     } focus_follows_mouse;
@@ -129,7 +134,6 @@ typedef struct Options {
     DisableLigature disable_ligatures;
     bool force_ltr;
     bool resize_in_steps;
-    bool sync_to_monitor;
     bool close_on_child_death;
     // remap_modifier: modifier_remap[i] is the mask that the modifier at bit i
     // is presented as, or 0 to leave it alone. modifier_remap_mask is the OR of
@@ -485,6 +489,9 @@ typedef struct Tab {
 } Tab;
 
 enum RENDER_STATE { RENDER_FRAME_NOT_REQUESTED, RENDER_FRAME_REQUESTED, RENDER_FRAME_READY };
+// How long to wait for a requested render frame before assuming it is lost, or
+// on Wayland, that the compositor is withholding frames because the window is hidden
+#define RENDER_FRAME_STALL_TIMEOUT (250 * MONOTONIC_T_1e6)
 typedef enum { NO_CLOSE_REQUESTED, CONFIRMABLE_CLOSE_REQUESTED, CLOSE_BEING_CONFIRMED, IMPERATIVE_CLOSE_REQUESTED } CloseRequest;
 // What caused kitty to quit, reported to on_close watchers
 typedef enum { QUIT_CAUSE_NONE, QUIT_CAUSE_ACTION, QUIT_CAUSE_OS_REQUEST, QUIT_CAUSE_LOGOUT, QUIT_CAUSE_SIGNAL, QUIT_CAUSE_FATAL_ERROR } QuitCause;
@@ -524,6 +531,12 @@ typedef struct BackgroundImageRenderSettings {
 #define MAX_CUSTOM_SHADER_GROUPS 16
 // Passed to the custom shader pipeline as a preprocessor define by slang.py
 #define POINTER_MAP_SIZE 64
+// The layout of the texture describing the visible windows passed to custom
+// shaders, must match KITTY_WINDOW_TEXELS and KITTY_WINDOWS_PER_ROW in
+// shaders/custom/types.slang. Each window is described by
+// CUSTOM_SHADER_WINDOW_TEXELS consecutive uint32 texels.
+#define CUSTOM_SHADER_WINDOW_TEXELS 16
+#define CUSTOM_SHADER_WINDOWS_PER_ROW 64
 
 // Summary of the custom shader animation state machine, cached once per frame
 // so the renderer can decide whether a new frame is needed without walking the
@@ -568,11 +581,13 @@ typedef enum {
     SHADER_ANIM_EVENT_COMMAND_FINISH,
     SHADER_ANIM_EVENT_ALTERNATE_SCREEN_ENTER,
     SHADER_ANIM_EVENT_ALTERNATE_SCREEN_EXIT,
+    SHADER_ANIM_EVENT_PROGRESS_START,
+    SHADER_ANIM_EVENT_PROGRESS_STOP,
     NUM_SHADER_ANIM_EVENTS
 } ShaderAnimationEvent;
 // Events named by the pipeline itself, with the user: prefix, and fired by the
 // shader_event action occupy the bits above the builtin events
-#define SHADER_ANIM_FIRST_USER_EVENT 16
+#define SHADER_ANIM_FIRST_USER_EVENT 20
 _Static_assert(NUM_SHADER_ANIM_EVENTS <= SHADER_ANIM_FIRST_USER_EVENT, "Too many builtin shader animation events");
 #define MAX_SHADER_ANIM_USER_EVENTS (64 - SHADER_ANIM_FIRST_USER_EVENT)
 #define MAX_SHADER_ANIM_USER_EVENT_NAME_LEN 63
@@ -581,12 +596,18 @@ typedef uint64_t ShaderAnimEventMask;
 
 typedef struct OSWindow {
     void *handle;
+    gpu_surface_t gpu_surface;
     id_type id;
     monotonic_t created_at;
     struct {
         int x, y, w, h;
         bool is_set, was_maximized;
     } before_fullscreen;
+    // The message shown when software rendering is used, see draw_software_rendering_banner()
+    struct {
+        monotonic_t shown_at;
+        bool shown, done;
+    } software_rendering_banner;
     int viewport_width, viewport_height, window_width, window_height;
     double viewport_x_ratio, viewport_y_ratio;
     Tab *tabs;
@@ -598,14 +619,20 @@ typedef struct OSWindow {
         bool has_layout;
     } background_image;
     struct {
-        uint32_t framebuffer_id, attached_texture_generation;
-        uint32_t extra_fbo_id, extra_fbo_generation;
-        uint32_t fbo_a_id, fbo_a_generation;
-        uint32_t fbo_b_id, fbo_b_generation;
+        gpu_render_target_t framebuffer_id;
+        uint32_t attached_texture_generation;
+        gpu_render_target_t extra_fbo_id;
+        uint32_t extra_fbo_generation;
+        gpu_render_target_t fbo_a_id;
+        uint32_t fbo_a_generation;
+        gpu_render_target_t fbo_b_id;
+        uint32_t fbo_b_generation;
     } indirect_output;
-    uint32_t persist_texture_id, persist_fbo_id, persist_texture_generation;
+    gpu_texture_t persist_texture_id;
+    gpu_render_target_t persist_fbo_id;
+    uint32_t persist_texture_generation;
     unsigned int active_tab, num_tabs, capacity, last_active_tab, last_num_tabs, last_active_window_id;
-    bool focused_at_last_render, needs_render, needs_layers, input_held;
+    bool focused_at_last_render, needs_render, needs_layers;
     unsigned keep_rendering_till_swap;
     WindowRenderData tab_bar_render_data;
     struct {
@@ -637,7 +664,13 @@ typedef struct OSWindow {
     FONTS_DATA_HANDLE fonts_data;
     id_type temp_font_group_id;
     enum RENDER_STATE render_state;
-    monotonic_t last_render_frame_received_at, last_rendered_at;
+    monotonic_t last_render_frame_received_at, render_frame_requested_at, last_rendered_at;
+    // Whether to wake up the main loop when the next render frame arrives, as
+    // something is waiting for it, see is_render_deferred_by_frame_pacing()
+    bool tick_on_render_frame;
+    // Whether a stall in the delivery of render frames has been reported since
+    // the last render frame was received, see no_render_frame_received_recently()
+    bool render_frame_stall_reported;
     uint64_t render_calls;
     uint32_t frame_counter;
     id_type last_focused_counter;
@@ -659,9 +692,23 @@ typedef struct OSWindow {
         int mapped_modifiers;
         monotonic_t mapped_last_event_at;
         bool mapped_gesture, mapped_grabbed;
+        // Detailed wheel event reporting: the fractions of the reported
+        // deltas not yet sent and the window and unit they belong to
+        double reported_remainder_x, reported_remainder_y;
+        id_type reported_window_id;
+        int reported_unit;
     } scroll;
     ShaderAnimEventMask shader_anim_event_registry;
     id_type last_bell_window_id; // ID of the most recent window that received a bell event
+    // Whether any visible window in the active tab was showing a progress bar at the last check
+    bool progress_bar_visible;
+    // The texture describing the visible windows for custom shaders, see CUSTOM_SHADER_WINDOW_TEXELS
+    struct {
+        gpu_texture_t texture;
+        uint32_t height;       // in rows of CUSTOM_SHADER_WINDOWS_PER_ROW windows
+        uint32_t *uploaded;    // the texels last uploaded to texture
+        size_t uploaded_count; // number of windows in uploaded
+    } shader_windows;
     // Time up to which command and alternate screen changes in the active window have been turned into shader events
     monotonic_t screen_state_checked_at;
     ShaderGroupAnimState shader_group_anim[MAX_CUSTOM_SHADER_GROUPS];
@@ -716,8 +763,9 @@ typedef struct GlobalState {
     // Set once an IME composition has been seen, see sync_ime_position_with_cursor()
     bool ime_used;
     WindowLogoTable *all_window_logos;
-    int gl_version;
     bool supports_framebuffer_srgb;
+    // Rendering is done on the CPU, see the software value of the gpu_driver option
+    bool software_rendering;
     PyObject *options_object;
 
     struct {
@@ -755,11 +803,16 @@ typedef struct GlobalState {
         double x, y;
     } window_being_dragged;
     struct {
-        uint32_t texture_id, framebuffer_id, texture_generation;
+        gpu_texture_t texture_id;
+        gpu_render_target_t framebuffer_id;
+        uint32_t texture_generation;
         int width, height;
-        uint32_t extra_texture_id, extra_texture_setup_fbo_id;
-        uint32_t texture_a_id, texture_a_fbo_id;
-        uint32_t texture_b_id, texture_b_fbo_id;
+        gpu_texture_t extra_texture_id;
+        gpu_render_target_t extra_texture_setup_fbo_id;
+        gpu_texture_t texture_a_id;
+        gpu_render_target_t texture_a_fbo_id;
+        gpu_texture_t texture_b_id;
+        gpu_render_target_t texture_b_fbo_id;
     } layers_render_texture;
 } GlobalState;
 
@@ -775,18 +828,22 @@ extern GlobalState global_state;
 
 static inline void
 sprite_index_to_pos(unsigned idx, unsigned xnum, unsigned ynum, unsigned *x, unsigned *y, unsigned *z) {
-    div_t r = div(idx & 0x7fffffff, ynum * xnum), r2 = div(r.rem, xnum);
+    // The two high bits are flags, see SPRITE_INDEX_MASK
+    div_t r = div(idx & 0x3fffffff, ynum * xnum), r2 = div(r.rem, xnum);
     *z = r.quot;
     *y = r2.quot;
     *x = r2.rem;
 }
 
 
-void initialize_gpu(void);
+// How long the message shown when software rendering is used stays up
+#define SOFTWARE_RENDERING_BANNER_DURATION s_double_to_monotonic_t(5.0)
+// Initialize the GPU driver, returns false on failure, with the error available from gpu_last_error()
+bool initialize_gpu(void);
 void free_vao(ssize_t vao_idx);
 void cleanup_shader_resources_on_terminate(void);
 bool remove_os_window(id_type os_window_id);
-void *make_os_window_context_current(OSWindow *w);
+gpu_surface_t make_os_window_context_current(OSWindow *w);
 void set_os_window_size(OSWindow *os_window, int x, int y);
 void get_os_window_size(OSWindow *os_window, int *w, int *h, int *fw, int *fh);
 void get_os_window_pos(OSWindow *os_window, int *x, int *y);
@@ -821,11 +878,8 @@ void upload_gamma_lut(void);
 bool send_cell_data_to_gpu(ssize_t, Screen *, OSWindow *);
 void draw_cells(const WindowRenderData *, OSWindow *, bool, bool, bool, Window *, const Window *, monotonic_t);
 bool update_cursor_trail(CursorTrail *ct, Window *w, monotonic_t now, OSWindow *os_window);
-void set_gpu_viewport(unsigned w, unsigned h);
-void free_texture(uint32_t *);
-void free_framebuffer(uint32_t *);
-void send_image_to_gpu(uint32_t *, const void *, int32_t, int32_t, bool, bool, bool, RepeatStrategy);
-void send_indexed_image_to_gpu(uint32_t *, const void *, int32_t, int32_t, unsigned, bool);
+void send_image_to_gpu(gpu_texture_t *, const void *, int32_t, int32_t, bool, bool, bool, RepeatStrategy);
+void send_indexed_image_to_gpu(gpu_texture_t *, const void *, int32_t, int32_t, unsigned, bool);
 void send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index, pixel *, sprite_index);
 void blank_canvas(float, color_type, bool);
 void blank_os_window(OSWindow *);
@@ -837,6 +891,10 @@ void send_prerendered_sprites_for_window(OSWindow *w);
 #endif
 void request_frame_render(OSWindow *w);
 void request_tick_callback(void);
+void apply_render_interval_to_os_window(OSWindow *w);
+#ifndef __APPLE__
+monotonic_t os_window_frame_period(OSWindow *w);
+#endif
 typedef void (*timer_callback_fun)(id_type, void *);
 typedef void (*tick_callback_fun)(void *);
 id_type add_main_loop_timer(monotonic_t interval, bool repeats, timer_callback_fun callback, void *callback_data, timer_callback_fun free_callback);
@@ -871,7 +929,7 @@ bool set_wheel_mappings(PyObject *py_opts, Options *opts);
 bool set_url_mappings(PyObject *py_opts, Options *opts);
 void update_menu_bar_title(PyObject *title UNUSED);
 void change_live_resize_state(OSWindow *, bool);
-bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images);
+bool render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool ignore_frame_pacing);
 void update_mouse_pointer_shape(void);
 void update_pointer_shape_for_kitty_window(id_type kitty_window_id);
 bool update_link_hover_for_modifiers(int old_mods, int new_mods);
@@ -883,6 +941,12 @@ bool screen_needs_rendering_in_layers(OSWindow *os_window, Window *w, Screen *sc
 void setup_os_window_for_rendering(OSWindow *, Tab *, Window *, bool, monotonic_t);
 monotonic_t update_custom_shader_animations(ShaderAnimEventMask event_mask, monotonic_t now, OSWindow *os_window);
 void init_shader_animation_state(OSWindow *os_window);
+// Whether kitty draws its own progress bars, it does not when they are hidden or
+// replaced by the custom shader pipeline, as that subscribes to progress-start
+bool builtin_progress_bar_enabled(void);
+// Whether frames must be rendered to animate the progress bar of the screen,
+// by kitty or by custom shaders
+bool progress_bar_is_animating(const Screen *screen, monotonic_t now);
 
 // Records an OS window focus change for the custom shader animation state
 // machine. The pending events are only consumed when the OS window is next

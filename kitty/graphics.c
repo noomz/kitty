@@ -8,6 +8,7 @@
 #define GRAPHICS_INTERNAL_APIS
 #include "graphics.h"
 #include "state.h"
+#include "gpu.h"
 #include "disk-cache.h"
 #include "iqsort.h"
 #include "safe-wrappers.h"
@@ -161,7 +162,7 @@ new_texture_ref(void) {
     return ans;
 }
 
-static uint32_t
+static gpu_texture_t
 texture_id_for_img(Image *img) {
     return img->texture ? img->texture->id : 0;
 }
@@ -279,6 +280,8 @@ grman_pause_rendering(GraphicsManager *self, GraphicsManager *dest) {
     dest->num_of_negative_refs = 0;
     dest->num_of_positive_refs = 0;
     dest->num_of_indexed_refs = 0;
+    dest->num_of_smooth_scroll_refs = 0;
+    dest->last_num_layer_regions = 0;
     if (self == NULL) return;
     dest->window_id = self->window_id;
     dest->layers_dirty = true;
@@ -1181,7 +1184,7 @@ finish_command_response(const GraphicsCommand *g, bool data_loaded) {
 
 static void
 update_src_rect(ImageRef *ref, Image *img) {
-    // The src rect in OpenGL co-ords [0, 1] with origin at top-left corner of image
+    // The src rect in texture co-ords [0, 1] with origin at top-left corner of image
     ref->src_rect.left = (float)ref->src_x / (float)img->width;
     ref->src_rect.right = (float)(ref->src_x + ref->src_width) / (float)img->width;
     ref->src_rect.top = (float)ref->src_y / (float)img->height;
@@ -1550,7 +1553,7 @@ handle_put_command(GraphicsManager *self, const GraphicsCommand *g, Cursor *c, b
 
 void
 gpu_data_for_image(ImageRenderData *ans, float left, float top, float right, float bottom) {
-    // For dest rect: x-axis is from -1 to 1, y axis is from 1 to -1
+    // For dest rect: x-axis is from -1 to 1, y axis is from -1 (top) to 1 (bottom)
     static const ImageRef source_rect = {.src_rect = {.left = 0, .top = 0, .bottom = 1, .right = 1}};
     ans->src_rect = source_rect.src_rect;
     ans->dest_rect = (ImageRect){.left = left, .right = right, .top = top, .bottom = bottom};
@@ -1573,8 +1576,16 @@ resolve_cell_ref(const Image *img, id_type virt_ref_id, int32_t *start_row, int3
     return found;
 }
 
+// The placement at the root of the chain of parents of an image, which
+// decides whether it moves with a smooth scroll region
+typedef struct RootPlacement {
+    int32_t start_row, start_column, num_rows, num_cols;
+    uint32_t smooth_scroll_region;
+} RootPlacement;
+
 static bool
-resolve_parent_offset(const GraphicsManager *self, const ImageRef *ref, int32_t *start_row, int32_t *start_column, bool *has_virtual_ancestor) {
+resolve_parent_offset(
+    const GraphicsManager *self, const ImageRef *ref, int32_t *start_row, int32_t *start_column, bool *has_virtual_ancestor, RootPlacement *root) {
     *start_row = 0;
     *start_column = 0;
     *has_virtual_ancestor = false;
@@ -1598,7 +1609,41 @@ resolve_parent_offset(const GraphicsManager *self, const ImageRef *ref, int32_t 
     }
     *start_row = ref->start_row + y;
     *start_column = ref->start_column + x;
+    // Images move with the smooth scroll region of their root ancestor. A
+    // root displayed using Unicode placeholders is the placeholder cell.
+    *root = (RootPlacement){
+        .start_row = ref->start_row,
+        .start_column = ref->start_column,
+        .num_rows = MAX(1, (int32_t)ref->effective_num_rows),
+        .num_cols = MAX(1, (int32_t)ref->effective_num_cols),
+        .smooth_scroll_region = ref->smooth_scroll_region};
     return true;
+}
+
+static bool
+image_in_smooth_scroll_region(
+    int32_t start_row, int32_t start_column, int32_t num_rows, int32_t num_cols, bool horizontal, int32_t left, int32_t top, int32_t right, int32_t bottom) {
+    // Whether an image that is not yet moving with a region moves with it: it
+    // must be within the rectangle across the direction of scrolling and
+    // intersect it along it. See docs/smooth-scrolling-protocol.rst
+    if (horizontal) return start_row >= top && start_row + num_rows <= bottom && start_column < right && start_column + num_cols > left;
+    return start_column >= left && start_column + num_cols <= right && start_row < bottom && start_row + num_rows > top;
+}
+
+static uint8_t
+layer_region_for_image(const ImageLayerRegion *regions, unsigned num_regions, const RootPlacement *p) {
+    // One plus the index of the region the image is drawn with, zero if none
+    if (p->smooth_scroll_region) {
+        for (unsigned k = 0; k < num_regions; k++)
+            if (regions[k].id == p->smooth_scroll_region) return (uint8_t)(k + 1);
+        return 0;
+    }
+    for (unsigned k = 0; k < num_regions; k++) {
+        const ImageLayerRegion *r = regions + k;
+        if (image_in_smooth_scroll_region(p->start_row, p->start_column, p->num_rows, p->num_cols, r->horizontal, r->left, r->top, r->right, r->bottom))
+            return (uint8_t)(k + 1);
+    }
+    return 0;
 }
 
 
@@ -1613,8 +1658,24 @@ grman_update_layers(
     float dy,
     unsigned int num_cols,
     unsigned int num_rows,
-    CellPixelSize cell) {
+    CellPixelSize cell,
+    const ImageLayerRegion *regions,
+    unsigned num_regions) {
+    num_regions = MIN(num_regions, MAX_IMAGE_LAYER_REGIONS);
     if (self->last_scrolled_by != scrolled_by || self->last_scroll_offset_lines != scroll_offset_lines) set_layers_dirty(self);
+    if (UNLIKELY(num_regions || self->last_num_layer_regions)) {
+        bool changed = num_regions != self->last_num_layer_regions;
+        for (unsigned k = 0; k < num_regions && !changed; k++) {
+            const ImageLayerRegion *a = regions + k, *b = self->last_layer_regions + k;
+            changed = a->id != b->id || a->offset != b->offset || a->horizontal != b->horizontal || a->left != b->left || a->top != b->top ||
+                      a->right != b->right || a->bottom != b->bottom;
+        }
+        if (changed) {
+            set_layers_dirty(self);
+            if (num_regions) memcpy(self->last_layer_regions, regions, num_regions * sizeof(regions[0]));
+            self->last_num_layer_regions = num_regions;
+        }
+    }
     self->last_scrolled_by = scrolled_by;
     self->last_scroll_offset_lines = scroll_offset_lines;
     if (!self->layers_dirty) return false;
@@ -1624,12 +1685,14 @@ grman_update_layers(
     self->num_of_negative_refs = 0;
     self->num_of_positive_refs = 0;
     self->num_of_indexed_refs = 0;
+    self->num_of_smooth_scroll_refs = 0;
     ImageRect r;
     float screen_width = dx * num_cols, screen_height = dy * num_rows;
-    float screen_bottom = screen_top - screen_height;
+    // NDC y increases downwards, see gpu/api.h
+    float screen_bottom = screen_top + screen_height;
     float screen_width_px = num_cols * cell.width;
     float screen_height_px = num_rows * cell.height;
-    float y0 = screen_top - dy * ((float)scrolled_by + scroll_offset_lines);
+    float y0 = screen_top + dy * ((float)scrolled_by + scroll_offset_lines);
 
     // Iterate over all visible refs and create render data
     self->render_data.count = 0;
@@ -1646,9 +1709,15 @@ grman_update_layers(
                 continue;
             }
             int32_t start_row = ref->start_row, start_column = ref->start_column;
+            RootPlacement root = {
+                .start_row = start_row,
+                .start_column = start_column,
+                .num_rows = MAX(1, (int32_t)ref->effective_num_rows),
+                .num_cols = MAX(1, (int32_t)ref->effective_num_cols),
+                .smooth_scroll_region = ref->smooth_scroll_region};
             if (ref->parent.img) {
                 bool has_virtual_ancestor;
-                if (!resolve_parent_offset(self, ref, &start_row, &start_column, &has_virtual_ancestor)) {
+                if (!resolve_parent_offset(self, ref, &start_row, &start_column, &has_virtual_ancestor, &root)) {
                     if (!has_virtual_ancestor) {
                         refitr = remove_ref_itr(img, refitr);
                         ref_removed = true;
@@ -1656,15 +1725,15 @@ grman_update_layers(
                     continue;
                 }
             }
-            r.top = y0 - start_row * dy - dy * (float)ref->cell_y_offset / (float)cell.height;
+            r.top = y0 + start_row * dy + dy * (float)ref->cell_y_offset / (float)cell.height;
             r.left = screen_left + start_column * dx + dx * (float)ref->cell_x_offset / (float)cell.width;
 
             int32_t nr = ref->num_rows, nc = ref->num_cols;
             if (nr) {
-                r.bottom = y0 - (start_row + nr) * dy;
+                r.bottom = y0 + (start_row + nr) * dy;
                 if (nc) r.right = screen_left + (start_column + nc) * dx;
                 else {
-                    double height_px = (((double)r.top - r.bottom) / screen_height) * screen_height_px;
+                    double height_px = (((double)r.bottom - r.top) / screen_height) * screen_height_px;
                     double width_px = height_px * ref->src_width / (double)ref->src_height;
                     r.right = r.left + (float)((width_px / screen_width_px) * screen_width);
                 }
@@ -1673,10 +1742,22 @@ grman_update_layers(
                 else r.right = r.left + screen_width * (float)ref->src_width / screen_width_px;
                 double width_px = (((double)r.right - r.left) / screen_width) * screen_width_px;
                 double height_px = width_px * ref->src_height / (double)ref->src_width;
-                r.bottom = r.top - (float)((height_px / screen_height_px) * screen_height);
+                r.bottom = r.top + (float)((height_px / screen_height_px) * screen_height);
             }
 
-            if (r.top <= screen_bottom || r.bottom >= screen_top) {
+            const uint8_t region_idx = UNLIKELY(num_regions) ? layer_region_for_image(regions, num_regions, &root) : 0;
+            if (region_idx) {
+                const ImageLayerRegion *lr = regions + region_idx - 1;
+                if (lr->horizontal) {
+                    r.left += dx * lr->offset;
+                    r.right += dx * lr->offset;
+                } else {
+                    r.top += dy * lr->offset;
+                    r.bottom += dy * lr->offset;
+                }
+            }
+
+            if (r.top >= screen_bottom || r.bottom <= screen_top) {
                 refitr = vt_next(refitr);
                 continue;
             } // not visible
@@ -1695,11 +1776,13 @@ grman_update_layers(
             rd->ref_id = ref->internal_id;
             rd->texture_id = texture_id_for_img(img);
             rd->indexed_px_sz = img->indexed_px_sz;
+            rd->smooth_scroll_region = region_idx;
+            if (region_idx) self->num_of_smooth_scroll_refs++;
             if (img->indexed_px_sz) {
                 self->num_of_indexed_refs++;
                 // The rect is in normalized device co-ordinates, so allow for rounding errors
                 const float width_px = (r.right - r.left) / screen_width * screen_width_px;
-                const float height_px = (r.top - r.bottom) / screen_height * screen_height_px;
+                const float height_px = (r.bottom - r.top) / screen_height * screen_height_px;
                 rd->is_unscaled = fabsf(width_px - ref->src_width) < 0.01f && fabsf(height_px - ref->src_height) < 0.01f;
             }
             img->is_drawn = true;
@@ -1728,8 +1811,12 @@ grman_update_layers(
     while (i < self->render_data.count) {
         id_type num_identical = 1, image_id = self->render_data.item[i].image_id, start = i;
         const bool is_unscaled = self->render_data.item[i].is_unscaled;
+        // Refs clipped to different smooth scroll regions are drawn separately
+        const uint8_t region = self->render_data.item[i].smooth_scroll_region;
         while (++i < self->render_data.count) {
-            if (self->render_data.item[i].image_id != image_id || self->render_data.item[i].is_unscaled != is_unscaled) break;
+            if (self->render_data.item[i].image_id != image_id || self->render_data.item[i].is_unscaled != is_unscaled ||
+                self->render_data.item[i].smooth_scroll_region != region)
+                break;
             num_identical++;
         }
         while (num_identical > 0) { self->render_data.item[start++].group_count = num_identical--; }
@@ -2533,6 +2620,44 @@ src_pixels_per_screen_pixel(const ImageRef *ref, CellPixelSize cell) {
 }
 
 static bool
+clip_ref_to_rows(ImageRef *ref, Image *img, int32_t top, int32_t bottom, bool clip_top, bool clip_bottom, CellPixelSize cell) {
+    // Clip the image to the rows [top, bottom], only at the top or bottom as
+    // specified. Returns true if nothing of the image is left.
+    if ((clip_top && ref->start_row + (int32_t)ref->effective_num_rows <= top) || (clip_bottom && ref->start_row > bottom)) return true;
+    uint32_t clipped_rows;
+    float clip_amt;
+    const float scale = src_pixels_per_screen_pixel(ref, cell);
+    if (clip_top && ref->start_row < top) {
+        // image moved up
+        clipped_rows = top - ref->start_row;
+        clip_amt = scale * (float)(cell.height * clipped_rows - ref->cell_y_offset);
+        if (ref->src_height <= clip_amt) return true;
+        ref->src_y += clip_amt;
+        ref->src_height -= clip_amt;
+        ref->effective_num_rows -= clipped_rows;
+        if (ref->num_rows) ref->num_rows -= clipped_rows;
+        ref->cell_y_offset = 0;
+        update_src_rect(ref, img);
+        ref->start_row += clipped_rows;
+    }
+    if (clip_bottom && ref->start_row + (int32_t)ref->effective_num_rows - 1 > bottom) {
+        // image moved down
+        clipped_rows = ref->start_row + ref->effective_num_rows - 1 - bottom;
+        // the last row may be only partially covered by the image,
+        // so calculate the clip amount from the height that remains visible
+        float visible_height_px = (float)(cell.height * (ref->effective_num_rows - clipped_rows)) - (float)ref->cell_y_offset;
+        float new_src_height = scale * visible_height_px;
+        if (new_src_height <= 0) return true;
+        clip_amt = ref->src_height - new_src_height;
+        if (clip_amt > 0) ref->src_height -= clip_amt;
+        ref->effective_num_rows -= clipped_rows;
+        if (ref->num_rows) ref->num_rows -= clipped_rows;
+        update_src_rect(ref, img);
+    }
+    return false;
+}
+
+static bool
 scroll_filter_margins_func(ImageRef *ref, Image *img, const void *data, CellPixelSize cell) {
     if (ref->is_virtual_ref) return false;
     ScrollData *d = (ScrollData *)data;
@@ -2547,35 +2672,7 @@ scroll_filter_margins_func(ImageRef *ref, Image *img, const void *data, CellPixe
         ref->start_row += d->amt;
         if (ref_outside_region(ref, d->margin_top, d->margin_bottom)) return true;
         // Clip the image if scrolling has resulted in part of it being outside the page area
-        uint32_t clipped_rows;
-        float clip_amt;
-        const float scale = src_pixels_per_screen_pixel(ref, cell);
-        if (ref->start_row < (int32_t)d->margin_top) {
-            // image moved up
-            clipped_rows = d->margin_top - ref->start_row;
-            clip_amt = scale * (float)(cell.height * clipped_rows - ref->cell_y_offset);
-            if (ref->src_height <= clip_amt) return true;
-            ref->src_y += clip_amt;
-            ref->src_height -= clip_amt;
-            ref->effective_num_rows -= clipped_rows;
-            if (ref->num_rows) ref->num_rows -= clipped_rows;
-            ref->cell_y_offset = 0;
-            update_src_rect(ref, img);
-            ref->start_row += clipped_rows;
-        } else if (ref->start_row + (int32_t)ref->effective_num_rows - 1 > (int32_t)d->margin_bottom) {
-            // image moved down
-            clipped_rows = ref->start_row + ref->effective_num_rows - 1 - d->margin_bottom;
-            // the last row may be only partially covered by the image,
-            // so calculate the clip amount from the height that remains visible
-            float visible_height_px = (float)(cell.height * (ref->effective_num_rows - clipped_rows)) - (float)ref->cell_y_offset;
-            float new_src_height = scale * visible_height_px;
-            if (new_src_height <= 0) return true;
-            clip_amt = ref->src_height - new_src_height;
-            if (clip_amt > 0) ref->src_height -= clip_amt;
-            ref->effective_num_rows -= clipped_rows;
-            if (ref->num_rows) ref->num_rows -= clipped_rows;
-            update_src_rect(ref, img);
-        }
+        if (clip_ref_to_rows(ref, img, d->margin_top, d->margin_bottom, true, true, cell)) return true;
         return ref_outside_region(ref, d->margin_top, d->margin_bottom);
     }
     return false;
@@ -2586,6 +2683,143 @@ grman_scroll_images(GraphicsManager *self, const ScrollData *data, CellPixelSize
     if (vt_size(&self->images_by_internal_id)) {
         set_layers_dirty(self);
         modify_refs(self, data, data->has_margins ? scroll_filter_margins_func : scroll_filter_func, cell);
+    }
+}
+
+static float
+src_pixels_per_screen_pixel_x(const ImageRef *ref, CellPixelSize cell) {
+    // The horizontal scale factor mapping pixels in the destination rectangle
+    // on the screen to pixels in the source rectangle. Must match the dest
+    // rect calculation used for rendering in grman_update_layers().
+    float dest_width_px;
+    if (ref->num_cols) dest_width_px = (float)(ref->num_cols * cell.width) - (float)ref->cell_x_offset;
+    else if (ref->num_rows && ref->src_height > 0) {
+        float dest_height_px = (float)(ref->num_rows * cell.height) - (float)ref->cell_y_offset;
+        dest_width_px = dest_height_px * ref->src_width / ref->src_height;
+    } else return 1.f; // rendered at native size
+    return dest_width_px > 0 ? ref->src_width / dest_width_px : 1.f;
+}
+
+static bool
+clip_ref_to_columns(ImageRef *ref, Image *img, int32_t left, int32_t right, bool clip_left, bool clip_right, CellPixelSize cell) {
+    // Clip the image to the columns [left, right], only on the left or right
+    // as specified. Returns true if nothing of the image is left.
+    if ((clip_left && ref->start_column + (int32_t)ref->effective_num_cols <= left) || (clip_right && ref->start_column > right)) return true;
+    const float scale = src_pixels_per_screen_pixel_x(ref, cell);
+    if (clip_left && ref->start_column < left) {
+        const uint32_t clipped_cols = left - ref->start_column;
+        const float clip_amt = scale * (float)(cell.width * clipped_cols - ref->cell_x_offset);
+        if (ref->src_width <= clip_amt) return true;
+        ref->src_x += clip_amt;
+        ref->src_width -= clip_amt;
+        ref->effective_num_cols -= clipped_cols;
+        if (ref->num_cols) ref->num_cols -= clipped_cols;
+        ref->cell_x_offset = 0;
+        update_src_rect(ref, img);
+        ref->start_column += clipped_cols;
+    }
+    if (clip_right && ref->start_column + (int32_t)ref->effective_num_cols - 1 > right) {
+        const uint32_t clipped_cols = ref->start_column + ref->effective_num_cols - 1 - right;
+        // the last column may be only partially covered by the image, so
+        // calculate the clip amount from the width that remains visible
+        const float visible_width_px = (float)(cell.width * (ref->effective_num_cols - clipped_cols)) - (float)ref->cell_x_offset;
+        const float new_src_width = scale * visible_width_px;
+        if (new_src_width <= 0) return true;
+        if (new_src_width < ref->src_width) ref->src_width = new_src_width;
+        ref->effective_num_cols -= clipped_cols;
+        if (ref->num_cols) ref->num_cols -= clipped_cols;
+        update_src_rect(ref, img);
+    }
+    return false;
+}
+
+static bool
+smooth_scroll_filter_func(ImageRef *ref, Image UNUSED *img, const void *data, CellPixelSize cell UNUSED) {
+    // Images are positioned relative to their parent, so move only images without one
+    if (ref->is_virtual_ref || ref->parent.img) return false;
+    const SmoothScrollImageData *d = data;
+    const int32_t rows = (int32_t)ref->effective_num_rows, cols = (int32_t)ref->effective_num_cols;
+    if (ref->smooth_scroll_region != d->region_id) {
+        if (ref->smooth_scroll_region) return false; // moving with another region
+        if (d->uses_history) {
+            // The scrollback is the overflow buffer above the full width
+            // rectangle and moves with its rows, as do the images in it
+            if (ref->start_row >= d->bottom) return false;
+        } else if (!image_in_smooth_scroll_region(
+                       ref->start_row, ref->start_column, MAX(1, rows), MAX(1, cols), d->horizontal, d->left, d->top, d->right, d->bottom))
+            return false;
+    }
+    int32_t *pos = d->horizontal ? &ref->start_column : &ref->start_row;
+    *pos += d->amt;
+    const int32_t limit = *pos + (d->horizontal ? cols : rows);
+    if (*pos >= d->after_limit) return true;
+    if (d->uses_history) {
+        if (limit <= d->history_limit) return true;
+        // Images in the scrollback that are not next to the rectangle are no longer drawn with it
+        ref->smooth_scroll_region = limit > d->before_limit ? d->region_id : 0;
+        return false;
+    }
+    if (limit <= d->before_limit) return true;
+    ref->smooth_scroll_region = d->region_id;
+    return false;
+}
+
+void
+grman_smooth_scroll_images(GraphicsManager *self, const SmoothScrollImageData *data, CellPixelSize cell) {
+    if (vt_size(&self->images_by_internal_id)) {
+        set_layers_dirty(self);
+        modify_refs(self, data, smooth_scroll_filter_func, cell);
+    }
+}
+
+typedef struct SmoothScrollReleaseData {
+    uint32_t region_id;
+    int32_t left, top, right, bottom;
+    bool horizontal, clip_before;
+} SmoothScrollReleaseData;
+
+static bool
+smooth_scroll_release_filter_func(ImageRef *ref, Image *img, const void *data, CellPixelSize cell) {
+    const SmoothScrollReleaseData *d = data;
+    if (ref->smooth_scroll_region != d->region_id) {
+        // Images that have not moved yet also move with the region when they
+        // are in its rectangle, see layer_region_for_image()
+        if (ref->smooth_scroll_region || ref->is_virtual_ref || ref->parent.img) return false;
+        if (!image_in_smooth_scroll_region(
+                ref->start_row,
+                ref->start_column,
+                MAX(1, (int32_t)ref->effective_num_rows),
+                MAX(1, (int32_t)ref->effective_num_cols),
+                d->horizontal,
+                d->left,
+                d->top,
+                d->right,
+                d->bottom))
+            return false;
+    }
+    ref->smooth_scroll_region = 0;
+    if (d->horizontal) return clip_ref_to_columns(ref, img, d->left, d->right - 1, d->clip_before, true, cell);
+    return clip_ref_to_rows(ref, img, d->top, d->bottom - 1, d->clip_before, true, cell);
+}
+
+void
+grman_smooth_scroll_release_images(
+    GraphicsManager *self,
+    uint32_t region_id,
+    int32_t left,
+    int32_t top,
+    int32_t right,
+    int32_t bottom,
+    bool horizontal,
+    bool clip_before,
+    CellPixelSize cell) {
+    // The images moving with the region are no longer moving with it, clip
+    // them to its rectangle as the overflow buffers they extend into are discarded
+    if (vt_size(&self->images_by_internal_id)) {
+        set_layers_dirty(self);
+        const SmoothScrollReleaseData d = {
+            .region_id = region_id, .left = left, .top = top, .right = right, .bottom = bottom, .horizontal = horizontal, .clip_before = clip_before};
+        modify_refs(self, &d, smooth_scroll_release_filter_func, cell);
     }
 }
 
@@ -2972,12 +3206,12 @@ image_as_dict(GraphicsManager *self, Image *img) {
         return NULL;
     }
     PyObject *ans = Py_BuildValue(
-        "{sI sI sI sI sI sI sI "
+        "{sK sI sI sI sI sI sI "
         "sO sI sO "
         "sI sI sI "
         "sI sI sy# sN sI}",
         "texture_id",
-        texture_id_for_img(img),
+        (unsigned long long)texture_id_for_img(img),
         U(client_id),
         U(width),
         U(height),
@@ -3081,7 +3315,7 @@ grman_render_data_as_python(GraphicsManager *self) {
             ans,
             i,
             Py_BuildValue(
-                "{sN sN sI si sK sK sI sO}",
+                "{sN sN sI si sK sK sI sO sI}",
                 "src_rect",
                 R(src_rect),
                 "dest_rect",
@@ -3097,7 +3331,9 @@ grman_render_data_as_python(GraphicsManager *self) {
                 "indexed_px_sz",
                 (unsigned int)r->indexed_px_sz,
                 "is_unscaled",
-                r->is_unscaled ? Py_True : Py_False));
+                r->is_unscaled ? Py_True : Py_False,
+                "smooth_scroll_region",
+                (unsigned int)r->smooth_scroll_region));
 #undef R
     }
     return ans;
@@ -3108,7 +3344,7 @@ W(update_layers) {
     float xstart, ystart, dx, dy, scroll_offset_lines = 0.0f;
     CellPixelSize cell;
     PA("IffffIIII|f", &scrolled_by, &xstart, &ystart, &dx, &dy, &sx, &sy, &cell.width, &cell.height, &scroll_offset_lines);
-    grman_update_layers(self, scrolled_by, scroll_offset_lines, xstart, ystart, dx, dy, sx, sy, cell);
+    grman_update_layers(self, scrolled_by, scroll_offset_lines, xstart, ystart, dx, dy, sx, sy, cell, NULL, 0);
     return grman_render_data_as_python(self);
 }
 
@@ -3219,6 +3455,7 @@ grman_render_data(GraphicsManager *self) {
         .num_of_negative_refs = self->num_of_negative_refs,
         .num_of_positive_refs = self->num_of_positive_refs,
         .num_of_indexed_refs = self->num_of_indexed_refs,
+        .num_of_smooth_scroll_refs = self->num_of_smooth_scroll_refs,
     };
     return ans;
 }

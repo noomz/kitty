@@ -901,6 +901,8 @@ extern bool init_fontconfig_library(PyObject *);
 extern bool init_crypto_library(PyObject *);
 extern bool init_desktop(PyObject *);
 extern bool init_fonts(PyObject *);
+extern bool init_font_select(PyObject *);
+extern bool init_startup_timing(PyObject *);
 extern bool init_glfw(PyObject *m);
 extern bool init_dnd(PyObject *m);
 extern bool init_child(PyObject *m);
@@ -916,6 +918,9 @@ extern bool init_utmp(PyObject *module);
 extern bool init_loop_utils(PyObject *module);
 extern bool init_systemd_module(PyObject *module);
 extern bool init_mime_cache(PyObject *module);
+extern bool init_glyph_protocol(PyObject *module);
+extern bool init_vector_glyph(PyObject *module);
+extern bool init_vector_glyph_render(PyObject *module);
 #ifdef __APPLE__
 extern int init_CoreText(PyObject *);
 extern bool init_cocoa(PyObject *module);
@@ -944,6 +949,7 @@ PyInit_fast_data_types(void) {
     m = PyModule_Create(&module);
     if (m == NULL) return NULL;
     init_monotonic();
+    init_char_props();
 
     if (!init_logging(m)) return NULL;
     if (!init_LineBuf(m)) return NULL;
@@ -977,11 +983,16 @@ PyInit_fast_data_types(void) {
     if (!init_freetype_render_ui_text(m)) return NULL;
 #endif
     if (!init_fonts(m)) return NULL;
+    if (!init_font_select(m)) return NULL;
+    if (!init_startup_timing(m)) return NULL;
     if (!init_utmp(m)) return NULL;
     if (!init_loop_utils(m)) return NULL;
     if (!init_crypto_library(m)) return NULL;
     if (!init_systemd_module(m)) return NULL;
     if (!init_mime_cache(m)) return NULL;
+    if (!init_glyph_protocol(m)) return NULL;
+    if (!init_vector_glyph(m)) return NULL;
+    if (!init_vector_glyph_render(m)) return NULL;
     if (!init_animations(m)) return NULL;
 
     CellAttrs a;
@@ -1033,6 +1044,7 @@ PyInit_fast_data_types(void) {
     PyModule_AddIntMacro(m, ESC_PM);
     PyModule_AddIntMacro(m, TEXT_SIZE_CODE);
     PyModule_AddIntMacro(m, DND_CODE);
+    PyModule_AddIntMacro(m, SMOOTH_SCROLL_CODE);
     PyModule_AddIntMacro(m, COLOR_NOT_SET);
     PyModule_AddIntMacro(m, COLOR_IS_SPECIAL);
     PyModule_AddIntMacro(m, COLOR_IS_INDEX);

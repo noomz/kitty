@@ -14,7 +14,7 @@ parse_multicell_code(PS *self, uint8_t *parser_buf, const size_t parser_buf_pos)
     unsigned int i, code;
     uint64_t lcode;
     bool is_negative; (void)is_negative;
-    size_t sz;
+    size_t sz; (void)sz;
 
     enum KEYS {
         width='w',
@@ -76,8 +76,10 @@ case horizontal_align: value_state = UINT; break;
 
                 is_negative = false;
                 if(parser_buf[pos] == '-') { is_negative = true; pos++; }
-#define I(x) case x: g.x = is_negative ? 0 - (int32_t)code : (int32_t)code; break
+#define I(x) case x: g.x = is_negative ? (int32_t)(-(int64_t)code) : (int32_t)code; break
                 READ_UINT;
+                if (code > (is_negative ? 2147483648u : 2147483647u)) {
+                    REPORT_ERROR("Malformed MultiCellCommand control block, number is too large"); return; }
                 switch(key) {
                     ;
                     default: break;
@@ -135,11 +137,8 @@ case horizontal_align: value_state = UINT; break;
     }
 
     REPORT_VA_COMMAND("K s { sI sI sI sI sI sI  ss#}", self->window_id, "multicell_command",
-
 "width", (unsigned int)g.width, "scale", (unsigned int)g.scale, "subscale_n", (unsigned int)g.subscale_n, "subscale_d", (unsigned int)g.subscale_d, "vertical_align", (unsigned int)g.vertical_align, "horizontal_align", (unsigned int)g.horizontal_align,
-
-"", (char*)parser_buf + payload_start, g.payload_sz
-);
+"", (char*)parser_buf + payload_start, g.payload_sz);
 
     screen_handle_multicell_command(self->screen, &g, parser_buf + payload_start);
 }

@@ -115,6 +115,18 @@ pointerHandleLeave(void *data UNUSED, struct wl_pointer *pointer UNUSED, uint32_
     if (!window) return;
     _glfw.wl.serial = serial;
     _glfw.wl.pointerFocus = NULL;
+    if (window->wl.scroll_gesture_in_progress) {
+        // The end of the gesture will not be delivered to this window
+        window->wl.scroll_gesture_in_progress = false;
+        _glfwInputScroll(
+            window,
+            &(GLFWScrollEvent){
+                .phase = GLFW_SCROLL_PHASE_CANCELLED,
+                .source = window->wl.prev_frame_scroll_source,
+                .offset_type = window->wl.prev_frame_offset_type,
+                .direction_inverted = window->wl.prev_frame_direction_inverted,
+                .keyboard_modifiers = _glfw.wl.xkb.states.modifiers});
+    }
     if (window->wl.surface == surface) {
         window->wl.hovered = false;
         _glfwInputCursorEnter(window, false);
@@ -247,12 +259,36 @@ pointer_handle_frame(void *data UNUSED, struct wl_pointer *pointer UNUSED) {
     }
     bool stopped = info.y_stop_received || info.x_stop_received;
     if (!found && stopped) ev.offset_type = window->wl.prev_frame_offset_type;
+    if (info.source_received) {
+        switch (info.source_type) {
+            case WL_POINTER_AXIS_SOURCE_WHEEL: ev.source = GLFW_SCROLL_SOURCE_WHEEL; break;
+            case WL_POINTER_AXIS_SOURCE_FINGER: ev.source = GLFW_SCROLL_SOURCE_FINGER; break;
+            case WL_POINTER_AXIS_SOURCE_CONTINUOUS: ev.source = GLFW_SCROLL_SOURCE_CONTINUOUS; break;
+            case WL_POINTER_AXIS_SOURCE_WHEEL_TILT: ev.source = GLFW_SCROLL_SOURCE_WHEEL_TILT; break;
+            default: ev.source = GLFW_SCROLL_SOURCE_UNKNOWN; break;
+        }
+    } else if (!found) ev.source = window->wl.prev_frame_scroll_source;
+    ev.direction_inverted = info.direction_inverted_received ? info.direction_inverted : window->wl.prev_frame_direction_inverted;
+    // Only finger and continuous sources send axis_stop, so only they have gestures
+    if (ev.source == GLFW_SCROLL_SOURCE_FINGER || ev.source == GLFW_SCROLL_SOURCE_CONTINUOUS) {
+        if (stopped) {
+            ev.phase = GLFW_SCROLL_PHASE_ENDED;
+            window->wl.scroll_gesture_in_progress = false;
+        } else if (found) {
+            ev.phase = window->wl.scroll_gesture_in_progress ? GLFW_SCROLL_PHASE_CHANGED : GLFW_SCROLL_PHASE_BEGAN;
+            window->wl.scroll_gesture_in_progress = true;
+        }
+    }
     ev.unscaled.x *= -1;
     const double scale = ev.offset_type == GLFW_SCROLL_OFFEST_HIGHRES ? _glfwWaylandWindowScale(window) : 1;
     ev.x_offset = scale * ev.unscaled.x;
     ev.y_offset = scale * ev.unscaled.y;
     glfw_handle_scroll_event_for_momentum(window, &ev, stopped, info.source_type == WL_POINTER_AXIS_SOURCE_FINGER);
-    if (found) window->wl.prev_frame_offset_type = ev.offset_type;
+    if (found || info.source_received) {
+        if (found) window->wl.prev_frame_offset_type = ev.offset_type;
+        window->wl.prev_frame_scroll_source = ev.source;
+        window->wl.prev_frame_direction_inverted = ev.direction_inverted;
+    }
     /* clear pointer_curr_axis_info for next frame */
     memset(&info, 0, sizeof(info));
 }
@@ -262,6 +298,7 @@ pointer_handle_axis_source(void *data UNUSED, struct wl_pointer *pointer UNUSED,
     _GLFWwindow *window = _glfw.wl.pointerFocus;
     if (!window) return;
     info.source_type = source;
+    info.source_received = true;
 }
 
 static void
@@ -292,7 +329,12 @@ pointer_handle_axis_value120(void *data UNUSED, struct wl_pointer *pointer UNUSE
 }
 
 static void
-pointer_handle_axis_relative_direction(void *data UNUSED, struct wl_pointer *pointer UNUSED, uint32_t axis UNUSED, uint32_t axis_relative_direction UNUSED) {}
+pointer_handle_axis_relative_direction(void *data UNUSED, struct wl_pointer *pointer UNUSED, uint32_t axis UNUSED, uint32_t axis_relative_direction) {
+    _GLFWwindow *window = _glfw.wl.pointerFocus;
+    if (!window) return;
+    info.direction_inverted_received = true;
+    if (axis_relative_direction == WL_POINTER_AXIS_RELATIVE_DIRECTION_INVERTED) info.direction_inverted = true;
+}
 
 #undef info
 static const struct wl_pointer_listener pointerListener = {
@@ -1025,16 +1067,6 @@ _glfwPlatformInit(bool *supports_window_occlusion) {
     glfw_dlsym(_glfw.wl.cursor.theme_get_cursor, _glfw.wl.cursor.handle, "wl_cursor_theme_get_cursor");
     glfw_dlsym(_glfw.wl.cursor.image_get_buffer, _glfw.wl.cursor.handle, "wl_cursor_image_get_buffer");
 
-    _glfw.wl.egl.handle = _glfw_dlopen("libwayland-egl.so.1");
-    if (!_glfw.wl.egl.handle) {
-        _glfwInputError(GLFW_PLATFORM_ERROR, "Wayland: Failed to open libwayland-egl");
-        return false;
-    }
-
-    glfw_dlsym(_glfw.wl.egl.window_create, _glfw.wl.egl.handle, "wl_egl_window_create");
-    glfw_dlsym(_glfw.wl.egl.window_destroy, _glfw.wl.egl.handle, "wl_egl_window_destroy");
-    glfw_dlsym(_glfw.wl.egl.window_resize, _glfw.wl.egl.handle, "wl_egl_window_resize");
-
     _glfw.wl.display = wl_display_connect(NULL);
     if (!_glfw.wl.display) {
         _glfwInputError(GLFW_PLATFORM_ERROR, "Wayland: Failed to connect to display");
@@ -1163,28 +1195,13 @@ _glfwPlatformTerminate(void) {
     if (_glfw.wl.pointer_gestures) zwp_pointer_gestures_v1_release(_glfw.wl.pointer_gestures);
 
     if (_glfw.wl.registry) wl_registry_destroy(_glfw.wl.registry);
-    // Call eglTerminate before disconnecting from the display: eglTerminate
-    // sends Wayland protocol requests which must be flushed and their closures
-    // drained before we unload the EGL library.  The dlclose calls move to
-    // after wl_display_disconnect so the message format tables remain mapped
-    // while the queue is drained, preventing a segfault in
-    // destroy_queued_closure().
-    if (_glfw.egl.display) {
-        eglTerminate(_glfw.egl.display);
-        _glfw.egl.display = EGL_NO_DISPLAY;
-    }
+    // The GPU driver must have released all its resources, such as EGL
+    // displays, before this is called, since they can send Wayland protocol
+    // requests that must be flushed and drained before disconnecting.
     if (_glfw.wl.display) {
         wl_display_flush(_glfw.wl.display);
         wl_display_disconnect(_glfw.wl.display);
         _glfw.wl.display = NULL;
-    }
-    if (_glfw.egl.handle) {
-        _glfw_dlclose(_glfw.egl.handle);
-        _glfw.egl.handle = NULL;
-    }
-    if (_glfw.wl.egl.handle) {
-        _glfw_dlclose(_glfw.wl.egl.handle);
-        _glfw.wl.egl.handle = NULL;
     }
     finalizePollData(&_glfw.wl.eventLoopData);
     if (_glfw.wl.compositor_name) {
@@ -1199,7 +1216,7 @@ _glfwPlatformTerminate(void) {
 const char *
 _glfwPlatformGetVersionString(void) {
     (void)keep_going;
-    return _GLFW_VERSION_NUMBER " Wayland EGL OSMesa"
+    return _GLFW_VERSION_NUMBER " Wayland"
 #if defined(_POSIX_TIMERS) && defined(_POSIX_MONOTONIC_CLOCK)
                                 " clock_gettime"
 #else

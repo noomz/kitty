@@ -5,11 +5,13 @@
  */
 
 #include "state.h"
+#include "gpu.h"
 #include "cleanup.h"
 #include "monotonic.h"
 #include "dnd.h"
 #include "charsets.h"
 #include "control-codes.h"
+#include "startup-timing.h"
 #include <structmember.h>
 #include "glfw-wrapper.h"
 #ifdef __APPLE__
@@ -28,14 +30,67 @@ typedef struct mouse_cursor {
 
 static mouse_cursor cursors[GLFW_INVALID_CURSOR + 1] = {0};
 
+static int
+default_swap_interval(void) {
+    // On Wayland, syncing to the monitor is done using frame callbacks, a swap
+    // interval would block rendering indefinitely when the window is hidden.
+    return OPT(render_interval.sync_to_monitor) && !global_state.is_wayland ? 1 : 0;
+}
+
+// Must be called with the surface current
 static void
-apply_swap_interval(int val) {
+apply_swap_interval(gpu_surface_t surface, int val) {
     (void)val;
+    (void)surface;
 #ifndef __APPLE__
-    if (val < 0) val = OPT(sync_to_monitor) && !global_state.is_wayland ? 1 : 0;
-    glfwSwapInterval(val);
+    if (val < 0) val = default_swap_interval();
+    gpu_surface_set_swap_interval(surface, val);
 #endif
 }
+
+// GPU surfaces {{{
+static void
+native_window_for_gpu(GLFWwindow *w, GPUNativeWindow *ans) {
+#ifdef __APPLE__
+    *ans = (GPUNativeWindow){.platform = GPU_PLATFORM_COCOA, .handle = w ? glfwGetCocoaView(w) : NULL};
+#else
+    if (global_state.is_wayland) {
+        *ans = (GPUNativeWindow){.platform = GPU_PLATFORM_WAYLAND, .display = glfwGetWaylandDisplay(), .handle = w ? glfwGetWaylandWindow(w) : NULL};
+    } else {
+        *ans = (GPUNativeWindow){.platform = GPU_PLATFORM_X11, .display = glfwGetX11Display(), .screen = -1, .x11_window = w ? glfwGetX11Window(w) : 0};
+    }
+#endif
+}
+
+static GPUSurfaceConfig
+gpu_surface_config(bool transparent) {
+    return (GPUSurfaceConfig){
+        .transparent = transparent,
+        // Request SRGB output buffer
+        // Prevents kitty from starting on Wayland + NVIDIA, sigh: https://github.com/kovidgoyal/kitty/issues/7021
+        // Remove after https://github.com/NVIDIA/egl-wayland/issues/85 is fixed.
+        // Also apparently mesa has introduced a bug with sRGB surfaces and Wayland.
+        // Sigh. Wayland is such a pile of steaming crap.
+        // See https://github.com/kovidgoyal/kitty/issues/7174#issuecomment-2000033873
+        // GL_FRAMEBUFFER_SRGB works anyway without this on Wayland.
+        .srgb = !global_state.is_wayland,
+        .allow_offline_renderers = true,
+        .high_resolution = true,
+        .swap_interval = default_swap_interval(),
+    };
+}
+
+static void
+native_surface_changed_callback(GLFWwindow *glfw_window) {
+    for (size_t i = 0; i < global_state.num_os_windows; i++) {
+        OSWindow *w = global_state.os_windows + i;
+        if (w->handle == glfw_window) {
+            if (w->gpu_surface) gpu_surface_native_changed(w->gpu_surface);
+            break;
+        }
+    }
+}
+// }}}
 
 void
 get_platform_dependent_config_values(void *glfw_window) {
@@ -362,7 +417,7 @@ cocoa_out_of_sequence_render(OSWindow *window) {
     // See https://github.com/kovidgoyal/kitty/issues/9463
     if (!current_framebuffer_is_ok()) {
         debug_rendering("Cocoa OpenGL framebuffer broken, re-creating\n");
-        if (!glfwCocoaRecreateGLDrawable(window->handle) || !current_framebuffer_is_ok()) {
+        if (!gpu_surface_recreate(window->gpu_surface) || !current_framebuffer_is_ok()) {
             debug_rendering("Cocoa OpenGL framebuffer re-creation failed\n");
             request_tick_callback();
             return;
@@ -375,8 +430,10 @@ cocoa_out_of_sequence_render(OSWindow *window) {
     bool rendered = false;
     if (window->fonts_data->sprite_map) {
         window->needs_render = true;
-        window->render_state = RENDER_FRAME_READY;
-        rendered = render_os_window(window, monotonic(), true);
+        // The window must be drawn now, as the OS expects its contents to be
+        // updated synchronously, for example, during a live resize, otherwise
+        // it is blanked below. Ignore both render frames and render_interval.
+        rendered = render_os_window(window, monotonic(), true, true);
     }
     if (!rendered) {
         debug_rendering("Cocoa out of sequence render did not happen\n");
@@ -396,6 +453,21 @@ cocoa_os_window_resized(GLFWwindow *w) {
 #endif
 
 
+// Apply a changed value of the render_interval option to an existing OS Window
+void
+apply_render_interval_to_os_window(OSWindow *w) {
+#ifdef __APPLE__
+    (void)w;
+#else
+    // The swap interval is zero during a live resize, it is restored when the resize ends
+    if (!w->handle || !w->gpu_surface || w->live_resize.in_progress) return;
+    gpu_surface_t orig_surface = make_os_window_context_current(w);
+    apply_swap_interval(w->gpu_surface, -1);
+    if (orig_surface) gpu_make_surface_current(orig_surface);
+#endif
+    w->needs_render = true;
+}
+
 void
 change_live_resize_state(OSWindow *w, bool in_progress) {
     if (in_progress != w->live_resize.in_progress) {
@@ -404,9 +476,9 @@ change_live_resize_state(OSWindow *w, bool in_progress) {
 #ifdef __APPLE__
         cocoa_out_of_sequence_render(w);
 #else
-        GLFWwindow *orig_ctx = make_os_window_context_current(w);
-        apply_swap_interval(in_progress ? 0 : -1);
-        if (orig_ctx) glfwMakeContextCurrent(orig_ctx);
+        gpu_surface_t orig_surface = make_os_window_context_current(w);
+        apply_swap_interval(w->gpu_surface, in_progress ? 0 : -1);
+        if (orig_surface) gpu_make_surface_current(orig_surface);
 
 #endif
     }
@@ -429,6 +501,9 @@ live_resize_callback(GLFWwindow *w, bool started) {
 static void
 framebuffer_size_callback(GLFWwindow *w, int width, int height) {
     if (!set_callback_window(w)) return;
+    // The GPU surface must always match the size of the window framebuffer
+    if (global_state.callback_os_window->gpu_surface && width > 0 && height > 0)
+        gpu_surface_resize(global_state.callback_os_window->gpu_surface, (uint32_t)width, (uint32_t)height);
     if (global_state.callback_os_window->ignore_resize_events) return;
     int min_width, min_height;
     min_size_for_os_window(global_state.callback_os_window, &min_width, &min_height);
@@ -1736,14 +1811,17 @@ set_os_window_icon(PyObject UNUSED *self, PyObject *args) {
 }
 
 
-void *
+// Makes the GPU surface of the OS Window current, returning the previously
+// current surface if it was changed, zero otherwise
+gpu_surface_t
 make_os_window_context_current(OSWindow *w) {
-    GLFWwindow *current_context = glfwGetCurrentContext();
-    if (w->handle != current_context) {
-        glfwMakeContextCurrent(w->handle);
-        return current_context;
+    gpu_surface_t current = gpu_get_current_surface();
+    if (w->gpu_surface != current) {
+        if (!gpu_make_surface_current(w->gpu_surface))
+            log_error("Failed to make the GPU surface of OS Window: %llu current with error: %s", w->id, gpu_last_error());
+        return current;
     }
-    return NULL;
+    return GPU_NULL_HANDLE;
 }
 
 void
@@ -2270,13 +2348,7 @@ set_window_creation_error(bool is_panel) {
             desc ? " with error: " : "",
             desc ? desc : "");
     } else {
-        PyErr_Format(
-            PyExc_OSError,
-            "Failed to create GLFWwindow%s%s. This usually happens because of old/broken OpenGL drivers. kitty requires working OpenGL %d.%d drivers.",
-            desc ? " with error: " : "",
-            desc ? desc : "",
-            OPENGL_REQUIRED_VERSION_MAJOR,
-            OPENGL_REQUIRED_VERSION_MINOR);
+        PyErr_Format(PyExc_OSError, "Failed to create GLFWwindow%s%s", desc ? " with error: " : "", desc ? desc : "");
     }
 }
 
@@ -2293,8 +2365,45 @@ is_visible_on_a_monitor(int x, int y, int width, int height) {
     return false;
 }
 
+typedef char GPUFailure[2048];
+
+static void
+describe_gpu_failure(GPUFailure failure, const char *what) {
+    snprintf(failure, sizeof(GPUFailure), "Failed to %s with the %s GPU driver with error: %s", what, gpu_driver_name(), gpu_last_error());
+}
+
+// Called when the GPU driver fails while creating the first window, before
+// any GPU resources exist, to switch to the next GPU driver, see the
+// gpu_driver option. Any surfaces must have been destroyed. Returns false,
+// with a Python exception set, if there is no other usable driver.
+static bool
+switch_gpu_driver_after_failure(bool is_first_window, const GPUFailure failure) {
+    if (is_first_window && has_untried_gpu_drivers()) {
+        GPUNativeWindow display;
+        native_window_for_gpu(NULL, &display);
+        const char *err = load_next_gpu_driver(&display);
+        if (!err) {
+            log_error("%s, using the %s GPU driver instead", failure, gpu_driver_name());
+            return true;
+        }
+        PyErr_Format(PyExc_OSError, "%s. Other GPU drivers are also not usable:\n%s", failure, err);
+        return false;
+    }
+    PyErr_Format(PyExc_OSError, "%s. This usually happens because of old/broken GPU drivers.", failure);
+    return false;
+}
+
 static PyObject *
 create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
+    {
+        // The GPU driver may still be loading, see glfw_init()
+        const char *err = wait_for_gpu_driver();
+        if (err) {
+            PyErr_Format(PyExc_RuntimeError, "Failed to load a GPU driver:\n%s", err);
+            return NULL;
+        }
+        startup_timing("GPU driver loaded");
+    }
     int x = INT_MIN, y = INT_MIN, window_state = WINDOW_NORMAL, disallow_override_title = 0;
     char *wm_class_class, *wm_class_name;
     PyObject *title, *optional_window_state = NULL, *load_programs = NULL, *get_window_size, *pre_show_callback, *optional_x = NULL, *optional_y = NULL,
@@ -2370,12 +2479,6 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
 #ifndef __APPLE__
         glfwConfigureMomentumScroller(OPT(momentum_scroll), -1, -1, 0);
 #endif
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, OPENGL_REQUIRED_VERSION_MAJOR);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, OPENGL_REQUIRED_VERSION_MINOR);
-        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, true);
-        // We don't use depth and stencil buffers
-        glfwWindowHint(GLFW_DEPTH_BITS, 0);
-        glfwWindowHint(GLFW_STENCIL_BITS, 0);
         glfwSetApplicationCloseCallback(application_close_requested_callback);
         glfwSetCurrentSelectionCallback(get_current_selection);
         glfwSetHasCurrentSelectionCallback(has_current_selection);
@@ -2383,17 +2486,8 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         glfwSetIMETextAroundCursorCallback(get_ime_text_around_cursor);
         glfwSetSystemColorThemeChangeCallback(on_system_color_scheme_change);
         glfwSetClipboardLostCallback(on_clipboard_lost);
-        // Request SRGB output buffer
-        // Prevents kitty from starting on Wayland + NVIDIA, sigh: https://github.com/kovidgoyal/kitty/issues/7021
-        // Remove after https://github.com/NVIDIA/egl-wayland/issues/85 is fixed.
-        // Also apparently mesa has introduced a bug with sRGB surfaces and Wayland.
-        // Sigh. Wayland is such a pile of steaming crap.
-        // See https://github.com/kovidgoyal/kitty/issues/7174#issuecomment-2000033873
-        // GL_FRAMEBUFFER_SRGB works anyway without this on Wayland.
-        if (!global_state.is_wayland) glfwWindowHint(GLFW_SRGB_CAPABLE, true);
 #ifdef __APPLE__
         cocoa_set_activation_policy(OPT(macos_hide_from_tasks) || lsc != NULL);
-        glfwWindowHint(GLFW_COCOA_GRAPHICS_SWITCHING, true);
         glfwSetApplicationShouldHandleReopen(on_application_reopen);
         glfwSetApplicationWillFinishLaunching(cocoa_application_lifecycle_event);
 #endif
@@ -2418,15 +2512,29 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     }
     bool want_semi_transparent = (1.0 - OPT(background_opacity) >= 0.01) || OPT(dynamic_background_opacity);
     glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, want_semi_transparent);
+    const GPUSurfaceConfig surface_config = gpu_surface_config(want_semi_transparent);
+#ifndef __APPLE__
+    if (!global_state.is_wayland) {
+        // The GPU driver may need the X11 window to use a particular visual
+        GPUNativeWindow display;
+        native_window_for_gpu(NULL, &display);
+        uint64_t visual_id = 0;
+        if (!gpu_choose_native_visual(&display, &surface_config, &visual_id)) {
+            GPUFailure failure;
+            describe_gpu_failure(failure, "choose an X11 visual for the window");
+            if (switch_gpu_driver_after_failure(is_first_window, failure)) return create_os_window(self, args, kw);
+            return NULL;
+        }
+        glfwWindowHint(GLFW_X11_VISUAL_ID, (int)visual_id);
+    }
+#endif
     uint32_t bgcolor = OPT(background);
     uint32_t bgalpha = (uint32_t)((MAX(0.f, MIN((OPT(background_opacity) * 255), 255.f))));
     glfwWindowHint(GLFW_WAYLAND_BGCOLOR, ((bgalpha & 0xff) << 24) | bgcolor);
-    // We use a temp window to avoid the need to set the window size after
-    // creation, which causes a resize event and all the associated processing.
-    // The temp window is used to get the DPI. On Wayland no temp window can be
-    // used, so start with window visible unless hidden window requested.
-    GLFWwindow *common_context = global_state.num_os_windows ? global_state.os_windows[0].handle : NULL;
-    GLFWwindow *temp_window = NULL;
+    // The DPI is needed before the window is created to calculate its size, to
+    // avoid the need to set the window size after creation, which causes a
+    // resize event and all the associated processing. On Wayland start with
+    // the window visible unless a hidden window is requested.
     glfwWindowHint(GLFW_VISIBLE, window_state != WINDOW_HIDDEN && global_state.is_wayland);
     float xscale, yscale;
     double xdpi, ydpi;
@@ -2462,18 +2570,15 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
 #undef QUERY_MONITOR
         }
     } else {
-#define glfw_failure(is_panel)               \
-    {                                        \
-        set_window_creation_error(is_panel); \
-        return NULL;                         \
-    }
-
-        glfwGetError(NULL); // clear any stale error
-        temp_window = glfwCreateWindow(640, 480, "temp", NULL, common_context, NULL);
-        if (temp_window == NULL) glfw_failure(false);
-        get_window_content_scale(temp_window, &xscale, &yscale, &xdpi, &ydpi);
+        // On X11 the scale is the same for all monitors. On macOS new windows
+        // are placed on the primary monitor, if the window ends up on a
+        // monitor with a different scale, the fonts are reloaded below.
+        // Creating a temporary window to get the scale is slow, particularly on
+        // macOS where destroying it alone takes ~10ms.
+        get_window_content_scale(NULL, &xscale, &yscale, &xdpi, &ydpi);
     }
     FONTS_DATA_HANDLE fonts_data = load_fonts_data(OPT(font_size), xdpi, ydpi);
+    startup_timing("Fonts loaded");
     PyObject *ret = PyObject_CallFunction(
         get_window_size,
         "IIddff",
@@ -2500,25 +2605,49 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         initial_window_size_py_callback = get_window_size;
     }
     glfwGetError(NULL); // clear any stale error
-    GLFWwindow *glfw_window = glfwCreateWindow(width, height, title_utf8, NULL, temp_window ? temp_window : common_context, lsc);
+    GLFWwindow *glfw_window = glfwCreateWindow(width, height, title_utf8, NULL, lsc);
     initial_window_size_py_callback = NULL;
-    if (temp_window) {
-        glfwDestroyWindow(temp_window);
-        temp_window = NULL;
+    if (glfw_window == NULL) {
+        set_window_creation_error(lsc != NULL);
+        return NULL;
     }
-    if (glfw_window == NULL) glfw_failure(lsc != NULL);
-#undef glfw_failure
     // Set titlebar-only mode before the window becomes visible
     if (global_state.is_wayland && (OPT(hide_window_decorations) & 2) && glfwWaylandSetTitlebarHidden) { glfwWaylandSetTitlebarHidden(glfw_window, true); }
-    glfwMakeContextCurrent(glfw_window);
-    if (is_first_window) initialize_gpu();
+    gpu_surface_t gpu_surface;
+    {
+        GPUNativeWindow native;
+        native_window_for_gpu(glfw_window, &native);
+        int fw = 0, fh = 0;
+        glfwGetFramebufferSize(glfw_window, &fw, &fh);
+        gpu_surface = gpu_surface_create(&native, &surface_config, (uint32_t)MAX(1, fw), (uint32_t)MAX(1, fh));
+        if (!gpu_surface || !gpu_make_surface_current(gpu_surface)) {
+            GPUFailure failure;
+            describe_gpu_failure(failure, "create a GPU surface for the window");
+            if (gpu_surface) gpu_surface_destroy(gpu_surface);
+            glfwDestroyWindow(glfw_window);
+            if (switch_gpu_driver_after_failure(is_first_window, failure)) return create_os_window(self, args, kw);
+            return NULL;
+        }
+    }
+    if (is_first_window && !initialize_gpu()) {
+        GPUFailure failure;
+        describe_gpu_failure(failure, "initialize the GPU");
+        gpu_surface_destroy(gpu_surface);
+        glfwDestroyWindow(glfw_window);
+        if (switch_gpu_driver_after_failure(is_first_window, failure)) return create_os_window(self, args, kw);
+        return NULL;
+    }
+    glfwSetNativeSurfaceChangedCallback(glfw_window, native_surface_changed_callback);
     bool is_semi_transparent = glfwGetWindowAttrib(glfw_window, GLFW_TRANSPARENT_FRAMEBUFFER);
     // blank the window once so that there is no initial flash of color
     // changing, in case the background color is not black
     blank_canvas(is_semi_transparent ? OPT(background_opacity) : 1.0f, OPT(background), true);
-    apply_swap_interval(-1);
+    apply_swap_interval(gpu_surface, -1);
     // On Wayland the initial swap is allowed only after the first XDG configure event
-    if (glfwAreSwapsAllowed(glfw_window)) glfwSwapBuffers(glfw_window);
+    if (glfwAreSwapsAllowed(glfw_window)) {
+        gpu_surface_present(gpu_surface);
+        glfwWindowContentsPresented(glfw_window);
+    }
     glfwSetInputMode(glfw_window, GLFW_LOCK_KEY_MODS, true);
     PyObject *pret = PyObject_CallFunction(pre_show_callback, "N", native_window_handle(glfw_window));
     if (pret == NULL) return NULL;
@@ -2543,6 +2672,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
         PyObject *ret = PyObject_CallNoArgs(load_programs);
         if (ret == NULL) return NULL;
         Py_DECREF(ret);
+        startup_timing("Shaders loaded");
         get_platform_dependent_config_values(glfw_window);
         if (!global_state.supports_framebuffer_srgb) {
             log_error("The OpenGL drivers dont support GL_FRAMEBUFFER_SRGB this will cause a small rendering performance penalty");
@@ -2552,6 +2682,7 @@ create_os_window(PyObject UNUSED *self, PyObject *args, PyObject *kw) {
     bind_shader_globals_to_current_context();
     OSWindow *w = add_os_window();
     w->handle = glfw_window;
+    w->gpu_surface = gpu_surface;
     w->disallow_title_changes = disallow_override_title;
     // A fixed title is never synced from the active window, so store it here
     if (disallow_override_title) w->window_title = Py_NewRef(title);
@@ -2688,6 +2819,9 @@ destroy_os_window(OSWindow *w) {
         // Ensure mouse cursor is visible and reset to default shape, needed on macOS
         show_mouse_cursor(w->handle);
         glfwSetCursor(w->handle, NULL);
+        // The GPU surface must be destroyed before the native window it renders into
+        if (w->gpu_surface) gpu_surface_destroy(w->gpu_surface);
+        w->gpu_surface = GPU_NULL_HANDLE;
         glfwDestroyWindow(w->handle);
     }
     w->handle = NULL;
@@ -2791,56 +2925,121 @@ dbus_monitor_session_state(PyObject *self UNUSED, PyObject *callback) {
 }
 #endif
 
+// Parse a sequence of (name, path, software) tuples of GPU drivers into candidates
+static bool
+set_gpu_drivers(PyObject *gpu_drivers, bool debug_rendering) {
+    RAII_PyObject(seq, PySequence_Fast(gpu_drivers, "gpu_drivers must be a sequence of (name, path, software) tuples"));
+    if (!seq) return false;
+    const Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+    RAII_ALLOC(GPUDriverCandidate, items, calloc(MAX(1, n), sizeof(GPUDriverCandidate)));
+    if (!items) {
+        PyErr_NoMemory();
+        return false;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        int software = 0;
+        if (!PyArg_ParseTuple(PySequence_Fast_GET_ITEM(seq, i), "ssp", &items[i].name, &items[i].path, &software)) return false;
+        items[i].software = software != 0;
+    }
+    if (!set_gpu_driver_candidates(items, (size_t)n, debug_rendering)) {
+        PyErr_NoMemory();
+        return false;
+    }
+    return true;
+}
+
 static PyObject *
 glfw_init(PyObject UNUSED *self, PyObject *args) {
     const char *path;
     int debug_keyboard = 0, debug_rendering = 0, wayland_enable_ime = 0;
-    PyObject *edge_sf;
-    if (!PyArg_ParseTuple(args, "sO|ppp", &path, &edge_sf, &debug_keyboard, &debug_rendering, &wayland_enable_ime)) return NULL;
+    PyObject *edge_sf, *gpu_drivers;
+    if (!PyArg_ParseTuple(args, "sOO|ppp", &path, &gpu_drivers, &edge_sf, &debug_keyboard, &debug_rendering, &wayland_enable_ime)) return NULL;
     if (!PyCallable_Check(edge_sf)) {
         PyErr_SetString(PyExc_TypeError, "edge_spacing_func must be a callable");
         return NULL;
     }
+    if (!set_gpu_drivers(gpu_drivers, debug_rendering != 0)) return NULL;
     Py_CLEAR(edge_spacing_func);
 #ifdef __APPLE__
     cocoa_set_uncaught_exception_handler();
 #endif
-    const char *err = load_glfw(path);
+    // Loading and initializing glfw is slow, particularly on macOS, where it
+    // is mostly spent waiting for the window server, so release the GIL to
+    // allow other Python threads to run, see init_glfw() in main.py. Nothing
+    // here must use Python, until the GIL is re-acquired.
+    const char *err;
+    bool ok = false, supports_window_occlusion = false;
+    Py_BEGIN_ALLOW_THREADS;
+    err = load_glfw(path);
+    if (!err) {
+        glfw_is_loaded = true;
+        push_modifier_remap_to_glfw();
+        glfwSetErrorCallback(error_callback);
+        glfwInitHint(GLFW_DEBUG_KEYBOARD, debug_keyboard);
+        glfwInitHint(GLFW_DEBUG_RENDERING, debug_rendering);
+        OPT(debug_keyboard) = debug_keyboard != 0;
+        glfwInitHint(GLFW_WAYLAND_IME, wayland_enable_ime != 0);
+#ifdef __APPLE__
+        glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, 0);
+        glfwInitHint(GLFW_COCOA_MENUBAR, 0);
+#endif
+        ok = glfwInit(monotonic_start_time, &supports_window_occlusion);
+    }
+    Py_END_ALLOW_THREADS;
     if (err) {
         PyErr_SetString(PyExc_RuntimeError, err);
         return NULL;
     }
-    glfw_is_loaded = true;
-    push_modifier_remap_to_glfw();
-    glfwSetErrorCallback(error_callback);
-    glfwInitHint(GLFW_DEBUG_KEYBOARD, debug_keyboard);
-    glfwInitHint(GLFW_DEBUG_RENDERING, debug_rendering);
-    OPT(debug_keyboard) = debug_keyboard != 0;
-    glfwInitHint(GLFW_WAYLAND_IME, wayland_enable_ime != 0);
-#ifdef __APPLE__
-    glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, 0);
-    glfwInitHint(GLFW_COCOA_MENUBAR, 0);
-#else
-    if (glfwDBusSetUserNotificationHandler) { glfwDBusSetUserNotificationHandler(dbus_user_notification_activated); }
-#endif
-    bool supports_window_occlusion = false;
-    bool ok = glfwInit(monotonic_start_time, &supports_window_occlusion);
     if (ok) {
 #ifdef __APPLE__
         glfwSetCocoaURLOpenCallback(apple_url_open_callback);
 #else
         glfwSetDrawTextFunction(draw_text_callback);
+        // Set only now as it calls Python
+        if (glfwDBusSetUserNotificationHandler) { glfwDBusSetUserNotificationHandler(dbus_user_notification_activated); }
 #endif
         get_window_dpi(NULL, &global_state.default_dpi.x, &global_state.default_dpi.y);
         edge_spacing_func = edge_sf;
         Py_INCREF(edge_spacing_func);
+        // The GPU driver needs the connection to the windowing system to
+        // check that it can render to windows, see connect() in gpu/api.h.
+        // global_state.is_wayland is not yet set, so use the loaded glfw
+        // module, which exports only the functions of its own platform.
+#ifdef __APPLE__
+        const GPUNativeWindow display = {.platform = GPU_PLATFORM_COCOA};
+#else
+        void *wl_display = glfwGetWaylandDisplay ? glfwGetWaylandDisplay() : NULL;
+        // On X11, render frames need the Present extension, see glfwX11RequestFrameEvent()
+        if (!wl_display && glfwX11SupportsFrameEvents && glfwX11SupportsFrameEvents()) global_state.has_render_frames = true;
+        const GPUNativeWindow display = wl_display ? (GPUNativeWindow){.platform = GPU_PLATFORM_WAYLAND, .display = wl_display}
+                                                   : (GPUNativeWindow){.platform = GPU_PLATFORM_X11, .display = glfwGetX11Display(), .screen = -1};
+#endif
+        // On Wayland, load the driver in a thread, as it is slow, it is waited
+        // for when the first window is created, see wait_for_gpu_driver().
+        // libwayland supports using the connection from multiple threads, X11
+        // connections are not thread safe unless XInitThreads() is called.
+        if (display.platform == GPU_PLATFORM_WAYLAND) err = load_next_gpu_driver_async(&display);
+        else {
+            Py_BEGIN_ALLOW_THREADS;
+            err = load_next_gpu_driver(&display);
+            Py_END_ALLOW_THREADS;
+        }
+        if (err) {
+            PyErr_Format(PyExc_RuntimeError, "Failed to load a GPU driver:\n%s", err);
+            return NULL;
+        }
     }
     return Py_BuildValue("OO", ok ? Py_True : Py_False, supports_window_occlusion ? Py_True : Py_False);
 }
 
 static PyObject *
 glfw_terminate(PYNOARG) {
+    // The GPU driver may still be loading, it uses the connection to the
+    // windowing system, which is closed below. Failures are irrelevant here.
+    wait_for_gpu_driver();
     cleanup_shader_resources_on_terminate();
+    // Must be done before glfwTerminate() closes the connection to the windowing system
+    if (gpu_driver.driver) gpu_release_native_resources();
     for (size_t i = 0; i < arraysz(cursors); i++) {
         if (cursors[i].is_custom && cursors[i].glfw) {
             glfwDestroyCursor(cursors[i].glfw);
@@ -3318,8 +3517,11 @@ is_mouse_hidden(OSWindow *w) {
 void
 swap_window_buffers(OSWindow *os_window) {
     if (glfwAreSwapsAllowed(os_window->handle)) {
-        glfwSwapBuffers(os_window->handle);
+        if (!gpu_surface_present(os_window->gpu_surface))
+            log_error("Failed to present the GPU surface of OS Window: %llu with error: %s", os_window->id, gpu_last_error());
+        glfwWindowContentsPresented(os_window->handle);
         os_window->keep_rendering_till_swap = 0;
+        startup_timing_frame_presented();
     }
 }
 
@@ -3581,6 +3783,20 @@ set_custom_cursor(PyObject *self UNUSED, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static void
+render_frame_received(OSWindow *w) {
+    w->render_state = RENDER_FRAME_READY;
+    w->last_render_frame_received_at = monotonic();
+    w->render_frame_stall_reported = false;
+    // Frames are often requested after every render, so only wake up the main
+    // loop if something is waiting for this frame, otherwise animations would
+    // be sampled at the monitor refresh rate.
+    if (w->tick_on_render_frame) {
+        w->tick_on_render_frame = false;
+        request_tick_callback();
+    }
+}
+
 #ifdef __APPLE__
 void
 get_cocoa_key_equivalent(uint32_t key, int mods, char *cocoa_key, size_t key_sz, int *cocoa_mods) {
@@ -3603,9 +3819,7 @@ static void
 cocoa_frame_request_callback(GLFWwindow *window) {
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
         if (global_state.os_windows[i].handle == window) {
-            global_state.os_windows[i].render_state = RENDER_FRAME_READY;
-            global_state.os_windows[i].last_render_frame_received_at = monotonic();
-            request_tick_callback();
+            render_frame_received(global_state.os_windows + i);
             break;
         }
     }
@@ -3614,6 +3828,10 @@ cocoa_frame_request_callback(GLFWwindow *window) {
 void
 request_frame_render(OSWindow *w) {
     glfwCocoaRequestRenderFrame(w->handle, cocoa_frame_request_callback);
+    // Track the oldest unanswered request, so that a display link that has
+    // stopped delivering frames is detected even though frames are
+    // re-requested after every render, see is_render_deferred_by_frame_pacing()
+    if (w->render_state != RENDER_FRAME_REQUESTED) w->render_frame_requested_at = monotonic();
     w->render_state = RENDER_FRAME_REQUESTED;
 }
 
@@ -3631,12 +3849,10 @@ py_clear_global_shortcuts(PyObject *self UNUSED, PyObject *args UNUSED) {
 #else
 
 static void
-wayland_frame_request_callback(id_type os_window_id) {
+frame_request_callback(id_type os_window_id) {
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
         if (global_state.os_windows[i].id == os_window_id) {
-            global_state.os_windows[i].render_state = RENDER_FRAME_READY;
-            global_state.os_windows[i].last_render_frame_received_at = monotonic();
-            request_tick_callback();
+            render_frame_received(global_state.os_windows + i);
             break;
         }
     }
@@ -3644,12 +3860,32 @@ wayland_frame_request_callback(id_type os_window_id) {
 
 void
 request_frame_render(OSWindow *w) {
-    // Some Wayland compositors are too fragile to handle multiple
-    // render frame requests, see https://github.com/kovidgoyal/kitty/issues/2329
-    if (w->render_state != RENDER_FRAME_REQUESTED) {
+    if (global_state.is_wayland) {
+        // Some Wayland compositors are too fragile to handle multiple
+        // render frame requests, see https://github.com/kovidgoyal/kitty/issues/2329
+        if (w->render_state != RENDER_FRAME_REQUESTED) {
+            w->render_state = RENDER_FRAME_REQUESTED;
+            w->render_frame_requested_at = monotonic();
+            glfwRequestWaylandFrameEvent(w->handle, w->id, frame_request_callback);
+        }
+    } else {
+        // On X11 a frame is the next vertical blank of the monitor the window
+        // is on, as reported by the Present extension. A request supersedes
+        // any previous pending request.
         w->render_state = RENDER_FRAME_REQUESTED;
-        glfwRequestWaylandFrameEvent(w->handle, w->id, wayland_frame_request_callback);
+        w->render_frame_requested_at = monotonic();
+        if (!glfwX11RequestFrameEvent || !glfwX11RequestFrameEvent(w->handle, w->id, frame_request_callback)) {
+            // Never block rendering on a frame that will not arrive
+            w->render_state = RENDER_FRAME_READY;
+        }
     }
+}
+
+monotonic_t
+os_window_frame_period(OSWindow *w) {
+    const monotonic_t ans = glfwX11GetFramePeriod && !global_state.is_wayland ? glfwX11GetFramePeriod(w->handle) : 0;
+    // Assume 60Hz if unknown
+    return ans > 0 ? ans : 16667 * MONOTONIC_T_1e3;
 }
 
 void
@@ -4417,7 +4653,6 @@ init_glfw(PyObject *m) {
 
     // --- Error codes -------------------------------------------------------------
     ADDC(GLFW_NOT_INITIALIZED);
-    ADDC(GLFW_NO_CURRENT_CONTEXT);
     ADDC(GLFW_INVALID_ENUM);
     ADDC(GLFW_INVALID_VALUE);
     ADDC(GLFW_OUT_OF_MEMORY);
@@ -4436,46 +4671,7 @@ init_glfw(PyObject *m) {
     ADDC(GLFW_FLOATING);
 
     // ---
-    ADDC(GLFW_RED_BITS);
-    ADDC(GLFW_GREEN_BITS);
-    ADDC(GLFW_BLUE_BITS);
-    ADDC(GLFW_ALPHA_BITS);
-    ADDC(GLFW_DEPTH_BITS);
-    ADDC(GLFW_STENCIL_BITS);
-    ADDC(GLFW_ACCUM_RED_BITS);
-    ADDC(GLFW_ACCUM_GREEN_BITS);
-    ADDC(GLFW_ACCUM_BLUE_BITS);
-    ADDC(GLFW_ACCUM_ALPHA_BITS);
-    ADDC(GLFW_AUX_BUFFERS);
-    ADDC(GLFW_STEREO);
-    ADDC(GLFW_SAMPLES);
-    ADDC(GLFW_SRGB_CAPABLE);
     ADDC(GLFW_REFRESH_RATE);
-    ADDC(GLFW_DOUBLEBUFFER);
-
-    // ---
-    ADDC(GLFW_CLIENT_API);
-    ADDC(GLFW_CONTEXT_VERSION_MAJOR);
-    ADDC(GLFW_CONTEXT_VERSION_MINOR);
-    ADDC(GLFW_CONTEXT_REVISION);
-    ADDC(GLFW_CONTEXT_ROBUSTNESS);
-    ADDC(GLFW_OPENGL_FORWARD_COMPAT);
-    ADDC(GLFW_CONTEXT_DEBUG);
-    ADDC(GLFW_OPENGL_PROFILE);
-
-    // ---
-    ADDC(GLFW_OPENGL_API);
-    ADDC(GLFW_OPENGL_ES_API);
-
-    // ---
-    ADDC(GLFW_NO_ROBUSTNESS);
-    ADDC(GLFW_NO_RESET_NOTIFICATION);
-    ADDC(GLFW_LOSE_CONTEXT_ON_RESET);
-
-    // ---
-    ADDC(GLFW_OPENGL_ANY_PROFILE);
-    ADDC(GLFW_OPENGL_CORE_PROFILE);
-    ADDC(GLFW_OPENGL_COMPAT_PROFILE);
 
     // ---
     ADDC(GLFW_CURSOR);

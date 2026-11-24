@@ -20,22 +20,29 @@ update_cursor_trail_target(CursorTrail *ct, Window *w, ndc_coords g) {
         case CURSOR_BLOCK:
         case CURSOR_HOLLOW:
         case CURSOR_BEAM:
-        case CURSOR_UNDERLINE: left = g.xstart + WD.screen->cursor_render_info.x * g.dx; bottom = g.ystart - (WD.screen->cursor_render_info.y + 1) * g.dy;
+        case CURSOR_UNDERLINE: {
+            const CursorRenderInfo *cri = &WD.screen->cursor_render_info;
+            // The shape the cursor is drawn with, as in cell_update_uniform_block(), decides its column on a right-to-left cell
+            const CursorShape drawn_shape = (cri->is_focused || OPT(cursor_shape_unfocused) == NO_CURSOR_SHAPE) ? cri->shape : OPT(cursor_shape_unfocused);
+            left = g.xstart + screen_cursor_drawn_x(WD.screen, cri->x, cri->y, drawn_shape) * g.dx;
+            bottom = g.ystart + (cri->y + 1) * g.dy;
+            break;
+        }
         default: break;
     }
     switch (WD.screen->cursor_render_info.shape) {
         case CURSOR_BLOCK:
         case CURSOR_HOLLOW:
             right = left + g.dx;
-            top = bottom + g.dy;
+            top = bottom - g.dy;
             break;
         case CURSOR_BEAM:
             right = left + g.dx / WD.screen->cell_size.width * OPT(cursor_beam_thickness);
-            top = bottom + g.dy;
+            top = bottom - g.dy;
             break;
         case CURSOR_UNDERLINE:
             right = left + g.dx;
-            top = bottom + g.dy / WD.screen->cell_size.height * OPT(cursor_underline_thickness);
+            top = bottom - g.dy / WD.screen->cell_size.height * OPT(cursor_underline_thickness);
             break;
         default: break;
     }

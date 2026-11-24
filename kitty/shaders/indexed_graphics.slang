@@ -9,10 +9,22 @@
 
 import blit_common;
 import background;
+import utils;
 
 // False for the variant used when the image is drawn at its natural size,
 // which needs only a single pixel read per fragment.
 extern static const bool is_scaled = true;
+
+// The uniform parameters of the program, shared by all its stages. See
+// PUSH_CONSTANTS_MAX_SIZE in slang.py for why they are declared this way.
+struct Params {
+    float4 src_rect;
+    float4 dest_rect;
+    uint has_alpha;
+    float extra_alpha;
+};
+[[vk::push_constant]]
+ConstantBuffer<Params> uniforms;
 
 struct VSOutput {
     float2 texcoord : TEXCOORD;
@@ -21,41 +33,42 @@ struct VSOutput {
 
 [shader("vertex")]
 VSOutput
-vertex_main(uint vertex_id: SV_VertexID, uniform float4 src_rect, uniform float4 dest_rect, ) {
-    BlitOutput ans = get_coords_for_blit(vertex_id, src_rect, dest_rect);
+vertex_main(uint vertex_id: SV_VertexID) {
+    BlitOutput ans = get_coords_for_blit(vertex_id, uniforms.src_rect, uniforms.dest_rect);
     return { ans.texcoord, float4(ans.position[0], ans.position[1], 0.0, 1.0) };
 }
 
 // The red channel is the palette index and, when has_alpha is non-zero, the
 // green channel is the straight alpha.
-uniform Sampler2D<uint4> image;
+[[vk::binding(1)]]
+uniform Sampler2D<uint2> image; // a two channel RG8UI texture // binding slots: see SHADER_BINDING_SLOTS in slang.py
 
 float4
 premult_color_at(int2 pos, uint has_alpha) {
-    uint4 px = image[pos];
+    uint2 px = texel_fetch(image, pos);
     float alpha = has_alpha != 0 ? float(px.g) / 255.0 : 1.0;
     return float4(indexed_image_color(px.r) * alpha, alpha);
 }
 
 [shader("fragment")]
 float4
-fragment_main(float2 texcoord: TEXCOORD, uniform uint has_alpha, uniform float extra_alpha)
+fragment_main(float2 texcoord: TEXCOORD)
     : SV_Target {
     // Integer textures cannot be filtered and anyway the palette lookup must
     // happen before interpolation, so do bilinear filtering here.
-    int width, height;
-    image.GetDimensions(width, height);
-    const int2 limit = int2(width - 1, height - 1);
+    const int2 size = texture_size(image);
+    const int width = size.x, height = size.y;
+    const int2 limit = size - 1;
     // When the image is drawn at its natural size every fragment is at the
     // center of a pixel, so just read that pixel. is_scaled is a compile time
     // constant so this is not a branch in the shader.
-    if (!is_scaled) return premult_color_at(clamp(int2(texcoord * float2(width, height)), int2(0, 0), limit), has_alpha) * extra_alpha;
+    if (!is_scaled) return premult_color_at(clamp(int2(texcoord * float2(width, height)), int2(0, 0), limit), uniforms.has_alpha) * uniforms.extra_alpha;
     const float2 pos = texcoord * float2(width, height) - 0.5;
     const float2 base = floor(pos);
     const float2 frac = pos - base;
     const int2 p0 = clamp(int2(base), int2(0, 0), limit);
     const int2 p1 = clamp(int2(base) + int2(1, 1), int2(0, 0), limit);
-    const float4 top = lerp(premult_color_at(p0, has_alpha), premult_color_at(int2(p1.x, p0.y), has_alpha), frac.x);
-    const float4 bottom = lerp(premult_color_at(int2(p0.x, p1.y), has_alpha), premult_color_at(p1, has_alpha), frac.x);
-    return lerp(top, bottom, frac.y) * extra_alpha;
+    const float4 top = lerp(premult_color_at(p0, uniforms.has_alpha), premult_color_at(int2(p1.x, p0.y), uniforms.has_alpha), frac.x);
+    const float4 bottom = lerp(premult_color_at(int2(p0.x, p1.y), uniforms.has_alpha), premult_color_at(p1, uniforms.has_alpha), frac.x);
+    return lerp(top, bottom, frac.y) * uniforms.extra_alpha;
 }

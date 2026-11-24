@@ -555,6 +555,8 @@ def test_compile(
     ldflags: Iterable[str] = (),
     get_output_arch: bool = False,
 ) -> Union[bool, BinaryArch]:
+    if not cc:
+        raise SystemExit('test_compile() called with no C compiler, the build environment has not been initialized')
     src = src or 'int main(void) { return 0; }'
     with tempfile.TemporaryDirectory(prefix='kitty-test-compile-') as tdir:
         with open(os.path.join(tdir, f'source.{source_ext}'), 'w', encoding='utf-8') as srcf:
@@ -693,7 +695,7 @@ def init_env(
                 raise SystemExit(f'Cannot have quotes in library paths: {val}')
             library_paths.setdefault(which, []).append(f'{name}="{val}"')
 
-    add_lpath('glfw/egl_context.c', '_GLFW_EGL_LIBRARY', egl_library)
+    add_lpath('gpu/opengl/egl.c', '_GLFW_EGL_LIBRARY', egl_library)
     add_lpath('kitty/desktop.c', '_KITTY_STARTUP_NOTIFICATION_LIBRARY', startup_notification_library)
     add_lpath('kitty/desktop.c', '_KITTY_CANBERRA_LIBRARY', canberra_library)
     add_lpath('kitty/systemd.c', '_KITTY_SYSTEMD_LIBRARY', systemd_library)
@@ -768,6 +770,7 @@ def kitty_env(args: Options) -> Env:
 
     xxhash = xxhash_flags()
     at_least_version('harfbuzz', 1, 5)
+    at_least_version('fribidi', 1)
     cflags.extend(pkg_config('libpng', '--cflags-only-I'))
     cflags.extend(pkg_config('lcms2', '--cflags-only-I'))
     cflags.extend(xxhash[0])
@@ -806,13 +809,16 @@ def kitty_env(args: Options) -> Env:
         cflags.extend(pkg_config('cairo-fc', '--cflags-only-I'))
         platform_libs = []
         platform_libs.extend(pkg_config('cairo-fc', '--libs'))
+        cflags.extend(pkg_config('libbrotlidec', '--cflags-only-I'))
+        platform_libs.extend(pkg_config('libbrotlidec', '--libs'))
     cflags.extend(pkg_config('harfbuzz', '--cflags-only-I'))
     platform_libs.extend(pkg_config('harfbuzz', '--libs'))
+    cflags.extend(pkg_config('fribidi', '--cflags-only-I'))
+    platform_libs.extend(pkg_config('fribidi', '--libs'))
     pylib = get_python_flags(args, cflags)
-    gl_libs = ['-framework', 'OpenGL'] if is_macos else pkg_config('gl', '--libs')
     libpng = pkg_config('libpng', '--libs')
     lcms2 = pkg_config('lcms2', '--libs')
-    ans.ldpaths += pylib + platform_libs + gl_libs + libpng + lcms2 + libcrypto_ldflags + xxhash[1]
+    ans.ldpaths += pylib + platform_libs + libpng + lcms2 + libcrypto_ldflags + xxhash[1]
     if is_macos:
         ans.ldpaths.extend('-framework Cocoa'.split())
     elif not is_openbsd:
@@ -978,7 +984,7 @@ def get_source_specific_cflags(env: Env, src: str) -> List[str]:
     elif src == 'kitty/simd-string-512.c':
         # uses native AVX-512 intrinsics, only compiled on x86-64, selected at runtime only when the CPU supports these features
         if env.binary_arch.isa is ISA.AMD64:
-            ans.extend(('-mavx512f', '-mavx512bw', '-mavx512vl', '-mavx512vbmi2'))
+            ans.extend(('-mavx512f', '-mavx512bw', '-mavx512vl'))
             # We have manual vzeroupper so prevent compiler from emitting it causing duplicates
             if env.compiler_type is CompilerType.clang:
                 ans.append('-mllvm')
@@ -1189,6 +1195,7 @@ def find_c_files() -> Tuple[List[str], List[str]]:
             ans.append(os.path.join('kitty', x))
         elif ext == '.h':
             headers.append(os.path.join('kitty', x))
+    headers.extend(gpu_api_headers())
     ans.append('kitty/vt-parser-dump.c')
 
     # ringbuf
@@ -1247,7 +1254,7 @@ def glfw_init_env(
 
     elif module == 'cocoa':
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
-        for f_ in 'Cocoa IOKit CoreFoundation CoreVideo UniformTypeIdentifiers'.split():
+        for f_ in 'Cocoa IOKit CoreFoundation QuartzCore UniformTypeIdentifiers'.split():
             ans.ldpaths.extend(('-framework', f_))
 
     elif module == 'wayland':
@@ -1300,6 +1307,119 @@ def build_wayland_protocols(
                 items.append(Command(f'Generating {emphasis(os.path.basename(dest))} ...', [env.wayland_scanner, q, src, dest], lambda: True))
     if items:
         parallel_run(items)
+
+
+def gpu_api_headers() -> List[str]:
+    return ['gpu/api.h', 'gpu/opengl/version.h', 'gpu/vulkan/version.h', 'gpu/metal/version.h']
+
+
+@lru_cache(maxsize=2)
+def vulkan_headers_available() -> bool:
+    # The Vulkan driver needs only the Vulkan headers to build, libvulkan is loaded at runtime
+    cflags = env.cflags + pkg_config('x11', '--cflags-only-I', fatal=False)
+    src = '\n'.join(
+        (
+            '#define VK_NO_PROTOTYPES',
+            '#define VK_USE_PLATFORM_XLIB_KHR',
+            '#define VK_USE_PLATFORM_WAYLAND_KHR',
+            '#include <vulkan/vulkan.h>',
+            'int main(void) { return VK_API_VERSION_1_3 ? 0 : 1; }',
+        )
+    )
+    return bool(test_compile(env.cc, *cflags, src=src, link_also=False))
+
+
+def gpu_drivers_to_build() -> List[str]:
+    # The GPU drivers built for this platform. OpenGL is built on all
+    # platforms, Metal on macOS and Vulkan on other platforms, when its headers
+    # are available.
+    ans = ['opengl']
+    if is_macos:
+        ans.insert(0, 'metal')
+    else:
+        if vulkan_headers_available():
+            ans.insert(0, 'vulkan')
+        else:
+            print(error('The Vulkan headers were not found, the Vulkan GPU driver will not be built'), file=sys.stderr)
+    return ans
+
+
+def gpu_shader_targets_to_build() -> List[str]:
+    # The shader targets the built-in shaders are compiled for, those of the GPU drivers being built
+    return [t for driver in gpu_drivers_to_build() for t in gpu_driver_shader_targets(driver)]
+
+
+def gpu_driver_init_env(env: Env, driver: str = 'opengl') -> Env:
+    ans = env.copy()
+    ans.cflags.append('-fPIC')
+    if driver == 'opengl':
+        if is_macos:
+            # Apple deprecated OpenGL in Mojave (10.14) silence the endless
+            # warnings about it
+            ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
+            for f_ in ('OpenGL', 'Cocoa'):
+                ans.ldpaths.extend(('-framework', f_))
+        else:
+            # The X11 headers are needed for GLX. All libraries, libGL, libEGL,
+            # libX11, etc. are loaded at runtime, so as to work on both X11
+            # and Wayland without any link time dependencies.
+            for dep in ('x11', 'xrender'):
+                ans.cflags.extend(pkg_config(dep, '--cflags-only-I'))
+            ans.ldpaths.append('-ldl')
+    elif driver == 'vulkan':
+        # The X11 headers are needed for the Xlib surface functions. libvulkan
+        # and libX11 are loaded at runtime.
+        ans.cflags.extend(pkg_config('x11', '--cflags-only-I'))
+        ans.ldpaths.append('-ldl')
+    elif driver == 'metal':
+        for f_ in ('Metal', 'QuartzCore', 'CoreGraphics', 'Cocoa'):
+            ans.ldpaths.extend(('-framework', f_))
+    return ans
+
+
+def gpu_driver_shader_targets(driver: str = 'opengl') -> List[str]:
+    # The shader targets consumed by a GPU driver, the built-in shaders are
+    # compiled for these. Must match what the driver returns from its
+    # shader_target() function.
+    if driver == 'opengl':
+        with open('gpu/opengl/version.h') as f:
+            m = re.search(r'^#define GLSL_VERSION (\d+)', f.read(), flags=re.MULTILINE)
+        if m is None:
+            raise SystemExit('Could not find GLSL_VERSION in gpu/opengl/version.h')
+        return [f'glsl-{m.group(1)}']
+    if driver == 'vulkan':
+        with open('gpu/vulkan/version.h') as f:
+            m = re.search(r'^#define SPIRV_VERSION (\d+)', f.read(), flags=re.MULTILINE)
+        if m is None:
+            raise SystemExit('Could not find SPIRV_VERSION in gpu/vulkan/version.h')
+        return [f'spirv-{m.group(1)}']
+    if driver == 'metal':
+        with open('gpu/metal/version.h') as f:
+            m = re.search(r'^#define MSL_VERSION (\d+)', f.read(), flags=re.MULTILINE)
+        if m is None:
+            raise SystemExit('Could not find MSL_VERSION in gpu/metal/version.h')
+        return [f'msl-{m.group(1)}']
+    raise KeyError(f'Unknown GPU driver: {driver}')
+
+
+def gpu_driver_sources(driver: str) -> List[str]:
+    if driver == 'opengl':
+        common = ['driver.c', 'gl-wrapper.c']
+        platform = ['nsgl.m'] if is_macos else ['egl.c', 'glx.c']
+        return [f'gpu/{driver}/{x}' for x in common + platform]
+    if driver == 'vulkan':
+        return [f'gpu/{driver}/{x}' for x in ('driver.c', 'memory.c', 'commands.c', 'textures.c', 'pipelines.c', 'surfaces.c')]
+    if driver == 'metal':
+        return [f'gpu/{driver}/{x}' for x in ('driver.m', 'commands.m', 'buffers.m', 'textures.m', 'pipelines.m', 'surfaces.m')]
+    raise KeyError(f'Unknown GPU driver: {driver}')
+
+
+def compile_gpu_drivers(compilation_database: CompilationDatabase, build_dsym: bool = False) -> None:
+    for driver in gpu_drivers_to_build():
+        denv = gpu_driver_init_env(env, driver)
+        sources = gpu_driver_sources(driver)
+        headers = sorted(set(glob.glob(f'gpu/{driver}/*.h') + gpu_api_headers()))
+        compile_c_extension(denv, f'kitty/{driver}', compilation_database, sources, headers, desc_prefix=f'[{driver}] ', build_dsym=build_dsym)
 
 
 def compile_glfw(compilation_database: CompilationDatabase, build_dsym: bool = False) -> None:
@@ -1451,6 +1571,7 @@ def generate_shaders(kitty_exe: str) -> None:
             '+launch',
             os.path.join(src_base, 'kitty/shaders/slang.py'),
             'verbose' if verbose else '',
+            '--targets=' + ','.join(gpu_shader_targets_to_build()),
             'build/shaders',
             'shaders',
         ],
@@ -1478,6 +1599,7 @@ def build(args: Options, native_optimizations: bool = True, call_init: bool = Tr
         build_dsym=args.build_dsym,
     )
     compile_glfw(args.compilation_database, args.build_dsym)
+    compile_gpu_drivers(args.compilation_database, args.build_dsym)
     compile_kittens(args)
     add_builtin_fonts(args)
 
@@ -1513,6 +1635,15 @@ def parse_go_version(x: str) -> Tuple[int, int, int]:
     while len(ans) < 3:
         ans.append(0)
     return ans[0], ans[1], ans[2]
+
+
+def go_experiments_env(env: dict[str, str]) -> dict[str, str]:
+    # The simd experiment is needed for the simd package used by tools/simdstring
+    experiments = [x for x in env.get('GOEXPERIMENT', '').split(',') if x]
+    if 'simd' not in experiments and 'nosimd' not in experiments:
+        experiments.append('simd')
+    env['GOEXPERIMENT'] = ','.join(experiments)
+    return env
 
 
 @lru_cache(2)
@@ -1580,7 +1711,7 @@ def build_static_kittens(
         c = cmd + ['-o', dest, src]
         if args.verbose:
             print(shlex.join(c))
-        e = os.environ.copy()
+        e = go_experiments_env(os.environ.copy())
         # https://github.com/kovidgoyal/kitty/issues/6051#issuecomment-1441369828
         e.pop('PWD', None)
         if for_platform:
@@ -2014,7 +2145,7 @@ def macos_info_plist(for_quake: str = '') -> bytes:
         NSHumanReadableCopyright=time.strftime('Copyright %Y, Kovid Goyal'),
         CFBundleGetInfoString='kitty - The fast, feature-rich, GPU based terminal emulator. https://sw.kovidgoyal.net/kitty/',
         # Operating System Version
-        LSMinimumSystemVersion='12.0.0',
+        LSMinimumSystemVersion='14.0.0',
         # Categorization
         CFBundlePackageType='APPL',
         CFBundleSignature='????',
@@ -2563,6 +2694,8 @@ def do_build(args: Options) -> None:
             bundle_type = ('macos' if is_macos else 'linux') + '-freeze'
             build_launcher(args, launcher_dir=os.path.join(args.prefix, 'bin'), bundle_type=bundle_type)
         elif args.action == 'build-frozen-tools':
+            # The env is needed to detect which GPU drivers, and hence shader targets, to build
+            init_env_from_args(args, False)
             build_static_kittens(args, launcher_dir=args.prefix, for_freeze=True)
         elif args.action == 'linux-package':
             build(args, native_optimizations=False)

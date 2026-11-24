@@ -214,6 +214,251 @@ class Selection(BaseTest):
             d = dict(descriptors[0], path=os.path.join(tdir, 'missing.ttf'))
             self.ae(CTFace(descriptor=d).postscript_name(), descriptors[0]['postscript_name'])
 
+    def test_font_selection_api(self):
+        # Font selection is done in C, optionally in a thread, see font-select.c
+        from kitty.fast_data_types import finish_font_selection
+        from kitty.fonts.common import finish_font_files_selection, start_font_files_selection
+
+        def key(d):
+            return tuple((k, d.get(k)) for k in ('path', 'index', 'named_style', 'axes', 'axis_map', 'matrix', 'postscript_name'))
+
+        def keys(ff):
+            return tuple(key(ff[x]) for x in ('medium', 'bold', 'italic', 'bi'))
+
+        def threaded(opts, symbol_map_families=()):
+            start_font_files_selection(opts, symbol_map_families, threaded=True)
+            return finish_font_files_selection(opts)
+
+        with self.assertRaises(RuntimeError):
+            finish_font_selection()
+        families = sorted({v[0]['family'] for v in all_fonts_map(True)['family_map'].values()})[:6]
+        opts = Options()
+        for family in families + ['NoSuchFontXYZ']:
+            with self.subTest(family=family):
+                opts.font_family = parse_font_spec(f'family="{family}"')
+                expected = keys(get_font_files(opts))
+                self.ae(expected, keys(threaded(opts)[0]))
+                if family.isascii():
+                    # names are matched ignoring case and extra whitespace
+                    opts.font_family = parse_font_spec(f'family="  {family.swapcase().replace(" ", "  ")} "')
+                    self.ae(expected, keys(get_font_files(opts)))
+        # A system font specification
+        opts.font_family = parse_font_spec('monospace')
+        expected = keys(get_font_files(opts))
+        self.ae(expected, keys(threaded(opts)[0]))
+        # Starting a new selection discards a running one
+        other = Options()
+        other.font_family = parse_font_spec('family="NoSuchFontXYZ"')
+        start_font_files_selection(other, threaded=True)
+        self.ae(expected, keys(threaded(opts)[0]))
+        # Fonts for symbol_map
+        symbol_families = ('monospace', families[0]) if is_macos else ('monospace', families[0], 'NoSuchFontXYZ')
+        ff, symbols, nerd_font = threaded(opts, symbol_families)
+        self.assertIsNone(nerd_font)
+        self.ae(expected, keys(ff))
+        self.ae(len(symbols), len(symbol_families))
+        for d, bold, italic in symbols:
+            self.assertTrue(d['path'])
+            self.assertIsInstance(bold, bool)
+            self.assertIsInstance(italic, bool)
+        # features are applied to the selected faces
+        opts.font_family = parse_font_spec(f'family="{families[0]}" features="+zero"')
+        ff = get_font_files(opts)
+        for x in ('medium', 'bold', 'italic', 'bi'):
+            self.ae(ff[x].get('features'), (ParsedFontFeature('+zero'),))
+
+    def test_builtin_nerd_font(self):
+        # The builtin NERD font is prepared by the font selection thread and is
+        # used for symbol_map entries for it and for fallback
+        from kitty.constants import fonts_dir
+        from kitty.fast_data_types import create_test_font_group, set_send_sprite_to_gpu, sprite_map_set_limits
+        from kitty.fonts import render
+
+        path = os.path.join(fonts_dir, 'SymbolsNerdFontMono-Regular.ttf')
+        if not os.path.exists(path):
+            self.skipTest('The builtin NERD font is not present')
+        opts = self.set_options({'symbol_map': {(0xE0B0, 0xE0B0): 'Symbols Nerd Font Mono'}})
+        sprite_map_set_limits(100000, 100)
+        set_send_sprite_to_gpu(lambda *a: None)
+        try:
+            render.set_font_family(opts, add_builtin_nerd_font=True, threaded=True)
+            create_test_font_group(11.0, 96.0, 96.0)  # uses the results of the selection
+            d = render.builtin_nerd_font_descriptor
+            self.assertIsNotNone(d)
+            self.ae(d['path'], path)  # type: ignore
+            self.ae(len(render.current_faces), 5)
+            self.ae(face_from_descriptor(render.current_faces[4][0]).postscript_name(), 'SymbolsNFM')  # type: ignore
+            # The builtin NERD font is used for fallback for NERD font icons,
+            # unless a font installed on the system has them, which is
+            # preferred. Such fonts need not have NERD in their names, for
+            # example, PragmataPro has the NERD font icons.
+            face = get_fallback_font('\U000f0001', False, False)
+            if face.path != path:
+                self.assertNotIn('LastResort', face.postscript_name(), f'Unexpected fallback font for a NERD font icon: {face.path}')
+            else:
+                self.ae(face.postscript_name(), 'SymbolsNFM')
+        finally:
+            set_send_sprite_to_gpu(None)
+
+    def test_variable_data_from_font_file(self):
+        # The pure C reading of variable font data used by font selection must
+        # match the data read via the platform font APIs
+        from kitty.fast_data_types import variable_data_from_font_file
+
+        seen = set()
+        count = 0
+        for descriptors in all_fonts_map(False)['variable_map'].values():
+            for d in descriptors:
+                path = d['path']
+                if path in seen or (is_macos and not path.lower().endswith(('.ttf', '.otf'))):
+                    continue
+                seen.add(path)
+                index = d.get('index', 0) & 0xFFFF  # type: ignore
+                expected = dict(face_from_descriptor(d).get_variable_data())
+                expected.pop('multi_axis_styles', None)  # type: ignore
+                expected['axes'] = tuple({k: v for k, v in ax.items() if k != 'name'} for ax in expected['axes'])  # type: ignore
+                with self.subTest(path=path):
+                    self.ae(expected, variable_data_from_font_file(path, index))
+                count += 1
+        if self.is_ci and not count:
+            raise AssertionError('No variable fonts found')
+
+    def test_variable_data_from_crafted_font(self):
+        import struct
+
+        from kitty.fast_data_types import variable_data_from_font_file
+
+        def name_table(names: dict[int, str]) -> bytes:
+            records, storage = b'', b''
+            for name_id, text in names.items():
+                data = text.encode('utf-16-be')
+                records += struct.pack('>6H', 3, 1, 1033, name_id, len(data), len(storage))
+                storage += data
+            return struct.pack('>3H', 0, len(names), 6 + len(records)) + records + storage
+
+        def fvar_table(axes: list[tuple[bytes, int]], instances: list[tuple[int, list[float], int]]) -> bytes:
+            instance_size = 4 + 4 * len(axes) + 2
+            ans = struct.pack('>8H', 1, 0, 16, 2, len(axes), 20, len(instances), instance_size)
+            for tag, name_id in axes:
+                ans += tag + struct.pack('>3iHH', 0, 0, 1000 << 16, 0, name_id)
+            for name_id, coords, psname_id in instances:
+                ans += struct.pack('>HH', name_id, 0) + b''.join(struct.pack('>i', int(c * 65536)) for c in coords) + struct.pack('>H', psname_id)
+            return ans
+
+        def sfnt(tables: dict[bytes, bytes]) -> bytes:
+            offset = 12 + 16 * len(tables)
+            header, data = struct.pack('>IHHHH', 0x00010000, len(tables), 0, 0, 0), b''
+            for tag, table in tables.items():
+                header += tag + struct.pack('>III', 0, offset + len(data), len(table))
+                data += table + b'\0' * (-len(table) % 4)
+            return header + data
+
+        names = {256: 'Weight', 257: 'Odd', 258: 'Bold', 259: 'Test-Bold', 1: 'Test', 25: 'TestVar'}
+        # An axis tag that is not valid UTF-8 and a duplicated axis tag
+        odd_tag = b'\xff\xfe\x80a'
+        fvar = fvar_table([(b'wght', 256), (odd_tag, 257), (b'wght', 256)], [(258, [700, 1, 800], 259)])
+        with tempfile.TemporaryDirectory() as tdir:
+            path = os.path.join(tdir, 'test.ttf')
+            with open(path, 'wb') as f:
+                f.write(sfnt({b'fvar': fvar, b'name': name_table(names)}))
+            vd = variable_data_from_font_file(path)
+            odd = odd_tag.decode('latin-1')
+            self.ae([a['tag'] for a in vd['axes']], ['wght', odd, 'wght'])
+            self.ae([a['strid'] for a in vd['axes']], ['Weight', 'Odd', 'Weight'])
+            self.ae(vd['variations_postscript_name_prefix'], 'TestVar')
+            self.ae(len(vd['named_styles']), 1)
+            ns = vd['named_styles'][0]
+            self.ae((ns['name'], ns['psname']), ('Bold', 'Test-Bold'))
+            # each tag used once, in order of first occurrence, with the value of the last occurrence
+            self.ae(list(ns['axis_values'].items()), [('wght', 800.0), (odd, 1.0)])
+
+            # A file that is not a valid font is a ValueError, not an OSError with a meaningless errno
+            with open(path, 'wb') as f:
+                f.write(b'\0\1\0\0\0')
+            with self.assertRaises(ValueError):
+                variable_data_from_font_file(path)
+            with self.assertRaises(FileNotFoundError):
+                variable_data_from_font_file(os.path.join(tdir, 'does-not-exist.ttf'))
+
+    def test_variable_data_for_font_collection_faces(self):
+        # Variable data must be cached per face, not per file, as font
+        # collection files contain multiple faces with different variable data.
+        import json
+        import subprocess
+
+        try:
+            from fontTools.fontBuilder import FontBuilder
+            from fontTools.pens.ttGlyphPen import TTGlyphPen
+            from fontTools.ttLib import TTCollection
+        except ImportError:
+            self.skipTest('fontTools is not available')
+        from kitty.constants import kitty_exe
+
+        def build_face(family: str, bold_name: str):
+            fb = FontBuilder(1000, isTTF=True)
+            chars = {ch: f'g{ch}' for ch in range(33, 127)}
+            fb.setupGlyphOrder(['.notdef', 'space'] + list(chars.values()))
+            fb.setupCharacterMap({32: 'space', **chars})
+            pen = TTGlyphPen(None)
+            pen.moveTo((100, 0))
+            pen.lineTo((100, 700))
+            pen.lineTo((500, 700))
+            pen.lineTo((500, 0))
+            pen.closePath()
+            box = pen.glyph()
+            fb.setupGlyf({'.notdef': box, 'space': TTGlyphPen(None).glyph(), **{g: box for g in chars.values()}})
+            fb.setupHorizontalMetrics({g: (600, 100) for g in fb.font.getGlyphOrder()})
+            fb.setupHorizontalHeader(ascent=800, descent=-200)
+            fb.setupNameTable({'familyName': family, 'styleName': 'Regular', 'psName': f'{family}-Regular', 'variationsPostScriptNamePrefix': family})
+            fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, usWinAscent=800, usWinDescent=200, xAvgCharWidth=600)
+            fb.setupPost(isFixedPitch=1)
+            fb.setupFvar(
+                [('wght', 100, 400, 900, 'Weight')],
+                [{'location': {'wght': w}, 'stylename': n, 'postscriptfontname': f'{family}-{n}'} for w, n in ((400, 'Regular'), (700, bold_name))],
+            )
+            return fb.font
+
+        checker = """
+import json, sys
+from kitty.fast_data_types import add_font_file, set_options
+from kitty.fonts.common import FontSpec, all_fonts_map, get_font_files, get_variable_data_for_descriptor
+from kitty.options.types import Options
+# not an assert, as kitty runs python with optimizations, which removes asserts
+if not add_font_file(sys.argv[-1]):
+    raise SystemExit('Failed to add font file')
+set_options(Options())
+opts = Options()
+opts.font_family = FontSpec.from_setting('family=KittyTestCollectionA style=Regular')
+opts.bold_font = FontSpec.from_setting('family=KittyTestCollectionB style=Heavy')
+ff = get_font_files(opts)
+vmap = all_fonts_map(True)['variable_map']
+# fontconfig descriptors identify the named style by index, CoreText ones by axis values
+def style(d):
+    return d.get('axis_map', {}).get('wght') if d['descriptor_type'] == 'core_text' else d.get('named_style')
+print(json.dumps({
+    'medium': [ff['medium'].get('family'), style(ff['medium'])],
+    'bold': [ff['bold'].get('family'), style(ff['bold'])],
+    'named_styles': [
+        [ns['name'] for ns in get_variable_data_for_descriptor(vmap[k][0])['named_styles']]
+        for k in ('kittytestcollectiona', 'kittytestcollectionb')],
+}))
+"""
+        with tempfile.TemporaryDirectory() as tdir:
+            path = os.path.join(tdir, 'collection.ttc')
+            c = TTCollection()
+            c.fonts = [build_face('KittyTestCollectionA', 'Bold'), build_face('KittyTestCollectionB', 'Heavy')]
+            c.save(path)
+            script = os.path.join(tdir, 'checker.py')
+            with open(script, 'w') as f:
+                f.write(checker)
+            # Use a separate process so that the added font does not affect other tests
+            cp = subprocess.run([kitty_exe(), '+launch', script, path], capture_output=True, text=True)
+            self.assertEqual(cp.returncode, 0, cp.stderr)
+            result = json.loads(cp.stdout.strip().splitlines()[-1])
+        self.ae(result['medium'], ['KittyTestCollectionA', 400 if is_macos else 0])
+        self.ae(result['bold'], ['KittyTestCollectionB', 700 if is_macos else 1])
+        self.ae(result['named_styles'], [['Regular', 'Bold'], ['Regular', 'Heavy']])
+
     def test_invalid_font_feature(self):
         with self.assertRaises(ValueError) as cm:
             ParsedFontFeature('!!bad!!')
@@ -354,6 +599,7 @@ class FontBaseTest(BaseTest):
     font_size = 16.0
     dpi = 72.0
     font_name = 'FiraCode-Medium.otf'
+    symbol_map: dict[tuple[int, int], str] = {}
 
     def path_for_font(self, name):
         if name not in self.font_path_cache:
@@ -368,7 +614,8 @@ class FontBaseTest(BaseTest):
         self.tdir = tempfile.mkdtemp()
         self.addCleanup(self.rmtree_ignoring_errors, self.tdir)
         path = self.path_for_font(self.font_name) if self.font_name else ''
-        tc = setup_for_testing(size=self.font_size, dpi=self.dpi, main_face_path=path)
+        symbol_map = {r: self.path_for_font(name) for r, name in self.symbol_map.items()}
+        tc = setup_for_testing(size=self.font_size, dpi=self.dpi, main_face_path=path, symbol_map_paths=symbol_map)
         self.sprites, self.cell_width, self.cell_height = tc.__enter__()
         self.addCleanup(tc.__exit__)
         self.assertEqual([k[0] for k in self.sprites], list(range(11)))
@@ -431,6 +678,100 @@ class Rendering(FontBaseTest):
         line = s.line(0)
         test_render_line(line)
         self.assertEqual(len(self.sprites) - prerendered, len(box_chars))
+
+    def test_render_lines_scrolled_in(self):
+        # lines cleared by scrolling keep stale render data, so they must be
+        # dirty, so that rendering them replaces it
+        s = self.create_screen(cols=5, lines=3, scrollback=0)
+        s.draw('abcde' * s.lines)
+        for y in range(s.lines):
+            test_render_line(s.line(y))
+        self.assertTrue(all(s.line(y).sprite_at(x) for y in range(s.lines) for x in range(s.columns)))
+        for reverse in (False, True):
+            s.reverse_index() if reverse else s.index()
+            y = 0 if reverse else s.lines - 1
+            self.ae(str(s.line(y)), '')
+            self.assertIn(y, s.linebuf.dirty_lines())
+            line = s.line(y)
+            test_render_line(line)
+            self.ae([line.sprite_at(x) for x in range(s.columns)], [0] * s.columns)
+            s.cursor_position(1, 1)
+
+    def test_render_line_with_split_multicell_chars(self):
+        # A horizontally scrolled smooth scroll region can split wide chars,
+        # leaving some of their cells in a line without the others. These
+        # cells keep their sprites and do not shift the other cells of the run.
+        s = self.create_screen(cols=8, lines=1, scrollback=0)
+        s.draw('xy好cdef')
+
+        def sprites():
+            line = s.line(0)
+            test_render_line(line)
+            return [line.sprite_at(x) for x in range(s.columns)]
+
+        before = sprites()
+        self.assertTrue(s.smooth_scroll_define(1, 2, 0, 7, 1, 1, False, True))
+        s.smooth_scroll(1, 1)  # the right half of the wide char is at the left edge of the region
+        after = sprites()
+        self.ae(after[2], before[3])
+        self.ae(after[3:6], before[4:7])
+        self.ae(after[7], before[7])
+        s = self.create_screen(cols=8, lines=1, scrollback=0)
+        s.draw('xy好cdef')
+        before = sprites()
+        self.assertTrue(s.smooth_scroll_define(1, 2, 0, 7, 1, 1, False, True))
+        s.smooth_scroll(1, -40)  # four columns of the default cell width of 10
+        after = sprites()  # the left half of the wide char is at the right edge of the region
+        self.ae(after[6], before[2])
+        self.ae(after[7], before[7])
+        self.ae(after[:2], before[:2])
+        # Chars split before they were ever rendered complete are rendered correctly
+        for delta, split_x, complete_x in ((10, 2, 3), (-40, 6, 2)):
+            s = self.create_screen(cols=8, lines=1, scrollback=0)
+            s.draw('xy好cdef')
+            self.assertTrue(s.smooth_scroll_define(1, 2, 0, 7, 1, 1, False, True))
+            s.smooth_scroll(1, delta)
+            self.ae(sprites()[split_x], before[complete_x])
+        # A char cut off by the end of the line, with its other cells in the
+        # overflow of the region, is rendered like one cut off by the edge of
+        # a region, as the leading part of the complete char, whether or not
+        # the complete char was rendered before
+
+        def char_at_end(ch, shift, scale=1):
+            lines = scale
+            s = self.create_screen(cols=10, lines=lines, scrollback=0)
+            width = 3 if scale == 1 else 1
+            s.cursor.x = 10 - width * scale
+            draw_multicell(s, ch, width=width, scale=scale)
+            if shift:
+                self.assertTrue(s.smooth_scroll_define(1, 0, 0, 10, lines, 1, False, True))
+                s.smooth_scroll(1, -10 * shift)
+            return s
+
+        def sprites_of(s, y=0):
+            line = s.line(y)
+            test_render_line(line)
+            return [line.sprite_at(x) for x in range(s.columns)]
+
+        for ch, shift, scale, cut_first in (
+            ('r', 1, 1, True),
+            ('s', 2, 1, True),
+            ('t', 1, 1, False),
+            ('u', 2, 1, False),
+            ('v', 1, 2, True),
+            ('w', 1, 2, False),
+        ):
+            start = 10 - 3 * (scale == 1) - 2 * (scale == 2)
+            for y in range(scale):
+                if cut_first:
+                    cut = sprites_of(char_at_end(ch, shift, scale), y)
+                complete = sprites_of(char_at_end(ch, 0, scale), y)
+                self.assertTrue(all(complete[start:]), f'{ch=} {y=}')
+                if not cut_first:
+                    cut = sprites_of(char_at_end(ch, shift, scale), y)
+                msg = f'{ch=} {shift=} {scale=} {y=} {cut_first=}'
+                self.ae(cut[start + shift :], complete[start : 10 - shift], msg)
+                self.ae(cut[: start + shift], [0] * (start + shift), msg)
 
     def test_line_thickness_scales_with_font_size(self):
         from kitty.fast_data_types import create_test_font_group, render_box_char
@@ -726,6 +1067,119 @@ class Rendering(FontBaseTest):
         self.ae(groups('i\u0332\u0308', font='LiberationMono-Regular.ttf'), [(1, 2)])
         self.ae(groups('u\u0332 u\u0332\u0301', font='LiberationMono-Regular.ttf'), [(1, 2), (1, 1), (1, 2)])
 
+    def test_rtl_shaping(self):
+        # HarfBuzz shapes runs containing Hebrew as backward (RTL) buffers and
+        # returns their glyphs in visual order, that is, with the glyphs of the
+        # last cell first. Each group must still cover exactly the cells its
+        # glyphs come from.
+        lm = 'LiberationMono-Regular.ttf'
+
+        # explicit shapes the run as right-to-left whatever its text, which gives the groups in logical order
+        def shape(draw, font, explicit=False):
+            main = '' if font else self.path_for_font('FiraCode-Medium.otf')
+            with setup_for_testing(size=self.font_size, dpi=self.dpi, main_face_path=main):
+                s = Screen(None, 4, 64)
+                draw(s)
+                return test_shape(s.line(0), self.path_for_font(font) if font else None, 0, explicit)
+
+        def ss(text, font=lm, explicit=False):
+            return shape(lambda s: s.draw(text), font, explicit)
+
+        def groups(text, font=lm, explicit=False):
+            return [g[:2] for g in ss(text, font, explicit)]
+
+        def check_units(units, font=lm, rtl=True, explicit=False):
+            # every unit is a single cell whose glyphs, shaped on its own,
+            # must be the glyphs of its group
+            text = ''.join(units)
+            shaped = ss(text, font, explicit)
+            self.ae([g[0] for g in shaped], [1] * len(units), f'cells per group for: {text!r}')
+            expected = [ss(u, font)[0][3] for u in (reversed(units) if rtl else units)]
+            self.ae([g[3] for g in shaped], expected, f'glyphs per group for: {text!r}')
+
+        hebrew_units = (
+            ('\u05e9', '\u05dc', '\u05d5', '\u05dd'),  # unpointed
+            # pointed, the shin and vav cells become a single composed glyph
+            ('\u05e9\u05b8\u05c1', '\u05dc', '\u05d5\u05b9', '\u05dd'),
+            ('\u05d1\u05bc', '\u05d2'),  # bet with dagesh composes into a single glyph
+            ('\u05ea\u05bc\u05c2', '\u05db', '\u05e1\u05b0\u05b7'),  # several marks per cell
+        )
+        for units in hebrew_units:
+            check_units(units)
+        # LTR text inside an RTL buffer
+        check_units(('\u05e9\u05b8\u05c1', '\u05dc', '\u05d5\u05b9', '\u05dd', ' ', 'a', 'b', '1'))
+        # the marks of a Latin letter come before it in an RTL buffer
+        self.ae(groups('\u05e9\u05b8\u05c1a\u0332'), [(1, 2), (1, 2)])
+        # mirrored brackets
+        self.ae(groups('(\u05e9\u05dc\u05d5\u05dd)'), [(1, 1)] * 6)
+        # the cells of a run that starts with an LTR letter are shaped as an
+        # LTR buffer, in logical order
+        check_units(('a', '\u05e9', '\u05dc'), rtl=False)
+        # forcing LTR gives logical order and the same per cell groups
+        with setup_for_testing(size=self.font_size, dpi=self.dpi):
+            self.set_options({'force_ltr': True})
+            s = Screen(None, 1, 64)
+            s.draw('\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd')
+            self.ae([g[:2] for g in test_shape(s.line(0), self.path_for_font(lm))], [(1, 2), (1, 1), (1, 1), (1, 1)])
+        self.set_options()
+
+        # cells wider than one column
+        self.ae(groups('\u05e9\u597d\u05dc'), [(1, 1), (2, 1), (1, 1)])
+        self.ae(groups('\u05e9\u2716\ufe0f\u05dc'), [(1, 1), (2, 2), (1, 1)])
+        for kw in ({'scale': 2}, {'width': 2}):
+
+            def draw(s, kw=kw):
+                s.draw('\u05e9')
+                draw_multicell(s, '\u05dc', **kw)
+                s.draw('\u05d5\u05dd')
+
+            shaped = shape(draw, lm)
+            self.ae([g[:2] for g in shaped], [(1, 1), (1, 1), (2, 1), (1, 1)], f'multicell: {kw}')
+            self.ae([g[3] for g in shaped], [ss(u)[0][3] for u in '\u05dd\u05d5\u05dc\u05e9'], f'multicell: {kw}')
+
+        def draw(s):
+            s.draw('\u05e9\u05b8\u05c1')
+            draw_multicell(s, '\u05d5\u05b9', scale=2)
+            s.draw('\u05dd')
+
+        self.ae([g[:2] for g in shape(draw, lm)], [(1, 1), (2, 1), (1, 2)])
+
+        # Arabic lam-alef is a single glyph covering two cells
+        dv = 'DejaVuSansMono.ttf'
+        lam_alef = ss('لا', dv)
+        self.ae([g[:2] for g in lam_alef], [(2, 1)])
+        self.ae(groups('سلام', dv), [(1, 1), (2, 1), (1, 1)])
+        self.ae(groups('السلام', dv), [(1, 1), (2, 1), (1, 1), (1, 1), (1, 1)])
+        # a mark on the lam, the ligature still spans both cells
+        self.ae(groups('لَا', dv), [(2, 2)])
+        # LTR text and wide cells next to the ligature
+        self.ae(groups('سلام abc', dv), [(1, 1)] * 4 + [(1, 1), (2, 1), (1, 1)])
+        self.ae(groups('لا好', dv), [(2, 1), (2, 1)])
+
+        # iosevka has no Hebrew so marks are not composed with their letters and
+        # come before them, its grouping must still give each letter its marks
+        self.ae(groups('\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd', 'iosevka-regular.ttf'), [(1, 1), (1, 2), (1, 1), (1, 3)])
+
+        # ligature fonts substitute glyphs designed for LTR in Hebrew runs, so
+        # only check that the cells are accounted for
+        for font in ('FiraCode-Medium.otf', 'CascadiaCode-Regular.otf', 'iosevka-regular.ttf'):
+            for text in ('\u05d0==\u05d1', '\u05d0===\u05d1', '\u05d0->\u05d1', '\u05d0<!--\u05d1', '\u05d0----\u05d1', '\u05e9==', '==\u05e9'):
+                g = groups(text, font)
+                self.assertTrue(all(n > 0 for n, _ in g), f'{font}: {text!r}: {g}')
+                self.ae(sum(n for n, _ in g), len(text), f'{font}: {text!r}: {g}')
+                self.ae(sum(n for _, n in g), len(text), f'{font}: {text!r}: {g}')
+
+        # an explicit direction shapes in logical order, with the same per cell groups
+        for units in (('\u05e9', '\u05dc', '\u05d5', '\u05dd'), ('\u05e9\u05b8\u05c1', '\u05dc', '\u05d5\u05b9', '\u05dd', ' ', 'a', 'b')):
+            check_units(units, rtl=False, explicit=True)
+        self.ae(groups('\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd', 'iosevka-regular.ttf', True), [(1, 3), (1, 1), (1, 2), (1, 1)])
+        for text, expected in (('لا', [(2, 1)]), ('السلام', [(1, 1), (1, 1), (1, 1), (2, 1), (1, 1)]), ('لَا', [(2, 2)]), ('لا好', [(2, 1), (2, 1)])):
+            self.ae(groups(text, dv, True), expected, text)
+        # ligatures are off in an explicit RTL run, shaped with the main face, FiraCode
+        single = ss('=', None, True)[0][3]
+        self.ae([g[3] for g in ss('==', None, True)], [single, single])
+        self.assertNotEqual([g[3] for g in ss('==', None)], [single, single])
+
     def test_shaped_run_cache(self):
         # test_shape() already checks that a cached run matches the HarfBuzz
         # output for the same run, here we check that different runs sharing a
@@ -737,7 +1191,21 @@ class Rendering(FontBaseTest):
             s.draw(text)
             return test_shape(s.line(0), None)
 
-        texts = ('abcd', 'a===b', '->', '<==>', '-' * 18, 'x' * 32, 'x' * 33, 'a<!--b', '\u00e1\u00e9', 'a>\u2060<b')
+        texts = (
+            'abcd',
+            'a===b',
+            '->',
+            '<==>',
+            '-' * 18,
+            'x' * 32,
+            'x' * 33,
+            'a<!--b',
+            '\u00e1\u00e9',
+            'a>\u2060<b',
+            '\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd',
+            '\u05e9\u597d\u05dc',
+            '\u05d0==\u05d1',
+        )
         cold = {}
         for text in texts:
             with ctx():  # a fresh font, and therefore an empty cache, for every run
@@ -745,6 +1213,25 @@ class Rendering(FontBaseTest):
         with ctx():  # all runs now share a single cache
             for text in texts + tuple(reversed(texts)):
                 self.ae(cold[text], shape(text), f'cached shaping differs for: {text!r}')
+        # A multicell char cut off by the end of the line, as can happen in a
+        # horizontally scrolled smooth scroll region, does not use the cached
+        # shaping of the complete char, which covers more cells than the line has
+        with ctx():
+            s = Screen(None, 1, 11)
+            s.draw('zabcdefg')
+            draw_multicell(s, 'w', width=3)
+            self.ae(test_shape(s.line(0), None)[-1][0], 3)
+            s = Screen(None, 1, 10)
+            s.draw('abcdefg')
+            draw_multicell(s, 'w', width=3)
+            self.assertTrue(s.smooth_scroll_define(1, 0, 0, 10, 1, 1, False, True))
+            s.smooth_scroll(1, -10)
+            s.cursor.x = 0
+            s.draw('z')
+            self.ae(str(s.line(0)), 'zabcdefgw')
+            groups = test_shape(s.line(0), None)
+            self.ae(groups[-1][0], 2)
+            self.ae(sum(g[0] for g in groups), s.columns)
 
     def test_shaping_with_many_combining_chars(self):
         # cells can hold more codepoints than MAX_NUM_CODEPOINTS_PER_CELL when
@@ -900,6 +1387,273 @@ class Rendering(FontBaseTest):
         self.ae(coalesce_symbol_maps(q), {(1, 4): 'a', (5, 5): 'b'})
         q = {(0, 30): 'a', (10, 10): 'b', (11, 11): 'b', (2, 2): 'c', (1, 1): 'c'}
         self.ae(coalesce_symbol_maps(q), {(0, 0): 'a', (1, 2): 'c', (3, 9): 'a', (10, 11): 'b', (12, 30): 'a'})
+
+
+class BidiRenderingBase(FontBaseTest):
+    def render_cells(self, line, levels=None, sprites=None):
+        test_render_line(line, None if levels is None else bytes(levels))
+        idx = [line.sprite_at(x) for x in range(len(line))]
+        sprites = self.sprites if sprites is None else sprites
+        return idx, [bytes(sprites[sprite_idx_to_pos(i, setup_for_testing.xnum, setup_for_testing.ynum)]) for i in idx]
+
+    def line(self, text, cols=None, **opts):
+        s = self.create_screen(cols=cols or len(text), lines=1, scrollback=0, options=opts)
+        parse_bytes(s, text.encode())
+        return s.line(0)
+
+    def render_text(self, text, cols=None, levels=None):
+        return self.render_cells(self.line(text, cols), levels)
+
+
+class BidiRendering(BidiRenderingBase):
+    font_name = 'LiberationMono-Regular.ttf'
+    # scaled to the cell height of the main face, this glyph spans the space after it
+    pua = '\ue0a0'
+    symbol_map = {(ord(pua), ord(pua)): 'FiraCode-Medium.otf'}
+
+    def test_levels_path(self):
+        # rendering at levels leaves the guessed path and its cache as they were, and runs of each direction have their own cache entries
+        for text in ('abcdef', 'a==>b', '\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd', '\u4f60\u597d', self.pua + '  '):
+            line = self.line(text, len(text) + 2)
+            n = len(line)
+            first = self.render_cells(line)
+            for levels in ([1] * n, [(i // 2) % 2 for i in range(n)]):
+                self.render_cells(line, levels)
+                self.ae(self.render_cells(line), first, f'{levels=}')
+        word = '\u05e9\u05dc\u05d5\u05dd'
+        alone = [self.render_text(ch)[1][0] for ch in word]
+        guessed = self.render_text(word)[1]
+        self.assertNotEqual(guessed, alone)
+        for levels, expected in (([1] * 4, alone), ([0] * 4, alone), (None, guessed)):
+            self.ae(self.render_text(word, levels=levels)[1], expected)
+        # HarfBuzz mirrors the parenthesis in an RTL run
+        ltr, rtl = self.render_text('(a', levels=[0, 0]), self.render_text('(a', levels=[1, 1])
+        self.assertNotEqual(ltr[1][0], rtl[1][0])
+        for levels, expected in (([0, 0], ltr), ([1, 1], rtl)):
+            self.ae(self.render_text('(a', levels=levels), expected)
+        # a multicell char's cells must share one level
+        s = self.create_screen(cols=6, lines=2, scrollback=0)
+        parse_bytes(s, b'\x1b]66;s=2;\xe2\x94\x80\x07ab')
+        with self.assertRaises(ValueError):
+            test_render_line(s.line(0), bytes([0, 1, 1, 1, 1, 1]))
+        # force_ltr shapes the guessed path as level 0 does
+        ctx = partial(setup_for_testing, size=self.font_size, dpi=self.dpi, main_face_path=self.path_for_font(self.font_name))
+
+        def render(text, force_ltr, levels=None):
+            with ctx() as (sprites, *_):  # a fresh font group, so no run is shaped from the cache
+                return self.render_cells(self.line(text, force_ltr=force_ltr), levels, sprites)[1]
+
+        for text in (word, f'({word}) abc'):
+            forced = render(text, True)
+            self.ae(render(text, False, [0] * len(text)), forced, text)
+            self.assertNotEqual(render(text, False), forced, text)
+
+    def test_rtl_cells_mirrored(self):
+        # empty pixels differ in their rgb bytes across platforms (CoreText leaves them white), only alpha is compared
+        def alpha(sprites):
+            return [bytes(b[0::4]) for b in sprites]
+
+        # a wide char's glyph halves swap, \u3001 being drawn in one half of its box
+        for ch in '\u4f60\u3001':
+            with self.subTest(ch=ch):
+                guessed_idx, guessed = self.render_text(ch, cols=2)
+                if 1 in guessed_idx:
+                    self.skipTest('no system font renders the wide character, the bundled fonts have no CJK glyphs')
+                self.assertNotEqual(guessed[0], guessed[1])
+                self.ae(self.render_text(ch, cols=2, levels=[1, 1])[1], [guessed[1], guessed[0]])
+        # a thin zero advance glyph in a two cell group must not be shifted out of the canvas, it renders as guessed under its RTL sprite key
+        s = self.create_screen(cols=2, lines=1, scrollback=0)
+        draw_multicell(s, '\u0307', width=2)
+        guessed_idx, guessed = self.render_cells(s.line(0))
+        self.ae([any(p) for p in alpha(guessed)], [True, False])
+        rtl_idx, rtl = self.render_cells(s.line(0), [1, 1])
+        self.ae(alpha(rtl), alpha(guessed))
+        self.assertNotEqual(rtl_idx[0], guessed_idx[0])
+        # lam-alef is one glyph over two cells, it renders as guessed under its RTL sprite keys, in a font group of its own
+        ctx = partial(setup_for_testing, size=self.font_size, dpi=self.dpi, main_face_path=self.path_for_font('DejaVuSansMono.ttf'))
+        with ctx() as (sprites, *_):
+            lam_alef = '\u0644\u0627'
+            guessed_idx, guessed = self.render_cells(self.line(lam_alef), sprites=sprites)
+            self.assertNotEqual(alpha(guessed)[0], alpha(guessed)[1])
+            rtl_idx, rtl = self.render_cells(self.line(lam_alef), [1, 1], sprites)
+            self.ae(alpha(rtl), alpha(guessed))
+            self.assertNotEqual(rtl_idx, guessed_idx)
+        # shifting the group towards the letter it joins must not push ink off the canvas, which depends on the cell width
+        with setup_for_testing(size=11.0, dpi=96.0, main_face_path=self.path_for_font('DejaVuSansMono.ttf')) as (sprites, cell_width, _):
+            for word in ('\u0633\u0644\u0627\u0645', '\u0633\u0644\u0627', '\u0628\u0644\u0627\u062f'):
+                with self.subTest(word=word):
+                    cols = len(word)
+
+                    def ink(levels):
+                        return [sum(c[0::4]) for c in self.render_cells(self.line(word, cols), levels, sprites)[1]]
+
+                    rtl_ink = ink([1] * cols)
+                    self.ae(sum(rtl_ink), sum(ink(None)))
+                    # the group is drawn right to left, its first cell on the right
+                    first = word.index('\u0644')
+                    self.assertGreater(rtl_ink[first], rtl_ink[first + 1])
+                    cell = self.render_cells(self.line(word, cols), [1] * cols, sprites)[1][first]
+                    self.assertTrue(any(cell[(cell_width - 1) * 4 :: cell_width * 4]))
+
+    def test_rtl_combining_mark_position(self):
+        # a mark that is not composed with its base is a cluster of its own in the base's cell, it must sit where it does
+        # when the direction is guessed
+        def render(text, levels, sprites, cell_width):
+            # the cell's alpha and the horizontal centroid of the ink the mark adds to its bare base
+            def alpha(text):
+                return self.render_cells(self.line(text, 2), levels, sprites)[1][0][0::4]
+
+            cell, base = alpha(text), alpha(text[0])
+            mark = [max(0, c - b) for c, b in zip(cell, base)]
+            self.assertTrue(sum(mark), f'{text!r} at {levels=} has no mark ink')
+            return cell, sum(a * (i % cell_width) for i, a in enumerate(mark)) / sum(mark)
+
+        def check(text, sprites=None, cell_width=self.cell_width):
+            with self.subTest(text=text):
+                guessed, gx = render(text, None, sprites, cell_width)
+                odd, ox = render(text, [1, 1], sprites, cell_width)
+                self.assertLessEqual(abs(ox - gx), 1, f'{text!r} mark centroid at an odd level: {ox:.1f} guessed: {gx:.1f}')
+                self.ae(odd, guessed)
+
+        check('בְ')
+        check('בִ')
+        ctx = partial(setup_for_testing, size=self.font_size, dpi=self.dpi, main_face_path=self.path_for_font('DejaVuSansMono.ttf'))
+        with ctx() as (sprites, cell_width, _):
+            check('بَ', sprites, cell_width)
+
+            # a mark after lam-alef, one glyph over two cells, is in the alef's cell: it must be drawn with the ligature, so
+            # the cells holding ink are those of the bare ligature, with more ink in the ligature's two cells
+            def ink(text, cols):
+                return [sum(c[0::4]) for c in self.render_cells(self.line(text, cols), [1] * cols, sprites)[1]]
+
+            for text in ('لاً', 'أهلاً'):
+                with self.subTest(text=text):
+                    bare = text[:-1]
+                    marked, unmarked = ink(text, len(bare)), ink(bare, len(bare))
+                    self.ae([bool(x) for x in marked], [bool(x) for x in unmarked], f'{text!r} inked cells {marked} bare {unmarked}')
+                    self.ae(marked[:-2], unmarked[:-2])
+                    self.assertGreater(sum(marked[-2:]), sum(unmarked[-2:]))
+
+    def test_rtl_multi_glyph_group(self):
+        # the glyphs of a group spanning several cells are in logical order, the canvas must still be in visual order as
+        # the cells are mapped to its slices last to first
+        s = self.create_screen(cols=2, lines=1, scrollback=0)
+        draw_multicell(s, 'אב', width=2)
+        guessed = [c[0::4] for c in self.render_cells(s.line(0))[1]]
+        self.assertNotEqual(guessed[0], guessed[1])
+        odd = [c[0::4] for c in self.render_cells(s.line(0), [1, 1])[1]]
+        self.ae(odd, guessed[::-1])
+
+    def test_rtl_split_multicell_char(self):
+        # a char cut off by the end of the line or by the left edge of a region is drawn as the matching cells of the
+        # complete char drawn at the same level: odd, even or BIDI_LEVEL_FIXED (0x80), on a line holding a bidi record as
+        # every line rendered at levels does. Four glyphs in two cells give each cell a different sprite at each level.
+        def screen(x, region_left=0, shift=0, bidi=True):
+            s = self.create_screen(cols=10, lines=1, scrollback=0)
+            if bidi:
+                parse_bytes(s, b'\x1b[8h')
+            s.cursor.x = x
+            draw_multicell(s, 'אבגד', width=2)
+            if shift:
+                self.assertTrue(s.smooth_scroll_define(1, region_left, 0, 10, 1, 1, False, True))
+                s.smooth_scroll(1, 10 * shift)
+            return s
+
+        def alpha(s, levels):
+            return [c[0::4] for c in self.render_cells(s.line(0), levels)[1]]
+
+        for x, region_left, shift, present in ((8, 0, -1, {9: 0}), (2, 2, 1, {2: 1})):
+            with self.subTest(x=x, shift=shift):
+                cut = screen(x, region_left, shift)
+                complete = {level: alpha(screen(x), [level] * 10) for level in (1, 0x80, 0)}
+                for level, sprites in complete.items():
+                    split = alpha(cut, [level] * 10)
+                    for c, k in present.items():
+                        self.assertNotEqual(sprites[x + k], complete[0 if level else 1][x + k], f'{level=} {c=}')
+                        self.ae(split[c], sprites[x + k], f'{level=} {c=}')
+
+        # in a frame, the cut char is in the columns of a horizontal region, so it is drawn as with bidi mode off
+        def frame_sprite(bidi):
+            s = screen(8, 0, -1, bidi)
+            s.test_update_cell_data(self.font_size, self.dpi, self.dpi)
+            return s.line(0).sprite_at(9)
+
+        self.ae(frame_sprite(True), frame_sprite(False))
+
+    def test_symbol_space_ligature_stops_at_level_change(self):
+        text = self.pua + ' '
+        idx0, px0 = self.render_text(text, levels=[0, 0])
+        self.assertTrue(idx0[1])
+        self.assertNotEqual(px0[0], px0[1])
+        self.ae(self.render_text(text, levels=[1, 1])[1], [px0[1], px0[0]])
+        self.ae(self.render_text(text, levels=[0, 1])[0][1], 0)
+
+    def test_fractional_text_alignment_ignores_direction(self):
+        # h=0 puts the ink of fractionally scaled text on the left of its area and h=1 on the right at any level; the cells
+        # of an odd level are displayed last to first
+        def centroid(halign, levels):
+            s = self.create_screen(cols=2, lines=1, scrollback=0)
+            draw_multicell(s, '\u05d1', width=2, subscale_n=1, subscale_d=2, horizontal_align=halign)
+            cells = self.render_cells(s.line(0), levels)[1]
+            cells = [c[0::4] for c in (cells[::-1] if levels and levels[0] & 1 else cells)]
+            w = self.cell_width
+            total = sum(map(sum, cells))
+            return sum(a * (ci * w + i % w) for ci, c in enumerate(cells) for i, a in enumerate(c)) / total / (2 * w)
+
+        for levels in (None, [0, 0], [1, 1]):
+            with self.subTest(levels=levels):
+                self.assertLess(centroid(0, levels), 0.3)
+                self.assertGreater(centroid(1, levels), 0.7)
+
+    def test_stamped_line_without_levels_is_shaped_left_to_right(self):
+        # Without levels a line holding a bidi record is shaped left to right instead of guessed from its text, as the
+        # digits (bidi class EN) of a run in an RTL script are
+        text = 'n \u06f1\u06f2\u06f3 m'
+        cols = len(text) + 2
+        ltr = self.render_cells(self.line(text, cols), [0] * cols)[1]
+        guessed = self.render_cells(self.line(text, cols))[1]
+        self.assertNotEqual(guessed, ltr)
+        self.ae(self.render_cells(self.line('\x1b[8h' + text, cols))[1], ltr)
+
+
+class BidiLigatureRendering(BidiRenderingBase):
+    font_name = 'FiraCode-Medium.otf'
+
+    def screen_sprites(self, text, strategy='never', cursor_x=None):
+        s = self.create_screen(cols=len(text) + 2, lines=1, scrollback=0)
+        s.disable_ligatures = strategy
+        parse_bytes(s, ('\x1b[8h' + text).encode())
+        if cursor_x is not None:
+            s.cursor.x = cursor_x
+        s.test_update_cell_data(self.font_size, self.dpi, self.dpi)
+        line = s.line(0)
+        return [bytes(self.sprites[sprite_idx_to_pos(line.sprite_at(x), setup_for_testing.xnum, setup_for_testing.ynum)]) for x in range(len(text))]
+
+    def test_no_ligatures_in_rtl_runs(self):
+        single = {ch: self.render_text(ch)[1][0] for ch in '=!'}
+        # sanity: a left-to-right run does ligate
+        self.assertNotEqual(self.render_text('==', levels=[0, 0])[1], [single['=']] * 2)
+        self.ae(self.render_text('==', levels=[1, 1])[1], [single['=']] * 2)
+        self.ae(self.render_text('!=', levels=[1, 1])[1], [single['!'], single['=']])
+
+    def test_no_ligatures_in_rtl_runs_on_screen(self):
+        single = {ch: self.render_text(ch)[1][0] for ch in '=!'}
+        # Hebrew words around the operators put them in an RTL run
+        text = '\u05d0\u05d1 == != \u05d2\u05d3'
+        expected = [single['='], single['='], single['!'], single['=']]
+        operators = (3, 4, 6, 7)
+        for strategy, cursor_x in (('never', None), ('always', None), ('cursor', 6), ('cursor', 3), ('cursor', 5), ('cursor', 0)):
+            with self.subTest(strategy=strategy, cursor_x=cursor_x):
+                sprites = self.screen_sprites(text, strategy, cursor_x)
+                self.ae([sprites[x] for x in operators], expected)
+
+    def test_ltr_ligatures_follow_disable_ligatures(self):
+        single = self.render_text('=')[1][0]
+        text = 'a == b'
+        for strategy, cursor_x, ligated in (('never', None, True), ('always', None, False), ('cursor', 5, True), ('cursor', 2, False)):
+            with self.subTest(strategy=strategy, cursor_x=cursor_x):
+                sprites = self.screen_sprites(text, strategy, cursor_x)
+                self.ae(sprites[2:4] != [single, single], ligated)
 
 
 def test_chars(chars: str = '╌', sz: int = 128) -> None:

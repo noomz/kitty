@@ -9,23 +9,27 @@
 #include "history.h"
 #include "line-buf.h"
 
-#define set_attribute_on_line(cells, which, val, xnum)                            \
-    {                                                                             \
-        for (index_type i__ = 0; i__ < xnum; i__++) cells[i__].attrs.which = val; \
-    }
-
 static inline bool
-set_named_attribute_on_line(GPUCell *cells, const char *which, uint16_t val, index_type xnum) {
+set_named_attribute_on_line(CellStyleTable *t, CPUCell *cells, RenderCell *render_cells, const char *which, uint16_t val, index_type xnum) {
     // Set a single attribute on all cells in the line
-#define s(q)                                        \
-    if (strcmp(#q, which) == 0) {                   \
-        set_attribute_on_line(cells, q, val, xnum); \
-        return true;                                \
+    if (strcmp("mark", which) == 0) {
+        if (render_cells)
+            for (index_type i = 0; i < xnum; i++) render_cells[i].mark = val;
+        return true;
+    }
+    uint32_t cache = 0;
+#define s(q)                                                                \
+    if (strcmp(#q, which) == 0) {                                           \
+        for (index_type i = 0; i < xnum; i++) {                             \
+            CellStyle st = *style_table_get(t, cells[i].style_idx);         \
+            st.attrs.q = val;                                               \
+            cells[i].style_idx = style_table_intern_cached(t, &st, &cache); \
+        }                                                                   \
+        return true;                                                        \
     }
     s(reverse);
     s(strike);
     s(dim);
-    s(mark);
     s(bold);
     s(italic);
     s(decoration);
@@ -36,20 +40,22 @@ set_named_attribute_on_line(GPUCell *cells, const char *which, uint16_t val, ind
 
 static inline void
 copy_line(const Line *src, Line *dest) {
-    memcpy(dest->cpu_cells, src->cpu_cells, sizeof(CPUCell) * MIN(src->xnum, dest->xnum));
-    memcpy(dest->gpu_cells, src->gpu_cells, sizeof(GPUCell) * MIN(src->xnum, dest->xnum));
+    // Copies the render data only if both lines have it, otherwise the render
+    // data of dest is stale and dest must be marked dirty.
+    const index_type n = MIN(src->xnum, dest->xnum);
+    memcpy(dest->cpu_cells, src->cpu_cells, sizeof(CPUCell) * n);
+    if (dest->render_cells) {
+        if (src->render_cells) memcpy(dest->render_cells, src->render_cells, sizeof(RenderCell) * n);
+        else memset(dest->render_cells, 0, sizeof(RenderCell) * n);
+    }
 }
 
 static inline void
-clear_chars_in_line(CPUCell *cpu_cells, GPUCell *gpu_cells, index_type xnum, char_type ch) {
+clear_chars_in_line(CPUCell *cpu_cells, index_type xnum, char_type ch) {
     // Clear only the char part of each cell, the rest must have been cleared by a memset or similar
     if (ch) {
-        static const CellAttrs empty = {0};
         const CPUCell c = {.ch_or_idx = ch};
-        for (index_type i = 0; i < xnum; i++) {
-            cpu_cells[i] = c;
-            gpu_cells[i].attrs = empty;
-        }
+        for (index_type i = 0; i < xnum; i++) cpu_cells[i] = c;
     }
 }
 
@@ -61,14 +67,15 @@ xlimit_for_line(const Line *line) {
 }
 
 static inline void
-line_save_cells(Line *line, index_type start, index_type num, GPUCell *gpu_cells, CPUCell *cpu_cells) {
-    memcpy(gpu_cells + start, line->gpu_cells + start, sizeof(GPUCell) * num);
+line_save_cells(Line *line, index_type start, index_type num, RenderCell *render_cells, CPUCell *cpu_cells) {
+    if (line->render_cells) memcpy(render_cells + start, line->render_cells + start, sizeof(RenderCell) * num);
+    else memset(render_cells + start, 0, sizeof(RenderCell) * num);
     memcpy(cpu_cells + start, line->cpu_cells + start, sizeof(CPUCell) * num);
 }
 
 static inline void
-line_reset_cells(Line *line, index_type start, index_type num, GPUCell *gpu_cells, CPUCell *cpu_cells) {
-    memcpy(line->gpu_cells + start, gpu_cells + start, sizeof(GPUCell) * num);
+line_reset_cells(Line *line, index_type start, index_type num, RenderCell *render_cells, CPUCell *cpu_cells) {
+    if (line->render_cells) memcpy(line->render_cells + start, render_cells + start, sizeof(RenderCell) * num);
     memcpy(line->cpu_cells + start, cpu_cells + start, sizeof(CPUCell) * num);
 }
 
@@ -82,7 +89,56 @@ line_is_empty(const Line *line) {
     return true;
 }
 
+// Whether the line has a bidi record. A line holding no text has none: a record it kept is dropped, so that the next text written
+// to it records the controls current then. The direction a leading mark set for the line's first text is not a record.
+static inline bool
+line_has_bidi_record(LineAttrs *a, const Line *line) {
+    if (a->bidi_stamp == BIDI_STAMP_NONE) return false;
+    if (!line_is_empty(line)) return true;
+    line_attrs_set_bidi(a, (LineAttrs){0});
+    a->bidi_may_reorder = false;
+    return false;
+}
+
+// The bidi record a line's text is serialized with, see line_has_bidi_record(), 0 for none. Unlike that function it leaves a
+// record kept by a line without text where it is, as serializing does not write to the line.
+static inline uint8_t
+line_bidi_record_for_ansi(const Line *line) {
+    if (line->attrs.bidi_stamp == BIDI_STAMP_NONE || line_is_empty(line)) return 0;
+    LineAttrs a = {0};
+    line_attrs_set_bidi(&a, line->attrs);
+    return a.val;
+}
+
+// Serializing bidi text as ANSI: the controls a paragraph was written under are set where the text of its first line holding
+// a record starts and reset to their defaults where the paragraph ends, so that the state is the default at every hard line
+// break and a paragraph written back is laid out as it was. Call ansi_bidi_row_start() before line_as_ansi() writes a line,
+// which writes the controls opened, and ansi_bidi_row_end() after it.
+static inline void
+ansi_bidi_row_start(ANSILineState *s, const Line *line) {
+    if (LIKELY(s->bidi_open || line->attrs.bidi_stamp == BIDI_STAMP_NONE)) return;
+    s->bidi_open = s->bidi_prefix = line_bidi_record_for_ansi(line);
+}
+// Writes the controls opened by ansi_bidi_row_start() that line_as_ansi() did not write
+void ansi_bidi_write_prefix(ANSILineState *s);
+// Resets the controls of the open paragraph to their defaults
+void ansi_bidi_close(ANSILineState *s);
+// After a line was written, continued when the next line continues its paragraph
+static inline void
+ansi_bidi_row_end(ANSILineState *s, bool continued) {
+    if (UNLIKELY(s->bidi_open) && !continued) ansi_bidi_close(s);
+}
+// Starts writing lines whose paragraph holds the record above in the lines before them, see screen_bidi_record_above(). Unless
+// written is set, the output before them did not open it, so its controls are written before the first line.
+static inline void
+ansi_bidi_continue(ANSILineState *s, uint8_t above, bool written) {
+    s->bidi_open = above;
+    s->bidi_prefix = written ? 0 : above;
+}
+
 typedef Line *(get_line_func)(void *, int);
+// The record of the lines above the first one as_text_generic() writes, see ansi_bidi_continue()
+typedef uint8_t(ansi_bidi_above_func)(void *);
 void line_clear_text(Line *self, unsigned int at, unsigned int num, char_type ch);
 void line_apply_cursor(Line *self, const Cursor *cursor, unsigned int at, unsigned int num, bool clear_char);
 char_type line_get_char(Line *self, index_type at);
@@ -111,13 +167,14 @@ PyObject *line_as_unicode(Line *, bool, ANSIBuf *);
 
 void linebuf_init_line(LineBuf *, index_type);
 void linebuf_init_line_at(LineBuf *, index_type, Line *);
-void linebuf_init_cells(LineBuf *lb, index_type ynum, CPUCell **c, GPUCell **g);
+void linebuf_init_cells(LineBuf *lb, index_type ynum, CPUCell **c, RenderCell **r);
 CPUCell *linebuf_cpu_cells_for_line(LineBuf *lb, index_type idx);
 void linebuf_clear(LineBuf *, char_type ch);
 void linebuf_clear_lines(LineBuf *self, const Cursor *cursor, index_type start, index_type end);
 void linebuf_index(LineBuf *self, index_type top, index_type bottom);
 void linebuf_reverse_index(LineBuf *self, index_type top, index_type bottom);
 void linebuf_clear_line(LineBuf *self, index_type y, bool clear_attrs);
+void linebuf_clear_line_text(LineBuf *self, index_type y);
 void linebuf_insert_lines(LineBuf *self, unsigned int num, unsigned int y, unsigned int bottom);
 void linebuf_delete_lines(LineBuf *self, index_type num, index_type y, index_type bottom);
 void linebuf_copy_line_to(LineBuf *, Line *, index_type);
@@ -133,14 +190,25 @@ void historybuf_add_line(HistoryBuf *self, const Line *line, ANSIBuf *);
 bool cells_have_multiline_chars(const CPUCell *cells, index_type count);
 bool historybuf_pop_line(HistoryBuf *, Line *);
 void historybuf_init_line(HistoryBuf *self, index_type num, Line *l);
+bool historybuf_init_line_for_render(HistoryBuf *self, index_type lnum, Line *l, index_type num_rows);
 bool history_buf_endswith_wrap(HistoryBuf *self);
 CPUCell *historybuf_cpu_cells(HistoryBuf *self, index_type num);
+LineAttrs *historybuf_attrs(HistoryBuf *self, index_type num);
 void historybuf_mark_line_clean(HistoryBuf *self, index_type y);
 void historybuf_mark_line_dirty(HistoryBuf *self, index_type y);
 void historybuf_set_line_has_image_placeholders(HistoryBuf *self, index_type y, bool val);
 void historybuf_refresh_sprite_positions(HistoryBuf *self);
 void historybuf_clear(HistoryBuf *self);
+void historybuf_invalidate_render_cache(HistoryBuf *self);
 void mark_text_in_line(PyObject *marker, Line *line, ANSIBuf *buf);
 bool line_has_mark(Line *, uint16_t mark);
-PyObject *as_text_generic(PyObject *args, void *container, get_line_func get_line, index_type lines, ANSIBuf *ansibuf, bool add_trailing_newline);
+PyObject *as_text_generic(
+    PyObject *args,
+    void *container,
+    get_line_func get_line,
+    index_type lines,
+    ANSIBuf *ansibuf,
+    bool add_trailing_newline,
+    ansi_bidi_above_func *bidi_above,
+    bool continues_previous);
 bool colors_for_cell(Line *self, const ColorProfile *cp, index_type *x, color_type *fg, color_type *bg, bool *reversed);

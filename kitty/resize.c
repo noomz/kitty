@@ -30,6 +30,9 @@ typedef struct Rewrap {
     bool prev_src_line_ended_with_wrap, current_src_line_has_multline_cells, current_dest_line_has_multiline_cells;
     bool dest_line_from_linebuf, src_is_in_linebuf;
     bool consume_src_hb;
+    // the src line continues the dest row and has a bidi record, which the row takes when it has none once a cell of the
+    // continuation is copied onto it
+    bool join_bidi_record;
 
 } Rewrap;
 
@@ -99,6 +102,11 @@ init_src_line(Rewrap *r) {
     r->dest.lb->line_attrs[dest_y] = r->src.line.attrs; \
     r->src.line.attrs.prompt_kind = UNKNOWN_PROMPT_KIND;
 
+static LineAttrs *
+dest_row_attrs(Rewrap *r) {
+    return r->dest_line_from_linebuf ? r->dest.lb->line_attrs + r->dest.y : historybuf_attrs(r->dest.hb, 0);
+}
+
 static void
 first_dest_line(Rewrap *r) {
     if (r->src.hb_count) {
@@ -122,6 +130,7 @@ linebuf_next_dest_line(Rewrap *r, bool continued) {
             linebuf_init_line(dest, dest->ynum - 1);
             dest->line->attrs.has_dirty_text = true;
             historybuf_add_line(r->dest.hb, dest->line, r->as_ansi_buf);
+            historybuf_note_bidi(r->dest.hb, dest->line->attrs);
         }
         linebuf_clear_line(dest, dest->ynum - 1, true);
     } else dest_y++;
@@ -135,6 +144,8 @@ linebuf_next_dest_line(Rewrap *r, bool continued) {
 static void
 next_dest_line(Rewrap *r, bool continued) {
     r->dest.x = 0;
+    // the new row has the attrs of the src line
+    r->join_bidi_record = false;
     r->current_dest_line_has_multiline_cells = false;
     if (r->dest_line_from_linebuf) {
         r->dest.y = linebuf_next_dest_line(r, continued);
@@ -153,10 +164,9 @@ next_dest_line(Rewrap *r, bool continued) {
     }
     if (r->sb->line_attrs[0].has_dirty_text) {
         CPUCell *cpu_cells;
-        GPUCell *gpu_cells;
-        linebuf_init_cells(r->sb, 0, &cpu_cells, &gpu_cells);
+        linebuf_init_cells(r->sb, 0, &cpu_cells, NULL);
         memcpy(r->dest.line.cpu_cells, cpu_cells, dest_xnum * sizeof(cpu_cells[0]));
-        memcpy(r->dest.line.gpu_cells, gpu_cells, dest_xnum * sizeof(gpu_cells[0]));
+        if (r->sb->line_attrs[0].bidi_may_reorder) dest_row_attrs(r)->bidi_may_reorder = true;
         r->current_dest_line_has_multiline_cells = true;
     }
     linebuf_index(r->sb, 0, r->sb->ynum - 1);
@@ -219,8 +229,24 @@ find_space_in_dest(Rewrap *r, index_type num_cells) {
 
 static void
 copy_range(Line *src, index_type src_at, Line *dest, index_type dest_at, index_type num) {
+    // render data is not copied as all rewrapped lines are marked dirty
     memcpy(dest->cpu_cells + dest_at, src->cpu_cells + src_at, num * sizeof(CPUCell));
-    memcpy(dest->gpu_cells + dest_at, src->gpu_cells + src_at, num * sizeof(GPUCell));
+}
+
+// A continuation joined onto a destination row without a bidi record brings its own
+static void
+join_bidi_record(Rewrap *r) {
+    r->join_bidi_record = false;
+    LineAttrs *a = dest_row_attrs(r);
+    if (a->bidi_stamp != BIDI_STAMP_NONE) return;
+    line_attrs_set_bidi(a, r->src.line.attrs);
+    if (!r->dest_line_from_linebuf) r->dest.hb->bidi_stamped = true;
+}
+
+// A row joined from several lines may reorder if any of them may
+static inline void
+carry_bidi_bit(Rewrap *r) {
+    if (r->src.line.attrs.bidi_may_reorder) dest_row_attrs(r)->bidi_may_reorder = true;
 }
 
 static void
@@ -233,6 +259,7 @@ copy_multiline_extra_lines(Rewrap *r, CPUCell *src_cell, index_type mc_width) {
         linebuf_init_line_at(r->sb, i - 1, &r->dest.scratch_line);
         linebuf_mark_line_dirty(r->sb, i - 1);
         copy_range(&r->src.scratch_line, r->src.x, &r->dest.scratch_line, r->dest.x, mc_width);
+        r->sb->line_attrs[i - 1].bidi_may_reorder |= r->src.scratch_line.attrs.bidi_may_reorder;
         update_tracked_cursors(r, mc_width, r->src.y + i, r->dest.y + i, src_xnum + 10000 /* ensure cursor is moved only if in region being copied */);
     }
 }
@@ -259,12 +286,22 @@ multiline_copy_src_to_dest(Rewrap *r) {
     while (r->src.x < r->src_x_limit) {
         c = &r->src.line.cpu_cells[r->src.x];
         if (c->is_multicell) {
-            mc_width = mcd_x_limit(c);
+            // The char can be missing some of its columns, if it was split by
+            // a horizontally scrolled smooth scroll region, so only the cells
+            // that actually continue it are used, and it is dropped if it is
+            // incomplete, as it cannot be placed consistently in dest
+            const MulticellColumns cols = multicell_char_columns(r->src.line.cpu_cells, src_xnum, r->src.x);
+            const bool complete = cols.start == r->src.x && multicell_char_columns_are_complete(r->src.line.cpu_cells, cols);
+            mc_width = complete ? mcd_x_limit(c) : cols.limit - r->src.x;
             if (mc_width > dest_xnum) {
                 update_tracked_cursors(r, mc_width, r->src.y, r->dest.y, r->src_x_limit);
                 r->src.x += mc_width;
                 continue;
             } else if (c->y) {
+                r->src.x += mc_width;
+                continue;
+            } else if (!complete) {
+                update_tracked_cursors_for_dropped_cells(r, mc_width);
                 r->src.x += mc_width;
                 continue;
             } else if (c->scale > 1 && !multiline_char_is_complete(r, c)) {
@@ -276,6 +313,8 @@ multiline_copy_src_to_dest(Rewrap *r) {
         } else mc_width = 1;
         find_space_in_dest(r, mc_width);
         copy_range(&r->src.line, r->src.x, &r->dest.line, r->dest.x, mc_width);
+        if (UNLIKELY(r->join_bidi_record)) join_bidi_record(r);
+        carry_bidi_bit(r);
         update_tracked_cursors(r, mc_width, r->src.y, r->dest.y, r->src_x_limit);
         if (c->is_multicell && c->scale > 1) copy_multiline_extra_lines(r, c, mc_width);
         r->src.x += mc_width;
@@ -302,6 +341,8 @@ fast_copy_src_to_dest(Rewrap *r) {
             return;
         }
         copy_range(&r->src.line, r->src.x, &r->dest.line, r->dest.x, num);
+        if (UNLIKELY(r->join_bidi_record)) join_bidi_record(r);
+        carry_bidi_bit(r);
         update_tracked_cursors(r, num, r->src.y, r->dest.y, r->src_x_limit);
         r->src.x += num;
         r->dest.x += num;
@@ -317,7 +358,7 @@ rewrap(Rewrap *r) {
         memcpy(r->dest.lb->line_map, r->src.lb->line_map, sizeof(index_type) * r->src.lb->ynum);
         memcpy(r->dest.lb->line_attrs, r->src.lb->line_attrs, sizeof(LineAttrs) * r->src.lb->ynum);
         memcpy(r->dest.lb->cpu_cell_buf, r->src.lb->cpu_cell_buf, (size_t)r->src.lb->xnum * r->src.lb->ynum * sizeof(CPUCell));
-        memcpy(r->dest.lb->gpu_cell_buf, r->src.lb->gpu_cell_buf, (size_t)r->src.lb->xnum * r->src.lb->ynum * sizeof(GPUCell));
+        memcpy(r->dest.lb->render_cell_buf, r->src.lb->render_cell_buf, (size_t)r->src.lb->xnum * r->src.lb->ynum * sizeof(RenderCell));
         r->num_content_lines_before = r->src.lb->ynum;
         if (r->dest.hb && r->src.hb) historybuf_fast_rewrap(r->dest.hb, r->src.hb, r->src.hb->count, r->consume_src_hb);
         r->dest.y = r->src.lb->ynum - 1;
@@ -335,7 +376,7 @@ rewrap(Rewrap *r) {
         if (init_src_line(r)) {
             if (r->src.y) next_dest_line(r, false);
             else first_dest_line(r);
-        }
+        } else r->join_bidi_record = line_has_bidi_record(&r->src.line.attrs, &r->src.line);
         if (r->current_src_line_has_multline_cells || r->current_dest_line_has_multiline_cells) multiline_copy_src_to_dest(r);
         else fast_copy_src_to_dest(r);
     }
@@ -376,7 +417,6 @@ clear_trailing_blanks(HistoryBuf *hb, index_type count) {
         index_type limit = l.xnum;
         while (limit && l.cpu_cells[limit - 1].ch_and_idx == BLANK_CHAR) limit--;
         zero_at_ptr_count(l.cpu_cells + limit, l.xnum - limit);
-        zero_at_ptr_count(l.gpu_cells + limit, l.xnum - limit);
     }
 }
 
@@ -386,6 +426,7 @@ resize_screen_buffers(
     ResizeResult ans = {0};
     ans.lb = alloc_linebuf(lines, columns, lb->text_cache);
     if (!ans.lb) return ans;
+    ans.lb->bidi_stamped = lb->bidi_stamped;
     RAII_PyObject(raii_nlb, (PyObject *)ans.lb);
     (void)raii_nlb;
     // sb holds the rows below the first row of multiline chars
@@ -409,6 +450,7 @@ resize_screen_buffers(
             for (index_type y = reused; y < hb->count; y++) {
                 historybuf_init_line(hb, hb->count - y - 1, &l);
                 historybuf_add_line(src_hb, &l, as_ansi_buf);
+                historybuf_note_bidi(src_hb, l.attrs);
             }
         }
         ans.hb = historybuf_alloc_for_rewrap(columns, hb);
@@ -451,19 +493,17 @@ resize_screen_buffers(
 }
 
 static void
-nuke_in_line(CPUCell *cp, GPUCell *gp, index_type start, index_type x_limit) {
+nuke_in_line(CPUCell *cp, index_type start, index_type x_limit) {
     for (index_type x = start; x < x_limit; x++) {
         cell_set_char(cp + x, 0);
         cell_clear_multicell(cp + x);
-        clear_sprite_position(gp[x]);
     }
 }
 
 static void
 nuke_multicell_char_at(LineBuf *lb, index_type x_, index_type y_) {
     CPUCell *cp;
-    GPUCell *gp;
-    linebuf_init_cells(lb, y_, &cp, &gp);
+    linebuf_init_cells(lb, y_, &cp, NULL);
     const CPUCell ref = cp[x_];
     // only the adjacent rows that continue the char, as it may be partial or torn
     index_type y_start = y_, y_limit = y_ + 1;
@@ -475,8 +515,9 @@ nuke_multicell_char_at(LineBuf *lb, index_type x_, index_type y_) {
     while (cp[x_].x && x_ > 0) x_--;
     index_type x_limit = MIN(lb->xnum, x_ + mcd_x_limit(&cp[x_]));
     for (index_type y = y_start; y < y_limit; y++) {
-        linebuf_init_cells(lb, y, &cp, &gp);
-        nuke_in_line(cp, gp, x_, x_limit);
+        linebuf_init_cells(lb, y, &cp, NULL);
+        nuke_in_line(cp, x_, x_limit);
+        linebuf_mark_line_dirty(lb, y);
     }
 }
 
@@ -486,6 +527,7 @@ resize_screen_buffer_without_rewrap(LineBuf *lb, index_type lines, index_type co
     ResizeResult ans = {0};
     ans.lb = alloc_linebuf(lines, columns, lb->text_cache);
     if (!ans.lb) return ans;
+    ans.lb->bidi_stamped = lb->bidi_stamped;
     Rewrap r = {
         .src = {.lb = lb},
     };
@@ -500,19 +542,18 @@ resize_screen_buffer_without_rewrap(LineBuf *lb, index_type lines, index_type co
         ans.lb->line_attrs[y] = lb->line_attrs[y];
         ans.lb->line_attrs[y].has_dirty_text = true;
         memcpy(ans.lb->line->cpu_cells, lb->line->cpu_cells, xcommon * sizeof(lb->line->cpu_cells[0]));
-        memcpy(ans.lb->line->gpu_cells, lb->line->gpu_cells, xcommon * sizeof(lb->line->gpu_cells[0]));
+        memcpy(ans.lb->line->render_cells, lb->line->render_cells, xcommon * sizeof(lb->line->render_cells[0]));
         if (xcommon > lb->line->xnum) {
             // extend the colors/styles of the last cell to edge
-            GPUCell e = lb->line->gpu_cells[xcommon - 1];
-            clear_sprite_position(e);
-            for (index_type x = xcommon; x < ans.lb->line->xnum; x++) ans.lb->line->gpu_cells[x] = e;
+            const uint32_t style_idx = lb->line->cpu_cells[xcommon - 1].style_idx;
+            for (index_type x = xcommon; x < ans.lb->line->xnum; x++) ans.lb->line->cpu_cells[x].style_idx = style_idx;
         } else if (xcommon < lb->line->xnum) {
             // remove multicell chars that were split at the right edge
             index_type last_x = xcommon - 1;
             CPUCell *c = ans.lb->line->cpu_cells + last_x;
             if (c->is_multicell && c->x + 1u < mcd_x_limit(c)) {
                 while (ans.lb->line->cpu_cells[last_x].x && last_x > 0) last_x--;
-                nuke_in_line(ans.lb->line->cpu_cells, ans.lb->line->gpu_cells, last_x, ans.lb->line->xnum);
+                nuke_in_line(ans.lb->line->cpu_cells, last_x, ans.lb->line->xnum);
             }
         }
     }
@@ -523,12 +564,12 @@ resize_screen_buffer_without_rewrap(LineBuf *lb, index_type lines, index_type co
         uint32_t fill_bg = 0;
         bg_freq_map freq;
         vt_init(&freq);
+        const CellStyleTable *t = tc_style_table(lb->text_cache);
         for (index_type y = 0; y < ans.num_content_lines_after; y++) {
             CPUCell *cp;
-            GPUCell *gp;
-            linebuf_init_cells(lb, y, &cp, &gp);
+            linebuf_init_cells(lb, y, &cp, NULL);
             for (index_type x = 0; x < lb->xnum; x++) {
-                bg_freq_map_itr itr = vt_get_or_insert(&freq, gp[x].bg, 0);
+                bg_freq_map_itr itr = vt_get_or_insert(&freq, style_table_get(t, cp[x].style_idx)->bg, 0);
                 if (!vt_is_end(itr)) itr.data->val++;
             }
         }
@@ -541,9 +582,15 @@ resize_screen_buffer_without_rewrap(LineBuf *lb, index_type lines, index_type co
         }
         vt_cleanup(&freq);
         if (fill_bg) {
+            CellStyleTable *t = tc_style_table(ans.lb->text_cache);
+            uint32_t style_cache = 0;
             for (index_type y = ans.num_content_lines_after; y < ans.lb->ynum; y++) {
                 linebuf_init_line(ans.lb, y);
-                for (index_type x = 0; x < ans.lb->xnum; x++) ans.lb->line->gpu_cells[x].bg = fill_bg;
+                for (index_type x = 0; x < ans.lb->xnum; x++) {
+                    CellStyle st = *style_table_get(t, ans.lb->line->cpu_cells[x].style_idx);
+                    st.bg = fill_bg;
+                    ans.lb->line->cpu_cells[x].style_idx = style_table_intern_cached(t, &st, &style_cache);
+                }
             }
         }
     }

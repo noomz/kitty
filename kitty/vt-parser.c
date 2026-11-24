@@ -20,11 +20,12 @@
 #define BUF_EXTRA (512u / 8u)
 #define MAX_ESCAPE_CODE_LENGTH (BUF_SZ / 4u)
 #define MAX_CSI_PARAMS 256u
-// Pending input smaller than this, typically the echo of typed characters, is
-// parsed without waiting for input_delay
-#define SMALL_PENDING_INPUT_THRESHOLD 1024u
-// See classify_pending_input()
-#define INPUT_PARSE_FORCE_MARGIN (16u * 1024u)
+// The most input a single non-flushing parse pass consumes, so that a continuous
+// stream of output cannot starve the main thread of rendering and event handling.
+#define MAX_INPUT_PER_PARSE_PASS BUF_SZ
+// Once this much of the buffer is in use, a parse pass compacts it as it goes, so
+// the I/O thread always has space to read into while the parser is busy.
+#define COMPACT_BUFFER_THRESHOLD (BUF_SZ / 2u)
 
 
 // Macros {{{
@@ -252,12 +253,7 @@ typedef struct PS {
     // these are temporary variables set only for duration of a parse call
     PyObject *dump_callback;
     Screen *screen;
-    monotonic_t now, new_input_at;
-    // Buffer size when new_input_at was set. Bytes before this are a scanned tail.
-    size_t fresh_input_at;
-    // input_chunk identifies the bytes stamped by new_input_at. accepted_chunk is a chunk
-    // the I/O thread woke the main loop for as small input, parsed even if it has grown since.
-    uint64_t input_chunk, accepted_chunk;
+    monotonic_t now;
     pthread_mutex_t lock;
 
     // The buffer
@@ -450,6 +446,7 @@ find_st_terminator(PS *self, size_t *end_pos) {
 
 #include "parse-multicell-command.h"
 #include "parse-dnd-command.h"
+#include "parse-smooth-scroll-command.h"
 
 static bool
 is_osc_52(PS *self) {
@@ -669,6 +666,7 @@ dispatch_osc(PS *self, uint8_t *buf, size_t limit, bool is_extended_osc) {
                 shell_prompt_marking(self->screen, (char *)buf + i);
             }
             break;
+        case SMOOTH_SCROLL_CODE: parse_smooth_scroll_code(self, buf + i, limit - i); break;
         case FILE_TRANSFER_CODE:
             START_DISPATCH
             DISPATCH_OSC(file_transmission);
@@ -984,7 +982,70 @@ csi_parse_loop(PS *self, ParsedCSI *csi, const uint8_t *buf, size_t *pos, const 
 }
 
 static bool
+csi_parse_simple(ParsedCSI *csi, const uint8_t *buf, size_t *pos, const size_t sz) {
+    // Fast path for the common form of CSI codes: an optional private marker, then
+    // non-empty numeric params separated by ; or : and then the final byte, all already
+    // in the buffer. Parses them in one pass with no per byte state machine transitions.
+    // Leaves csi and *pos as csi_parse_loop() would, and returns true, only when the
+    // complete code has this form, otherwise returns false and the caller must fall
+    // back to csi_parse_loop(), which handles everything else, including reporting
+    // errors. Must only be called in the CSI_START state.
+    size_t p = *pos;
+    if (p >= sz) return false;
+    char primary = 0;
+    switch (buf[p]) {
+        case '?':
+        case '>':
+        case '<':
+        case '=': primary = buf[p++]; break;
+    }
+    unsigned num_params = 0;
+    while (true) {
+        if (p >= sz) return false;
+        uint8_t ch = buf[p];
+        if ((uint8_t)(ch - '0') <= 9) {
+            uint64_t accumulator = 0;
+            const size_t digits_start = p;
+            do {
+                accumulator = accumulator * 10 + (ch - '0');
+                if (++p >= sz) return false;
+                ch = buf[p];
+            } while ((uint8_t)(ch - '0') <= 9);
+            if (p - digits_start > MAX_CSI_DIGITS || num_params >= MAX_CSI_PARAMS) return false;
+            csi->params[num_params++] = (int64_t)accumulator;
+            if (ch == ';' || ch == ':') {
+                // An empty param, which is not of this form, is detected by the next iteration
+                if (num_params >= MAX_CSI_PARAMS) return false;
+                csi->is_sub_param[num_params] = ch == ':';
+                p++;
+                if (p >= sz || (uint8_t)(buf[p] - '0') > 9) return false;
+                continue;
+            }
+        } else if (num_params) return false;
+        switch (ch) {
+            case CSI_TRAILER:
+                csi->primary = primary;
+                csi->num_params = num_params;
+                csi->trailer = ch;
+                csi->is_valid = true;
+                if (primary || num_params) csi->state = CSI_BODY;
+                *pos = p + 1;
+                return true;
+            default: return false;
+        }
+    }
+}
+
+#ifdef DUMP_COMMANDS
+extern bool csi_parse_simple_disabled_for_tests;
+#else
+bool csi_parse_simple_disabled_for_tests = false;
+#endif
+
+static bool
 consume_csi(PS *self) {
+    if (self->csi.state == CSI_START && !csi_parse_simple_disabled_for_tests && csi_parse_simple(&self->csi, self->buf, &self->read.pos, self->read.sz))
+        return true;
     return csi_parse_loop(self, &self->csi, self->buf, &self->read.pos, self->read.sz, self->read.consumed);
 }
 
@@ -1163,14 +1224,6 @@ screen_cursor_up2(Screen *s, unsigned int count) {
 static void
 screen_cursor_back1(Screen *s, unsigned int count) {
     screen_cursor_move(s, count, -1, false);
-}
-static void
-screen_tabn(Screen *s, unsigned int count) {
-    for (index_type i = 0; i < MAX(1u, count); i++) {
-        index_type x = s->cursor->x;
-        screen_tab(s);
-        if (s->cursor->x == x) break;
-    }
 }
 
 static const char *
@@ -1447,6 +1500,10 @@ dispatch_csi(PS *self) {
             if (!start_modifier && end_modifier == '*') { CALL_CSI_HANDLER1(screen_decsace, 0); }
             REPORT_ERROR("Unknown CSI x sequence with start and end modifiers: '%c' '%c'", start_modifier, end_modifier);
             break;
+        case 'k':
+            if (end_modifier == ' ' && !start_modifier) { CALL_CSI_HANDLER2(screen_set_bidi_direction, 0, 0); }
+            REPORT_ERROR("Unknown CSI k sequence with start and end modifiers: '%c' '%c'", start_modifier, end_modifier);
+            break;
         case DECSCUSR:
             if (end_modifier == ' ') {
                 if (!start_modifier) { CALL_CSI_HANDLER1M(screen_set_cursor, 1); }
@@ -1516,10 +1573,28 @@ dispatch_csi(PS *self) {
 #include "parse-graphics-command.h"
 
 static void
+parse_glyph_protocol_code(PS *self, uint8_t *buf, size_t bufsz) {
+    GlyphCommand cmd;
+    const char *err = parse_glyph_command(buf, bufsz, &cmd);
+    if (err) {
+        REPORT_ERROR("Ignoring APC escape code that is not a valid glyph protocol message: %s", err);
+        return;
+    }
+#ifdef DUMP_COMMANDS
+    RAII_PyObject(d, glyph_command_as_dict(&cmd, buf));
+    if (d) {
+        REPORT_VA_COMMAND("K s O", self->window_id, "glyph_command", d);
+    } else PyErr_Clear();
+#endif
+    screen_handle_glyph_command(self->screen, &cmd, buf);
+}
+
+static void
 dispatch_apc(PS *self, uint8_t *buf, size_t bufsz, bool is_extended UNUSED) {
     if (bufsz < 2) return;
     switch (buf[0]) {
         case 'G': parse_graphics_code(self, buf, bufsz); break;
+        case '2': parse_glyph_protocol_code(self, buf, bufsz); break;
         default: REPORT_ERROR("Unrecognized APC code: 0x%x", buf[0]); break;
     }
 }
@@ -1567,12 +1642,20 @@ consume_input(PS *self, PyObject *dump_callback UNUSED, id_type window_id UNUSED
 
     switch (self->vte_state) {
         case VTE_NORMAL:
-            consume_normal(self);
+            if (self->buf[self->read.pos] == ESC && self->utf8_decoder.state.cur == UTF8_ACCEPT) {
+                // Escape codes often follow each other directly, avoid calling the UTF-8
+                // decoder for no text. This is what it does on seeing ESC.
+                zero_at_ptr(&self->utf8_decoder.state);
+                self->read.pos++;
+                SET_STATE(ESC);
+            } else consume_normal(self);
             self->read.consumed = self->read.pos;
             break;
         case VTE_ESC:
             if (consume_esc(self)) { self->read.consumed = self->read.pos; }
-            break;
+            // Start parsing a CSI code right away rather than in the next call
+            if (self->vte_state != VTE_CSI || self->read.pos >= self->read.sz) break;
+            /* fallthrough */
         case VTE_CSI:
             if (consume_csi(self)) {
                 self->read.consumed = self->read.pos;
@@ -1611,20 +1694,19 @@ consume_input(PS *self, PyObject *dump_callback UNUSED, id_type window_id UNUSED
 #define with_lock pthread_mutex_lock(&self->lock);
 #define end_with_lock pthread_mutex_unlock(&self->lock);
 
-typedef enum { PENDING_INPUT_NONE, PENDING_INPUT_SMALL, PENDING_INPUT_READY, PENDING_INPUT_HELD } PendingInput;
-
-static PendingInput
-classify_pending_input(const PS *self, monotonic_t now) {
-    // Must be called with the lock held. Both the parser and the I/O thread use this,
-    // so the I/O thread wakes the main loop exactly when the parser will accept the input.
-    size_t pending = self->read.sz + self->write.pending;
-    // A cleared timestamp or bytes before fresh_input_at are a scanned tail the parser left in the buffer
-    if (!self->new_input_at || pending <= self->fresh_input_at) return PENDING_INPUT_NONE;
-    // A chunk this close to the end of the buffer is parsed immediately so a fast
-    // producer cannot fill the buffer and block while input_delay is waiting.
-    if (pending + INPUT_PARSE_FORCE_MARGIN > BUF_SZ) return PENDING_INPUT_READY;
-    if (pending - self->fresh_input_at < SMALL_PENDING_INPUT_THRESHOLD || self->input_chunk == self->accepted_chunk) return PENDING_INPUT_SMALL;
-    return now - self->new_input_at >= OPT(input_delay) ? PENDING_INPUT_READY : PENDING_INPUT_HELD;
+static bool
+compact_buffer(PS *self) {
+    // Must be called with the lock held and with no unmerged pending input. Moves the
+    // unconsumed bytes to the start of the buffer. Bytes the I/O thread is writing
+    // lie beyond read.sz, and vt_parser_commit_write() moves them down when they are
+    // committed. Returns true if the buffer was full, so the I/O thread had stopped reading.
+    if (!self->read.consumed) return false;
+    const bool was_full = self->read.sz >= BUF_SZ;
+    self->read.pos -= MIN(self->read.pos, self->read.consumed);
+    self->read.sz -= MIN(self->read.sz, self->read.consumed);
+    if (self->read.sz) memmove(self->buf, self->buf + self->read.consumed, self->read.sz);
+    self->read.consumed = 0;
+    return was_full;
 }
 
 static void
@@ -1632,39 +1714,39 @@ run_worker(void *p, ParseData *pd, bool flush) {
     Screen *screen = (Screen *)p;
     PS *self = (PS *)screen->vt_parser->state;
     screen->parsing_at = pd->now;
+    bool write_space_created = false;
     with_lock {
         self->read.sz += self->write.pending;
         self->write.pending = 0;
-        pd->has_pending_input = self->read.pos < self->read.sz;
-        if (pd->has_pending_input) {
-            if (flush || classify_pending_input(self, pd->now) != PENDING_INPUT_HELD) {
-                pd->input_read = true;
-                self->dump_callback = pd->dump_callback;
-                self->now = pd->now;
-                self->screen = screen;
-                self->read.consumed = 0;
-                do {
-                    end_with_lock;
-                    // consume all already read input without lock cycling, the
-                    // writer thread only modifies write.pending and buffer space
-                    // beyond read.sz + write.pending
-                    do { consume_input(self, pd->dump_callback, screen->window_id); } while (self->read.pos < self->read.sz);
-                    with_lock;
-                    self->read.sz += self->write.pending;
-                    self->write.pending = 0;
-                } while (self->read.pos < self->read.sz);
-                self->new_input_at = 0;
-                self->fresh_input_at = 0;
-                if (self->read.consumed) {
-                    pd->write_space_created = self->read.sz >= BUF_SZ;
-                    self->read.pos -= MIN(self->read.pos, self->read.consumed);
-                    self->read.sz -= MIN(self->read.sz, self->read.consumed);
-                    if (self->read.sz) memmove(self->buf, self->buf + self->read.consumed, self->read.sz);
-                }
-            }
+        if (self->read.pos < self->read.sz) {
+            pd->input_read = true;
+            self->dump_callback = pd->dump_callback;
+            self->now = pd->now;
+            self->screen = screen;
+            self->read.consumed = 0;
+            size_t parsed = 0;
+            do {
+                const size_t start = self->read.pos;
+                end_with_lock;
+                // consume all already read input without lock cycling, the
+                // writer thread only modifies write.pending and buffer space
+                // beyond read.sz + write.pending
+                do { consume_input(self, pd->dump_callback, screen->window_id); } while (self->read.pos < self->read.sz);
+                with_lock;
+                parsed += self->read.pos - start;
+                self->read.sz += self->write.pending;
+                self->write.pending = 0;
+                // Free the consumed space now rather than at the end of the pass, so that
+                // the I/O thread can keep reading while the rest of the input is parsed.
+                if (self->read.sz >= COMPACT_BUFFER_THRESHOLD && compact_buffer(self)) write_space_created = true;
+            } while (self->read.pos < self->read.sz && (flush || parsed < MAX_INPUT_PER_PARSE_PASS));
+            if (compact_buffer(self)) write_space_created = true;
         }
+        pd->has_pending_input = self->read.pos < self->read.sz;
+        historybuf_finish_writes();
     }
     end_with_lock;
+    if (write_space_created && pd->write_space_created) pd->write_space_created(pd->write_space_created_data);
 }
 
 #ifndef DUMP_COMMANDS
@@ -1702,14 +1784,6 @@ vt_parser_commit_write(Parser *p, size_t sz) {
     PS *self = (PS *)p->state;
     with_lock {
         size_t off = self->read.sz + self->write.pending;
-        // 0 means no unparsed input is waiting. monotonic() can return 0 at startup.
-        // A zero-length commit must not start the clock before any byte arrives.
-        if (sz && self->new_input_at == 0) {
-            monotonic_t stamp = monotonic();
-            self->new_input_at = stamp ? stamp : 1;
-            self->fresh_input_at = off;
-            self->input_chunk++;
-        }
         if (self->write.offset > off) memmove(self->buf + off, self->buf + self->write.offset, sz);
         self->write.pending += sz;
         self->write.sz = 0;
@@ -1726,32 +1800,6 @@ vt_parser_has_space_for_input(const Parser *p) {
     return ans;
 }
 
-ParserInputWake
-vt_parser_input_wake(const Parser *p, monotonic_t now) {
-    PS *self = (PS *)p->state;
-    ParserInputWake ans = {0};
-    with_lock {
-        switch (classify_pending_input(self, now)) {
-            case PENDING_INPUT_NONE: break;
-            case PENDING_INPUT_SMALL: ans.small_pending = true; break;
-            case PENDING_INPUT_READY: ans.large_ready = true; break;
-            case PENDING_INPUT_HELD: ans.large_held_until = self->new_input_at + OPT(input_delay); break;
-        }
-        if (ans.small_pending || ans.large_ready || ans.large_held_until) ans.chunk = self->input_chunk;
-    }
-    end_with_lock;
-    return ans;
-}
-
-void
-vt_parser_accept_input(Parser *p, uint64_t chunk) {
-    PS *self = (PS *)p->state;
-    with_lock {
-        // The chunk may have been parsed already, in which case a later chunk must not be accepted early
-        if (self->new_input_at && self->input_chunk == chunk) self->accepted_chunk = chunk;
-    }
-    end_with_lock;
-}
 #endif
 
 // }}}
@@ -1819,6 +1867,17 @@ static PyMethodDef methods[] = {
     {NULL},
 };
 
+static PyObject *
+test_set_csi_parse_simple(PyObject *self UNUSED, PyObject *val) {
+    csi_parse_simple_disabled_for_tests = !PyObject_IsTrue(val);
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef module_methods[] = {
+    {"test_set_csi_parse_simple", test_set_csi_parse_simple, METH_O, ""},
+    {NULL},
+};
+
 PyTypeObject Parser_Type = {
     PyVarObject_HEAD_INIT(NULL, 0).tp_name = "fast_data_types.Parser",
     .tp_basicsize = sizeof(Parser),
@@ -1863,7 +1922,8 @@ alloc_vt_parser(id_type window_id) {
 #define EXTRA_INIT                                                                                                \
     if (0 != PyModule_AddIntConstant(module, "VT_PARSER_BUFFER_SIZE", BUF_SZ)) return 0;                          \
     if (0 != PyModule_AddIntConstant(module, "VT_PARSER_MAX_ESCAPE_CODE_SIZE", MAX_ESCAPE_CODE_LENGTH)) return 0; \
-    if (!init_simd(module)) return 0;
+    if (!init_simd(module)) return 0;                                                                             \
+    if (PyModule_AddFunctions(module, module_methods) != 0) return 0;
 
 INIT_TYPE(Parser)
 

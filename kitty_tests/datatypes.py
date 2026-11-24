@@ -998,6 +998,13 @@ class TestDataTypes(BaseTest):
         a = []
         hb.as_ansi(a.append)
         self.ae(a, [str(hb.line(i)) + '\n' for i in range(hb.count - 1, -1, -1)])
+        # oldest line first after lines were pushed out of the buffer
+        lb = filled_line_buf(8, 5)
+        for i in range(lb.ynum):
+            hb.push(lb.line(i))
+        a = []
+        hb.as_ansi(a.append)
+        self.ae(a, [str(lb.line(i)) + '\n' for i in range(3, 8)])
 
     def test_strip_csi(self):
         def q(x, y=''):
@@ -1210,6 +1217,19 @@ class TestDataTypes(BaseTest):
         self.ae(s.marked_cells(), [(0, 0, 3), (2, 0, 3), (3, 0, 3)])
         s.set_marker()
         self.ae(s.marked_cells(), [])
+
+        # lines cleared by scrolling must not keep marks
+        s = self.create_screen()
+        for y in range(s.lines):
+            s.draw('a' * s.columns)
+        s.set_marker(marker_from_regex('a', 3))
+        self.ae(len(s.marked_cells()), s.lines * s.columns)
+        s.index()
+        self.ae(len(s.marked_cells()), (s.lines - 1) * s.columns)
+        s.cursor_position(1, 1)
+        s.reverse_index()
+        self.ae(len(s.marked_cells()), (s.lines - 1) * s.columns)
+        self.ae([c for c in s.marked_cells() if c[1] == 0], [])
 
         s = self.create_screen()
         s.draw('aXbX')

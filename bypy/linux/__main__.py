@@ -38,6 +38,7 @@ def binary_includes():
                 'crypto',
                 'crypt',
                 'iconv',
+                'fribidi',
                 'pcre2-8',
                 'graphite2',
                 'glib-2.0',
@@ -125,6 +126,34 @@ def copy_libs(env) -> None:
         x = f'libslang-{x}-0.0.0.so'
         shutil.copy2(os.path.join(LIBDIR, x), env.lib_dir)
     shutil.copy2(os.path.join(BIN, 'slangc'), env.bin_dir)
+
+
+GPU_DRIVERS = {'opengl': 'glsl-', 'vulkan': 'spirv-'}  # driver name -> shader target prefix
+
+
+def check_gpu_drivers(env) -> None:
+    # Both GPU drivers must be part of the build, otherwise kitty silently
+    # falls back to whichever driver is present
+    print('Checking GPU drivers...')
+    ext_dir = os.path.join(env.lib_dir, 'kitty-extensions')
+    for driver in GPU_DRIVERS:
+        path = os.path.join(ext_dir, f'kitty.{driver}.so')
+        if not os.path.isfile(path):
+            raise SystemExit(f'The {driver} GPU driver was not built, {path} does not exist')
+
+
+def check_builtin_shaders(env) -> None:
+    # The built-in shaders must be compiled for the shader targets of both GPU
+    # drivers. They are compiled by build_frozen_tools() so this must be called
+    # after it.
+    print('Checking built-in shaders...')
+    shaders_dir = os.path.join(env.lib_dir, 'kitty', 'shaders')
+    if not os.path.isdir(shaders_dir):
+        raise SystemExit(f'The built-in shaders were not compiled, {shaders_dir} does not exist')
+    for driver, target_prefix in GPU_DRIVERS.items():
+        targets = [x for x in os.listdir(shaders_dir) if x.startswith(target_prefix) and os.path.isfile(os.path.join(shaders_dir, x, 'cell.json'))]
+        if not targets:
+            raise SystemExit(f'The built-in shaders were not compiled for the {driver} GPU driver in {shaders_dir}')
 
 
 def add_ca_certs(env) -> None:
@@ -258,12 +287,14 @@ def main() -> None:
     env = Env(os.path.join(ext_dir, kitty_constants['appname']))
     copy_libs(env)
     copy_python(env)
+    check_gpu_drivers(env)
     iv['build_frozen_launcher']([path_to_freeze_dir(), env.obj_dir])
     files = find_binaries(env)
     fix_permissions(files)
     add_ca_certs(env)
     kitty_exe = os.path.join(env.base, 'bin', 'kitty')
     iv['build_frozen_tools'](kitty_exe)
+    check_builtin_shaders(env)
     if not args.dont_strip:
         strip_binaries(files)
     if not args.skip_tests:

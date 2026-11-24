@@ -20,14 +20,24 @@ import utils;
 struct GammaLUT {
     uniform float gamma_lut[256];
 };
-ConstantBuffer<GammaLUT> glt;
+[[vk::binding(8)]]
+ConstantBuffer<GammaLUT> glt; // binding slots: see SHADER_BINDING_SLOTS in slang.py
 #define gamma_lut glt.gamma_lut
 
 struct Colors {
     uniform uint colors[9];
 };
+[[vk::binding(9)]]
 ConstantBuffer<Colors> clrs;
 #define colors clrs.colors
+
+// The uniform parameters of the program, shared by all its stages. See
+// PUSH_CONSTANTS_MAX_SIZE in slang.py for why they are declared this way.
+struct Params {
+    float background_opacity;
+};
+[[vk::push_constant]]
+ConstantBuffer<Params> uniforms;
 
 // Vertex attributes matching GLSL input locations
 struct VertexInput {
@@ -67,7 +77,7 @@ as_color_vector(uint c, int shift) {
 
 [shader("vertex")]
 VertexOutput
-vertex_main(float4 rect, uint rect_color, uniform float background_opacity, uint vertex_id: SV_VertexID) {
+vertex_main(float4 rect, uint rect_color, uint vertex_id: SV_VertexID) {
     VertexOutput output;
 
     uint2 pos = pos_map[vertex_id];
@@ -86,7 +96,7 @@ vertex_main(float4 rect, uint rect_color, uniform float background_opacity, uint
         abs((float(rc) - ACTIVE_BORDER_COLOR) * (float(rc) - INACTIVE_BORDER_COLOR) * (float(rc) - BELL_BORDER_COLOR) * (float(rc) - TAB_BAR_EDGE_LEFT_COLOR) *
             (float(rc) - TAB_BAR_EDGE_RIGHT_COLOR)));
 
-    float final_opacity = if_one_then(is_not_a_border, background_opacity, 1.);
+    float final_opacity = if_one_then(is_not_a_border, uniforms.background_opacity, 1.);
     output.color_premul = vec4_premul(color3, final_opacity);
 
     return output;

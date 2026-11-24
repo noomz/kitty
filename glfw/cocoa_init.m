@@ -303,9 +303,7 @@ static GLFWapplicationshouldhandlereopenfun handle_reopen_callback = NULL;
     (void)notification;
     _GLFWwindow *window;
 
-    for (window = _glfw.windowListHead; window; window = window->next) {
-        if (window->context.client != GLFW_NO_API) [window->context.nsgl.object update];
-    }
+    for (window = _glfw.windowListHead; window; window = window->next) { _glfwInputNativeSurfaceChanged(window); }
 
     _glfwPollMonitorsNS();
 }
@@ -328,34 +326,6 @@ static GLFWapplicationwillfinishlaunchingfun finish_launching_callback = NULL;
     if (finish_launching_callback) finish_launching_callback(false);
 }
 
-- (BOOL)application:(NSApplication *)sender openFile:(NSString *)filename {
-    (void)sender;
-    if (!filename || !_glfw.ns.url_open_callback) return NO;
-    const char *url = NULL;
-    @try {
-        url = [[[NSURL fileURLWithPath:filename] absoluteString] UTF8String];
-    } @catch (NSException *exc) {
-        NSLog(@"Converting openFile filename: %@ failed with error: %@", filename, exc.reason);
-        return NO;
-    }
-    if (!url) return NO;
-    return _glfw.ns.url_open_callback(url);
-}
-
-- (void)application:(NSApplication *)sender openFiles:(NSArray *)filenames {
-    (void)sender;
-    if (!_glfw.ns.url_open_callback || !filenames) return;
-    for (id x in filenames) {
-        NSString *filename = x;
-        const char *url = NULL;
-        @try {
-            url = [[[NSURL fileURLWithPath:filename] absoluteString] UTF8String];
-        } @catch (NSException *exc) { NSLog(@"Converting openFiles filename: %@ failed with error: %@", filename, exc.reason); }
-        if (url) _glfw.ns.url_open_callback(url);
-    }
-}
-
-// Remove openFile and openFiles when the minimum supported macOS version is 10.13
 - (void)application:(NSApplication *)sender openURLs:(NSArray<NSURL *> *)urls {
     (void)sender;
     if (!_glfw.ns.url_open_callback || !urls) return;
@@ -446,14 +416,9 @@ glfwGetCurrentSystemColorTheme(bool query_if_unintialized) {
 
 
 @interface GLFWApplication : NSApplication
-- (void)tick_callback;
 @end
 
 @implementation GLFWApplication
-- (void)tick_callback {
-    _glfwDispatchTickCallback();
-}
-
 @end
 
 
@@ -811,6 +776,8 @@ glfwSetApplicationWillFinishLaunching(GLFWapplicationwillfinishlaunchingfun call
     return previous;
 }
 
+static void create_tick_source(void);
+
 int
 _glfwPlatformInit(bool *supports_window_occlusion) {
     @autoreleasepool {
@@ -822,6 +789,7 @@ _glfwPlatformInit(bool *supports_window_occlusion) {
         if (NSApp) _glfw.ns.finishedLaunching = true;
 
         [GLFWApplication sharedApplication];
+        create_tick_source();
 
         _glfw.ns.delegate = [[GLFWApplicationDelegate alloc] init];
         if (_glfw.ns.delegate == nil) {
@@ -1034,7 +1002,6 @@ _glfwPlatformTerminate(void) {
             _glfw.ns.appleSettings = nil;
         }
 
-        _glfwTerminateNSGL();
         if (global_shortcuts != nil) {
             [global_shortcuts release];
             global_shortcuts = nil;
@@ -1045,7 +1012,7 @@ _glfwPlatformTerminate(void) {
 
 const char *
 _glfwPlatformGetVersionString(void) {
-    return _GLFW_VERSION_NUMBER " Cocoa NSGL EGL OSMesa"
+    return _GLFW_VERSION_NUMBER " Cocoa"
 #if defined(_GLFW_BUILD_DLL)
                                 " dynamic"
 #endif
@@ -1057,16 +1024,36 @@ static void *tick_callback_data = NULL;
 // Atomic rather than lock protected, as it can be set from other threads at
 // any time, including after the main loop has returned and before they are joined.
 static atomic_bool tick_callback_requested = false;
+// A run loop source rather than performSelectorOnMainThread, which allocates and
+// takes a process wide lock that the main thread also takes to run it, so that it
+// is cheap to request a tick many thousands of times a second. Never released,
+// as other threads can signal it until they are joined.
+static CFRunLoopSourceRef tick_source = NULL;
+static CFRunLoopRef main_run_loop = NULL;
+
+static void
+tick_source_perform(void *info UNUSED) {
+    if (!tick_callback) return;
+    while (atomic_exchange(&tick_callback_requested, false)) tick_callback(tick_callback_data);
+}
+
+static void
+create_tick_source(void) {
+    CFRunLoopSourceContext ctx = {.version = 0, .perform = tick_source_perform};
+    main_run_loop = CFRunLoopGetMain();
+    tick_source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &ctx);
+    CFRunLoopAddSource(main_run_loop, tick_source, kCFRunLoopCommonModes);
+}
 
 static void
 queue_tick_callback(void) {
-    [NSApp performSelectorOnMainThread:@selector(tick_callback) withObject:nil waitUntilDone:NO];
-}
-
-void
-_glfwDispatchTickCallback(void) {
-    if (!tick_callback) return;
-    while (atomic_exchange(&tick_callback_requested, false)) tick_callback(tick_callback_data);
+    CFRunLoopSourceSignal(tick_source);
+    // Wake the run loop even on the main thread, as a source signalled from a
+    // kCFRunLoopBeforeWaiting observer, such as the AppKit display pass that calls
+    // updateLayer, is not checked again before the run loop sleeps. Since
+    // tick_callback_requested stays set until the tick runs, that would also make
+    // every later request, such as from the I/O thread, a no-op.
+    CFRunLoopWakeUp(main_run_loop);
 }
 
 void
@@ -1085,7 +1072,7 @@ void
 _glfwPlatformRunMainLoop(GLFWtickcallback callback, void *data) {
     tick_callback = callback;
     tick_callback_data = data;
-    // A request made while there was no main loop may have had its selector
+    // A request made while there was no main loop may have had its signal
     // consumed without dispatch, so queue it again
     if (atomic_load(&tick_callback_requested)) queue_tick_callback();
     [NSApp run];
@@ -1095,7 +1082,9 @@ _glfwPlatformRunMainLoop(GLFWtickcallback callback, void *data) {
 
 
 typedef struct {
-    NSTimer *os_timer;
+    CFRunLoopTimerRef os_timer;
+    CFAbsoluteTime fire_at;
+    bool armed;
     unsigned long long id;
     bool repeats;
     monotonic_t interval;
@@ -1107,7 +1096,7 @@ typedef struct {
 // Timers live in a growable array. Capacity starts at MIN_TIMERS_CAPACITY,
 // doubles when full and halves when less than a quarter is in use, but never
 // drops below MIN_TIMERS_CAPACITY, so normal usage never reallocates. The
-// NSTimer blocks look up their timer by os_timer and copy it before calling
+// timer callbacks look up their timer by id and copy it before calling
 // the callback, so the array can be safely reallocated by callbacks.
 #define MIN_TIMERS_CAPACITY 64u
 static Timer *timers = NULL;
@@ -1138,7 +1127,10 @@ remove_timer_at(size_t idx) {
         const Timer removed = timers[idx];
         remove_i_from_array(timers, idx, num_timers);
         maybe_shrink_timers();
-        if (removed.os_timer) [removed.os_timer invalidate];
+        if (removed.os_timer) {
+            CFRunLoopTimerInvalidate(removed.os_timer);
+            CFRelease(removed.os_timer);
+        }
         if (removed.callback_data && removed.free_callback_data) removed.free_callback_data(removed.id, removed.callback_data);
     }
 }
@@ -1151,19 +1143,48 @@ remove_all_timers(void) {
     timers_capacity = 0;
 }
 
+// Fire date of a disarmed timer and the interval of all timers. Repeats are done in
+// timer_fired() so that the interval can be changed without creating a new timer,
+// the interval only stops CF from invalidating the timer after it fires.
+#define DISARMED_FIRE_DATE 1e12
+#define OS_TIMER_INTERVAL 1e9
+
 static void
-schedule_timer(Timer *t) {
-    t->os_timer = [NSTimer scheduledTimerWithTimeInterval:monotonic_t_to_s_double(t->interval)
-                                                  repeats:(t->repeats ? YES : NO)block:^(NSTimer *os_timer) {
-                                                    for (size_t i = 0; i < num_timers; i++) {
-                                                        if (timers[i].os_timer == os_timer) {
-                                                            const Timer timer = timers[i];
-                                                            timer.callback(timer.id, timer.callback_data);
-                                                            if (!timer.repeats) _glfwPlatformRemoveTimer(timer.id);
-                                                            break;
-                                                        }
-                                                    }
-                                                  }];
+timer_fired(CFRunLoopTimerRef os_timer, void *info) {
+    const unsigned long long id = (uintptr_t)info;
+    for (size_t i = 0; i < num_timers; i++) {
+        if (timers[i].id == id) {
+            const Timer timer = timers[i];
+            if (timer.repeats) {
+                // Keep to the schedule, like a repeating NSTimer, unless it has fallen
+                // behind or, as CFAbsoluteTime is wall clock time, the clock was set back
+                const CFAbsoluteTime now = CFAbsoluteTimeGetCurrent(), interval = monotonic_t_to_s_double(timer.interval);
+                timers[i].fire_at += interval;
+                if (timers[i].fire_at < now || timers[i].fire_at > now + interval) timers[i].fire_at = now + interval;
+                CFRunLoopTimerSetNextFireDate(os_timer, timers[i].fire_at);
+            } else {
+                CFRunLoopTimerSetNextFireDate(os_timer, DISARMED_FIRE_DATE);
+                timers[i].armed = false;
+            }
+            timer.callback(timer.id, timer.callback_data);
+            if (!timer.repeats) _glfwPlatformRemoveTimer(timer.id);
+            break;
+        }
+    }
+}
+
+static void
+schedule_timer(Timer *t, bool enabled) {
+    if (!enabled && !t->armed) return;
+    const CFAbsoluteTime fire_at = enabled ? CFAbsoluteTimeGetCurrent() + monotonic_t_to_s_double(t->interval) : DISARMED_FIRE_DATE;
+    t->armed = enabled;
+    t->fire_at = fire_at;
+    if (t->os_timer) CFRunLoopTimerSetNextFireDate(t->os_timer, fire_at);
+    else {
+        CFRunLoopTimerContext ctx = {.info = (void *)(uintptr_t)t->id};
+        t->os_timer = CFRunLoopTimerCreate(kCFAllocatorDefault, fire_at, OS_TIMER_INTERVAL, 0, 0, timer_fired, &ctx);
+        CFRunLoopAddTimer(main_run_loop, t->os_timer, kCFRunLoopDefaultMode);
+    }
 }
 
 unsigned long long
@@ -1180,7 +1201,9 @@ _glfwPlatformAddTimer(monotonic_t interval, bool repeats, GLFWuserdatafun callba
     t->callback = callback;
     t->callback_data = callback_data;
     t->free_callback_data = free_callback;
-    schedule_timer(t);
+    t->os_timer = NULL;
+    t->armed = false;
+    schedule_timer(t, true);
     return timer_counter;
 }
 
@@ -1199,12 +1222,8 @@ _glfwPlatformUpdateTimer(unsigned long long timer_id, monotonic_t interval, bool
     for (size_t i = 0; i < num_timers; i++) {
         if (timers[i].id == timer_id) {
             Timer *t = timers + i;
-            if (t->os_timer) {
-                [t->os_timer invalidate];
-                t->os_timer = NULL;
-            }
             t->interval = interval;
-            if (enabled) schedule_timer(t);
+            schedule_timer(t, enabled);
             break;
         }
     }

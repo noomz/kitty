@@ -13,12 +13,14 @@
 typedef struct {
     PyObject_HEAD
 
-        GPUCell *gpu_cell_buf;
+        RenderCell *render_cell_buf;
     CPUCell *cpu_cell_buf;
     index_type xnum, ynum, *line_map, *scratch;
     LineAttrs *line_attrs;
     Line *line;
     TextCache *text_cache;
+    bool bidi_stamped;       // set by the first bidi record written into this buffer, cleared by RIS or when no record is left
+    bool bidi_maybe_unstamp; // a line may have become empty since the last look for a record, see bidi_prepare_live
 } LineBuf;
 
 

@@ -6,6 +6,7 @@
  */
 
 #include "cleanup.h"
+#include "gpu.h"
 #include "dnd.h"
 #include "options/to-c-generated.h"
 #include <math.h>
@@ -544,6 +545,9 @@ cell_size_differs(const OSWindow *os_window, const Screen *screen) {
 static void
 resize_screen(OSWindow *os_window, Screen *screen, bool has_graphics) {
     if (screen) {
+        // Scroll offsets are in pixels so the regions are invalid with a new cell size
+        if (screen->cell_size.height != os_window->fonts_data->fcm.cell_height || screen->cell_size.width != os_window->fonts_data->fcm.cell_width)
+            screen_smooth_scroll_remove_all(screen);
         screen->cell_size.width = os_window->fonts_data->fcm.cell_width;
         screen->cell_size.height = os_window->fonts_data->fcm.cell_height;
         screen_dirty_sprite_positions(screen);
@@ -627,6 +631,9 @@ destroy_os_window_item(OSWindow *w) {
     if (w->persist_fbo_id) free_framebuffer(&w->persist_fbo_id);
     free(w->pointer_map.data);
     zero_at_ptr(&w->pointer_map);
+    if (w->shader_windows.texture) free_texture(&w->shader_windows.texture);
+    free(w->shader_windows.uploaded);
+    zero_at_ptr(&w->shader_windows);
 }
 
 bool
@@ -794,7 +801,7 @@ pyset_borders_rects(PyObject *self UNUSED, PyObject *args) {
         r->left = gl_pos_x(r->px.left, osw->viewport_width);
         r->top = gl_pos_y(r->px.top, osw->viewport_height);
         r->right = r->left + gl_size(r->px.right - r->px.left, osw->viewport_width);
-        r->bottom = r->top - gl_size(r->px.bottom - r->px.top, osw->viewport_height);
+        r->bottom = r->top + gl_size(r->px.bottom - r->px.top, osw->viewport_height);
         r->color = color;
         r->border_type = border_type;
         r->horizontal = horizontal;
@@ -1703,6 +1710,7 @@ PYWRAP0(apply_options_update) {
         get_platform_dependent_config_values(os_window->handle);
         os_window->background_opacity.alpha = OPT(background_opacity);
         set_os_window_chrome(os_window);
+        apply_render_interval_to_os_window(os_window);
         if (!os_window->redraw_count) os_window->redraw_count++;
         for (size_t t = 0; t < os_window->num_tabs; t++) {
             Tab *tab = os_window->tabs + t;

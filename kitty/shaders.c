@@ -6,7 +6,7 @@
  */
 
 #include "fonts.h"
-#include "gl.h"
+#include "gpu.h"
 #include "cleanup.h"
 #include "colors.h"
 #include <stddef.h>
@@ -42,7 +42,9 @@ enum {
 
     NUM_PROGRAMS
 };
-enum { SPRITE_MAP_UNIT, GRAPHICS_UNIT, SPRITE_DECORATIONS_MAP_UNIT, CUSTOM_END_TEXTURE_A_UNIT, CUSTOM_END_TEXTURE_B_UNIT, CUSTOM_END_TEXTURE_PERSIST_UNIT };
+static_assert(NUM_PROGRAMS <= MAX_GPU_PROGRAMS, "Too many GPU programs");
+// The binding slots of textures and uniform blocks come from the program
+// metadata, see SHADER_BINDING_SLOTS in shaders/slang.py
 
 typedef struct UIRenderData {
     unsigned screen_width, screen_height, cell_width, cell_height, screen_left, screen_top, full_framebuffer_width, full_framebuffer_height;
@@ -66,43 +68,47 @@ row_offset_for_screen(const Screen *screen) {
 // Sprites {{{
 typedef struct {
     int xnum, ynum, x, y, z, last_num_of_layers, last_ynum;
-    GLuint texture_id;
-    GLint max_texture_size, max_array_texture_layers;
+    gpu_texture_t texture_id;
+    int32_t max_texture_size, max_array_texture_layers;
     struct decorations_map {
-        GLuint texture_id;
+        gpu_texture_t texture_id;
         unsigned width, height;
         size_t count;
     } decorations_map;
 } SpriteMap;
 
 static const SpriteMap NEW_SPRITE_MAP = {.xnum = 1, .ynum = 1, .last_num_of_layers = 1, .last_ynum = -1};
-static GLint max_texture_size = 0, max_array_texture_layers = 0;
+static int32_t max_texture_size = 0, max_array_texture_layers = 0;
+// The number of bytes per cell in the buffers holding the selection state of
+// cells. The state is a single byte, padded to the vertex input alignment
+// required by the GPU driver, set in initialize_gpu().
+static size_t selection_stride = 1;
 
-static GLfloat
+static float
 srgb_color(uint8_t color) {
     return srgb_lut[color];
 }
 
 static void
-color_vec3(GLint location, color_type color) {
-    glUniform3f(location, srgb_lut[(color >> 16) & 0xFF], srgb_lut[(color >> 8) & 0xFF], srgb_lut[color & 0xFF]);
+color_vec3(int32_t location, color_type color) {
+    param_3f(location, srgb_lut[(color >> 16) & 0xFF], srgb_lut[(color >> 8) & 0xFF], srgb_lut[color & 0xFF]);
 }
 
 static void
-color_vec4_premult(GLint location, color_type color, GLfloat alpha) {
-    glUniform4f(location, srgb_lut[(color >> 16) & 0xFF] * alpha, srgb_lut[(color >> 8) & 0xFF] * alpha, srgb_lut[color & 0xFF] * alpha, alpha);
+color_vec4_premult(int32_t location, color_type color, float alpha) {
+    param_4f(location, srgb_lut[(color >> 16) & 0xFF] * alpha, srgb_lut[(color >> 8) & 0xFF] * alpha, srgb_lut[color & 0xFF] * alpha, alpha);
 }
 
 static void
-color_vec4(GLint location, color_type color, GLfloat alpha) {
-    glUniform4f(location, srgb_lut[(color >> 16) & 0xFF], srgb_lut[(color >> 8) & 0xFF], srgb_lut[color & 0xFF], alpha);
+color_vec4(int32_t location, color_type color, float alpha) {
+    param_4f(location, srgb_lut[(color >> 16) & 0xFF], srgb_lut[(color >> 8) & 0xFF], srgb_lut[color & 0xFF], alpha);
 }
 
 // Write a color into a std140 float4 whose fourth component is unused. Uses
 // the same table as the shaders so the result is identical to converting the
 // color in the shader.
 static void
-linear_color_vec4(GLfloat *dest, color_type color) {
+linear_color_vec4(float *dest, color_type color) {
     dest[0] = srgb_lut[(color >> 16) & 0xFF];
     dest[1] = srgb_lut[(color >> 8) & 0xFF];
     dest[2] = srgb_lut[color & 0xFF];
@@ -112,24 +118,19 @@ linear_color_vec4(GLfloat *dest, color_type color) {
 
 static void
 clear_current_framebuffer(void) {
-    glClearColor(0, 0, 0, 0);
-    glClear(GL_COLOR_BUFFER_BIT);
+    gpu_clear(0, 0, 0, 0);
 }
 
-// Must be called as soon as there is a current OpenGL context, see
+// Must be called as soon as there is an initialized GPU driver, see
 // initialize_gpu(). Font groups are created before that happens and size their
 // sprite layout using these limits, so the sooner they are known the better.
 static void
 query_gpu_texture_limits(void) {
-    if (max_texture_size) return;
-    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &(max_texture_size));
-    glGetIntegerv(GL_MAX_ARRAY_TEXTURE_LAYERS, &(max_array_texture_layers));
-#ifdef __APPLE__
-    // Since on Apple we could have multiple GPUs, with different capabilities,
-    // upper bound the values according to the data from https://developer.apple.com/graphicsimaging/opengl/capabilities/
-    max_texture_size = MIN(8192, max_texture_size);
-    max_array_texture_layers = MIN(512, max_array_texture_layers);
-#endif
+    if (max_texture_size || !gpu_driver.initialized) return;
+    GPUCapabilities caps;
+    gpu_get_capabilities(&caps);
+    max_texture_size = (int32_t)caps.max_texture_size;
+    max_array_texture_layers = (int32_t)caps.max_array_texture_layers;
     sprite_tracker_set_limits(max_texture_size, max_array_texture_layers);
 }
 
@@ -155,127 +156,15 @@ free_sprite_data(FONTS_DATA_HANDLE fg) {
     }
 }
 
-
-static void
-discard_pending_gl_errors(void) {
-    // glad's error checking callback is installed only with --debug-rendering,
-    // so in normal runs errors queue up silently. Drain the queue so that a
-    // subsequent glGetError() reports only what we are interested in.
-    for (unsigned i = 0; i < 16 && glGetError() != GL_NO_ERROR; i++);
+static gpu_texture_t
+create_texture_or_die(const GPUTextureDesc *desc, const GPUPixelData *initial) {
+    gpu_texture_t ans = gpu_texture_create(desc, initial);
+    if (!ans) fatal("Failed to create a GPU texture with error: %s", gpu_last_error());
+    return ans;
 }
 
 static bool
-copy_texture_via_framebuffer(GLuint old_texture, GLuint new_texture, GLenum texture_type, GLint width, GLint height, GLint layers) {
-    GLint prev_read_fbo;
-    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read_fbo);
-    discard_pending_gl_errors();
-    GLuint fbo;
-    glGenFramebuffers(1, &fbo);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
-    bool ok = true;
-    for (GLint z = 0; z < layers && ok; z++) {
-        if (texture_type == GL_TEXTURE_2D_ARRAY) glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, old_texture, 0, z);
-        else glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, old_texture, 0);
-        ok = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-        if (!ok) break;
-        glBindTexture(texture_type, new_texture);
-        if (texture_type == GL_TEXTURE_2D_ARRAY) glCopyTexSubImage3D(texture_type, 0, 0, 0, z, 0, 0, width, height);
-        else glCopyTexSubImage2D(texture_type, 0, 0, 0, 0, 0, width, height);
-        // A complete framebuffer does not mean the copy itself was accepted,
-        // for instance if the two internal formats are not copy compatible.
-        // Without this check we would claim success and leave the new texture
-        // blank, losing every already rendered sprite.
-        ok = glGetError() == GL_NO_ERROR;
-    }
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read_fbo);
-    glDeleteFramebuffers(1, &fbo);
-    if (!ok) glBindTexture(texture_type, old_texture);
-    return ok;
-}
-
-static void
-copy_32bit_texture(GLuint old_texture, GLuint new_texture, GLenum texture_type) {
-    // requires new texture to be at least as big as old texture. Assumes textures are 32bits per pixel
-    GLint width, height, layers;
-    glBindTexture(texture_type, old_texture);
-    glGetTexLevelParameteriv(texture_type, 0, GL_TEXTURE_WIDTH, &width);
-    glGetTexLevelParameteriv(texture_type, 0, GL_TEXTURE_HEIGHT, &height);
-    glGetTexLevelParameteriv(texture_type, 0, GL_TEXTURE_DEPTH, &layers);
-    if (GLAD_GL_ARB_copy_image) {
-        glCopyImageSubData(old_texture, texture_type, 0, 0, 0, 0, new_texture, texture_type, 0, 0, 0, 0, width, height, layers);
-        return;
-    }
-    if (copy_texture_via_framebuffer(old_texture, new_texture, texture_type, width, height, layers)) return;
-
-    static bool copy_image_warned = false;
-    // Neither ARB_copy_image nor a framebuffer copy is usable, do a slow roundtrip copy
-    if (!copy_image_warned) {
-        copy_image_warned = true;
-        log_error("WARNING: Your system's OpenGL implementation cannot copy between textures on the GPU, falling back to a slower implementation");
-    }
-
-    GLint internal_format;
-    glGetTexLevelParameteriv(texture_type, 0, GL_TEXTURE_INTERNAL_FORMAT, &internal_format);
-    GLenum format, type;
-    switch (internal_format) {
-        case GL_R8UI:
-        case GL_R8I:
-        case GL_R16UI:
-        case GL_R16I:
-        case GL_R32UI:
-        case GL_R32I:
-        case GL_RG8UI:
-        case GL_RG8I:
-        case GL_RG16UI:
-        case GL_RG16I:
-        case GL_RG32UI:
-        case GL_RG32I:
-        case GL_RGB8UI:
-        case GL_RGB8I:
-        case GL_RGB16UI:
-        case GL_RGB16I:
-        case GL_RGB32UI:
-        case GL_RGB32I:
-        case GL_RGBA8UI:
-        case GL_RGBA8I:
-        case GL_RGBA16UI:
-        case GL_RGBA16I:
-        case GL_RGBA32UI:
-        case GL_RGBA32I:
-            format = GL_RED_INTEGER;
-            type = GL_UNSIGNED_INT;
-            break;
-        default:
-            format = GL_RGBA;
-            type = GL_UNSIGNED_INT_8_8_8_8;
-            break;
-    }
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    RAII_ALLOC(uint8_t, pixels, malloc((size_t)width * height * layers * 4u));
-    if (!pixels) fatal("Out of memory");
-    glGetTexImage(texture_type, 0, format, type, pixels);
-    glBindTexture(texture_type, new_texture);
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    if (texture_type == GL_TEXTURE_2D_ARRAY) glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, width, height, layers, format, type, pixels);
-    else glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, format, type, pixels);
-}
-
-static GLuint
-setup_new_sprites_texture(GLenum texture_type) {
-    GLuint tex;
-    glGenTextures(1, &tex);
-    glBindTexture(texture_type, tex);
-    // We use GL_NEAREST otherwise glyphs that touch the edge of the cell
-    // often show a border between cells
-    glTexParameteri(texture_type, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(texture_type, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(texture_type, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(texture_type, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    return tex;
-}
-
-static bool
-decorations_map_new_size(size_t count, size_t current_capacity, size_t max_size, GLint *width, GLint *height) {
+decorations_map_new_size(size_t count, size_t current_capacity, size_t max_size, int32_t *width, int32_t *height) {
     const size_t max_capacity = max_size * max_size;
     if (count >= max_capacity) return false;
     size_t capacity = MAX(MAX(count + 256, current_capacity * 2), (size_t)4096);
@@ -296,17 +185,18 @@ realloc_sprite_decorations_texture_if_needed(FONTS_DATA_HANDLE fg) {
     SpriteMap *sm = (SpriteMap *)fg->sprite_map;
     size_t current_capacity = (size_t)dm.width * dm.height;
     if (dm.count < current_capacity && dm.texture_id) return;
-    GLint width, height;
+    int32_t width, height;
     if (!decorations_map_new_size(dm.count, current_capacity, sm->max_texture_size, &width, &height))
-        fatal("Max texture size too small for sprite decorations map, maybe switch to using a GL_TEXTURE_2D_ARRAY");
-    const GLenum texture_type = GL_TEXTURE_2D;
-    GLuint tex = setup_new_sprites_texture(texture_type);
-    glTexImage2D(texture_type, 0, GL_R32UI, width, height, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+        fatal("Max texture size too small for sprite decorations map, maybe switch to using a GPU_TEXTURE_2D_ARRAY");
+    // We use nearest filtering otherwise glyphs that touch the edge of the cell
+    // often show a border between cells
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D, .format = GPU_FORMAT_R32UI, .width = width, .height = height, .filter = GPU_FILTER_NEAREST, .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+    gpu_texture_t tex = create_texture_or_die(&desc, NULL);
     if (dm.texture_id) { // copy data from old texture
-        copy_32bit_texture(dm.texture_id, tex, texture_type);
+        gpu_texture_copy(dm.texture_id, tex);
         free_texture(&dm.texture_id);
     }
-    glBindTexture(texture_type, 0);
     dm.texture_id = tex;
     dm.width = width;
     dm.height = height;
@@ -321,17 +211,35 @@ realloc_sprite_texture(FONTS_DATA_HANDLE fg) {
     SpriteMap *sprite_map = (SpriteMap *)fg->sprite_map;
     width = xnum * fg->fcm.cell_width;
     height = ynum * (fg->fcm.cell_height + 1);
-    const GLenum texture_type = GL_TEXTURE_2D_ARRAY;
-    GLuint tex = setup_new_sprites_texture(texture_type);
-    glTexStorage3D(texture_type, 1, GL_SRGB8_ALPHA8, width, height, znum);
+    // We use nearest filtering otherwise glyphs that touch the edge of the cell
+    // often show a border between cells
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D_ARRAY,
+        .format = GPU_FORMAT_SRGB8_ALPHA8,
+        .width = width,
+        .height = height,
+        .layers = znum,
+        .filter = GPU_FILTER_NEAREST,
+        .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+    gpu_texture_t tex = create_texture_or_die(&desc, NULL);
     if (sprite_map->texture_id) { // copy old texture data into new texture
-        copy_32bit_texture(sprite_map->texture_id, tex, texture_type);
+        gpu_texture_copy(sprite_map->texture_id, tex);
         free_texture(&sprite_map->texture_id);
     }
-    glBindTexture(texture_type, 0);
     sprite_map->last_num_of_layers = znum;
     sprite_map->last_ynum = ynum;
     sprite_map->texture_id = tex;
+}
+
+static void
+bind_sprite_map(const SpriteMap *sprite_map) {
+    // The sprite textures are bound once and used by all the cell programs,
+    // which share the same layout. They have binding slots distinct from those
+    // of every other program, so drawing images in between does not displace them.
+    uint32_t slot;
+    // The cell programs are compiled only once the first OS window is created
+    if (try_program_texture_slot(CELL_PROGRAM, "sprite_decorations_map", &slot)) gpu_bind_texture(slot, sprite_map->decorations_map.texture_id);
+    if (try_program_texture_slot(CELL_PROGRAM, "sprites", &slot)) gpu_bind_texture(slot, sprite_map->texture_id);
 }
 
 static void
@@ -341,10 +249,7 @@ ensure_sprite_map(FONTS_DATA_HANDLE fg) {
     if (!sprite_map->decorations_map.texture_id) realloc_sprite_decorations_texture_if_needed(fg);
     // We have to rebind since we don't know if the texture was ever bound
     // in the context of the current OSWindow
-    glActiveTexture(GL_TEXTURE0 + SPRITE_DECORATIONS_MAP_UNIT);
-    glBindTexture(GL_TEXTURE_2D, sprite_map->decorations_map.texture_id);
-    glActiveTexture(GL_TEXTURE0 + SPRITE_MAP_UNIT);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->texture_id);
+    bind_sprite_map(sprite_map);
 }
 
 void
@@ -357,46 +262,49 @@ send_sprite_to_gpu(FONTS_DATA_HANDLE fg, sprite_index idx, pixel *buf, sprite_in
     div_t d = div(idx, dm.width);
     x = d.rem;
     y = d.quot;
-    glActiveTexture(GL_TEXTURE0 + SPRITE_DECORATIONS_MAP_UNIT);
-    glBindTexture(GL_TEXTURE_2D, dm.texture_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &decoration_idx);
+    const GPUPixelData decoration_pixels = {.layout = GPU_PIXELS_R32UI, .row_alignment = 4, .data = &decoration_idx};
+    gpu_texture_upload(dm.texture_id, x, y, 0, 1, 1, &decoration_pixels);
 #undef dm
     sprite_tracker_current_layout(fg, &xnum, &ynum, &znum);
     if ((int)znum >= sprite_map->last_num_of_layers || (znum == 0 && (int)ynum > sprite_map->last_ynum)) {
         realloc_sprite_texture(fg);
         sprite_tracker_current_layout(fg, &xnum, &ynum, &znum);
     }
-    glActiveTexture(GL_TEXTURE0 + SPRITE_MAP_UNIT);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, sprite_map->texture_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     sprite_index_to_pos(idx, xnum, ynum, &x, &y, &z);
     x *= fg->fcm.cell_width;
     y *= (fg->fcm.cell_height + 1);
-    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, x, y, z, fg->fcm.cell_width, fg->fcm.cell_height + 1, 1, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, buf);
+    const GPUPixelData sprite_pixels = {.layout = GPU_PIXELS_RGBA8_PACKED, .row_alignment = 4, .data = buf};
+    gpu_texture_upload(sprite_map->texture_id, x, y, z, fg->fcm.cell_width, fg->fcm.cell_height + 1, &sprite_pixels);
+    // Sprites are sent while preparing to render, after ensure_sprite_map(),
+    // and the sprite textures may have been re-allocated, so rebind them.
+    bind_sprite_map(sprite_map);
+}
+
+static void
+define_texture(gpu_texture_t *tex_id, const GPUTextureDesc *desc, const GPUPixelData *pixels) {
+    if (*tex_id) {
+        if (!gpu_texture_reset(*tex_id, desc, pixels)) fatal("Failed to re-allocate GPU texture with error: %s", gpu_last_error());
+    } else *tex_id = create_texture_or_die(desc, pixels);
 }
 
 void
-send_image_to_gpu(GLuint *tex_id, const void *data, GLsizei width, GLsizei height, bool is_opaque, bool is_4byte_aligned, bool linear, RepeatStrategy repeat) {
-    if (!(*tex_id)) { glGenTextures(1, tex_id); }
-    glBindTexture(GL_TEXTURE_2D, *tex_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, is_4byte_aligned ? 4 : 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-    RepeatStrategy r;
+send_image_to_gpu(
+    gpu_texture_t *tex_id, const void *data, int32_t width, int32_t height, bool is_opaque, bool is_4byte_aligned, bool linear, RepeatStrategy repeat) {
+    GPUWrap wrap;
     switch (repeat) {
-        case REPEAT_MIRROR: r = GL_MIRRORED_REPEAT; break;
-        case REPEAT_CLAMP: {
-            static const GLfloat border_color[4] = {0};
-            glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border_color);
-            r = GL_CLAMP_TO_BORDER;
-            break;
-        }
-        default: r = GL_REPEAT;
+        case REPEAT_MIRROR: wrap = GPU_WRAP_MIRRORED_REPEAT; break;
+        case REPEAT_CLAMP: wrap = GPU_WRAP_CLAMP_TO_BORDER; break;
+        default: wrap = GPU_WRAP_REPEAT;
     }
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, r);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, r);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB_ALPHA, width, height, 0, is_opaque ? GL_RGB : GL_RGBA, GL_UNSIGNED_BYTE, data);
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D,
+        .format = GPU_FORMAT_SRGB8_ALPHA8,
+        .width = width,
+        .height = height,
+        .filter = linear ? GPU_FILTER_LINEAR : GPU_FILTER_NEAREST,
+        .wrap = wrap};
+    const GPUPixelData pixels = {.layout = is_opaque ? GPU_PIXELS_RGB8 : GPU_PIXELS_RGBA8, .row_alignment = is_4byte_aligned ? 4 : 1, .data = data};
+    define_texture(tex_id, &desc, &pixels);
 }
 
 // Indexed color images are stored as integer textures with the palette index
@@ -404,16 +312,17 @@ send_image_to_gpu(GLuint *tex_id, const void *data, GLsizei width, GLsizei heigh
 // Integer textures cannot be filtered, the shader does its own filtering after
 // the palette lookup.
 void
-send_indexed_image_to_gpu(GLuint *tex_id, const void *data, GLsizei width, GLsizei height, unsigned bytes_per_pixel, bool is_4byte_aligned) {
-    if (!(*tex_id)) { glGenTextures(1, tex_id); }
-    glBindTexture(GL_TEXTURE_2D, *tex_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, is_4byte_aligned ? 4 : 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+send_indexed_image_to_gpu(gpu_texture_t *tex_id, const void *data, int32_t width, int32_t height, unsigned bytes_per_pixel, bool is_4byte_aligned) {
     const bool has_alpha = bytes_per_pixel == 2;
-    glTexImage2D(GL_TEXTURE_2D, 0, has_alpha ? GL_RG8UI : GL_R8UI, width, height, 0, has_alpha ? GL_RG_INTEGER : GL_RED_INTEGER, GL_UNSIGNED_BYTE, data);
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D,
+        .format = has_alpha ? GPU_FORMAT_RG8UI : GPU_FORMAT_R8UI,
+        .width = width,
+        .height = height,
+        .filter = GPU_FILTER_NEAREST,
+        .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+    const GPUPixelData pixels = {.layout = has_alpha ? GPU_PIXELS_RG8 : GPU_PIXELS_R8, .row_alignment = is_4byte_aligned ? 4 : 1, .data = data};
+    define_texture(tex_id, &desc, &pixels);
 }
 
 // }}}
@@ -431,7 +340,6 @@ thickness_as_float(const OSWindow *os_window, unsigned level) {
 static void
 draw_rounded_rect(
     Viewport rect,
-    unsigned framebuffer_height,
     float thickness,
     unsigned corner_radius_px,
     color_type srgb_color,
@@ -440,14 +348,12 @@ draw_rounded_rect(
     color_type srgb_outer,
     float outer_alpha) {
     bind_program(ROUNDED_RECT_PROGRAM);
-    color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "color"), srgb_color, 1.f);
-    color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "background_color"), srgb_background, bg_alpha);
-    color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "outer_color"), srgb_outer, outer_alpha);
-    // y co-ord has to be changed to co-ord system with origin at bottom left
-    float y = (float)framebuffer_height - (float)(rect.top + rect.height);
-    glUniform4f(program_uniform_location(ROUNDED_RECT_PROGRAM, "rect"), rect.left, y, rect.width, rect.height);
-    glUniform2f(program_uniform_location(ROUNDED_RECT_PROGRAM, "params"), thickness, corner_radius_px);
-    save_viewport_using_top_left_origin(rect.left, rect.top, rect.width, rect.height, framebuffer_height);
+    color_vec4(program_param(ROUNDED_RECT_PROGRAM, "color"), srgb_color, 1.f);
+    color_vec4(program_param(ROUNDED_RECT_PROGRAM, "background_color"), srgb_background, bg_alpha);
+    color_vec4(program_param(ROUNDED_RECT_PROGRAM, "outer_color"), srgb_outer, outer_alpha);
+    param_2f(program_param(ROUNDED_RECT_PROGRAM, "size"), rect.width, rect.height);
+    param_2f(program_param(ROUNDED_RECT_PROGRAM, "params"), thickness, corner_radius_px);
+    save_viewport(rect.left, rect.top, rect.width, rect.height);
     draw_quad(true, 0);
     restore_viewport();
 }
@@ -455,7 +361,6 @@ draw_rounded_rect(
 
 // Cell {{{
 
-enum { CELL_RENDER_DATA_BINDING_POINT = 0, COLOR_TABLE_BINDING_POINT = 1, BORDER_COLORS_BINDING_POINT = 2, CUSTOM_END_DATA_BINDING_POINT = 3 };
 enum { BORDER_COLORS_GLOBAL_BUFFER };
 // VAOs used only to hold buffers for UBOs that are shared amongst programs/windows,
 // their vertex attribute/array facilities are unused.
@@ -492,6 +397,7 @@ typedef struct CustomShaderPipeline {
     size_t num_groups;
     bool active;
     bool bypass_builtin_trail;                      // true when any group subscribes to cursor-trail-move
+    bool bypass_builtin_progress_bar;               // true when any group subscribes to progress-start
     ShaderAnimEventMask all_animation_start_events; // union of the start and toggle events of all groups
     bool has_pointer_map;                           // true when a shader defines pointer_map() to move pointer events
     uint32_t pointer_map_groups;                    // bitmask of the groups with shaders whose pointer_map() is used
@@ -508,14 +414,15 @@ static struct {
 } custom_shaders;
 
 static struct {
-    GLuint texture_id, framebuffer_id;
+    gpu_texture_t texture_id;
+    gpu_render_target_t framebuffer_id;
 } pointer_map_target;
 
 static void
-write_uint_array_to_ubo(void *dest, const GLuint *src, size_t count, const ArrayInformation *ai) {
-    GLint stride = MAX((GLint)sizeof(GLuint), ai->stride);
+write_uint_array_to_ubo(void *dest, const uint32_t *src, size_t count, const ArrayInformation *ai) {
+    int32_t stride = MAX((int32_t)sizeof(uint32_t), ai->stride);
     uint8_t *buf = (uint8_t *)dest + ai->offset;
-    for (size_t i = 0; i < count; i++, buf += stride) memcpy(buf, src + i, sizeof(GLuint));
+    for (size_t i = 0; i < count; i++, buf += stride) memcpy(buf, src + i, sizeof(uint32_t));
 }
 
 // The gamma LUT is a compile time constant that lives in the default uniform
@@ -530,11 +437,11 @@ write_uint_array_to_ubo(void *dest, const GLuint *src, size_t count, const Array
 // See https://github.com/kovidgoyal/kitty/issues/10571
 void
 upload_gamma_lut(void) {
-#define U(program)                                                    \
-    {                                                                 \
-        bind_program(program);                                        \
-        GLint loc = program_uniform_location(program, "gamma_lut");   \
-        if (loc >= 0) glUniform1fv(loc, arraysz(srgb_lut), srgb_lut); \
+#define U(program)                                                       \
+    {                                                                    \
+        bind_program(program);                                           \
+        int32_t loc = program_param(program, "gamma_lut");               \
+        if (loc >= 0) param_floats(loc, 1, arraysz(srgb_lut), srgb_lut); \
     }
     for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) U(i);
     U(BORDERS_PROGRAM);
@@ -547,13 +454,6 @@ upload_gamma_lut(void) {
 
 static void
 init_cell_program(void) {
-    for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) {
-        UniformBlock crd = program_uniform_block(i, "CellRenderData");
-        glUniformBlockBinding(program_id(i), crd.index, CELL_RENDER_DATA_BINDING_POINT);
-        UniformBlock ct = program_uniform_block(i, "ColorTable");
-        glUniformBlockBinding(program_id(i), ct.index, COLOR_TABLE_BINDING_POINT);
-    }
-
     // Sanity check to ensure the attribute location binding worked
 #define C(p, name, expected)                                                                                                             \
     {                                                                                                                                    \
@@ -561,43 +461,33 @@ init_cell_program(void) {
         if (aloc != expected && aloc != -1) fatal("The attribute location for %s is %d != %d in program: %d", #name, aloc, expected, p); \
     }
     for (int p = CELL_PROGRAM; p < CELL_PROGRAM_SENTINEL; p++) {
-        C(p, colors, 0);
-        C(p, sprite_idx, 1);
+        C(p, cell_input, 0);
         C(p, is_selected, 2);
         C(p, decorations_sprite_map, 3);
     }
 #undef C
     UniformBlock border_colors = program_uniform_block(BORDERS_PROGRAM, "Colors");
-    glUniformBlockBinding(program_id(BORDERS_PROGRAM), border_colors.index, BORDER_COLORS_BINDING_POINT);
 
-    // The padding program shares the cell background computation and so uses the
-    // same uniform blocks bound to the same binding points as the cell programs.
-    {
-        UniformBlock crd = program_uniform_block(PADDING_PROGRAM, "CellRenderData");
-        glUniformBlockBinding(program_id(PADDING_PROGRAM), crd.index, CELL_RENDER_DATA_BINDING_POINT);
-        UniformBlock ct = program_uniform_block(PADDING_PROGRAM, "ColorTable");
-        glUniformBlockBinding(program_id(PADDING_PROGRAM), ct.index, COLOR_TABLE_BINDING_POINT);
-    }
 #define C(name, expected)                                                                                                                     \
     {                                                                                                                                         \
         int aloc = attrib_location(PADDING_PROGRAM, #name);                                                                                   \
         if (aloc != expected && aloc != -1) fatal("The attribute location for %s is %d != %d in the padding program", #name, aloc, expected); \
     }
-    C(colors, 0);
-    C(sprite_idx, 1);
+    C(cell_input, 0);
     C(is_selected, 2);
 #undef C
-    // Indexed color images get their colors from the color table of the window they are in
-    for (int i = GRAPHICS_INDEXED_PROGRAM; i <= GRAPHICS_INDEXED_UNSCALED_PROGRAM; i++) {
-        UniformBlock ct = program_uniform_block(i, "ColorTable");
-        glUniformBlockBinding(program_id(i), ct.index, COLOR_TABLE_BINDING_POINT);
+    // The sprite textures are bound once for all cell programs, see bind_sprite_map()
+    for (int i = CELL_PROGRAM + 1; i < CELL_PROGRAM_SENTINEL; i++) {
+        uint32_t a, b;
+        if (try_program_texture_slot(i, "sprites", &a) && (!try_program_texture_slot(CELL_PROGRAM, "sprites", &b) || a != b))
+            fatal("The cell programs use different binding slots for the sprites texture");
     }
 
     if (shader_globals_vao_idx == -1) {
         shader_globals_vao_idx = create_vao();
-        add_buffer_to_vao(shader_globals_vao_idx, GL_UNIFORM_BUFFER);
+        add_buffer_to_vao(shader_globals_vao_idx, GPU_BUFFER_UNIFORM);
         // The border colors change on every draw, but are shared amongst all border VAOs (only one is ever drawn at a time)
-        alloc_vao_buffer(shader_globals_vao_idx, border_colors.size, BORDER_COLORS_GLOBAL_BUFFER, GL_STREAM_DRAW);
+        alloc_vao_buffer(shader_globals_vao_idx, border_colors.size, BORDER_COLORS_GLOBAL_BUFFER, GPU_UPDATE_EVERY_USE);
     }
     upload_gamma_lut();
     bind_shader_globals_to_current_context();
@@ -742,23 +632,12 @@ static void
 init_custom_programs(void) {
     custom_shaders.count = 0;
     for (int i = CUSTOM_END_PROGRAM; i < NUM_PROGRAMS; i++) {
-        Program *p = program_ptr(i);
-        if (p && p->id) {
+        if (program_pipeline(i)) {
             custom_shaders.count++;
             if (i == CUSTOM_END_PROGRAM) {
                 bind_program(i);
-                glUniform1i(program_uniform_location(i, "backbuffer"), GRAPHICS_UNIT);
-#define set_optional_sampler(name, unit)                   \
-    {                                                      \
-        GLint loc = try_program_uniform_location(i, name); \
-        if (loc >= 0) glUniform1i(loc, unit);              \
-    }
-                set_optional_sampler("a", CUSTOM_END_TEXTURE_A_UNIT);
-                set_optional_sampler("b", CUSTOM_END_TEXTURE_B_UNIT);
-                set_optional_sampler("persist", CUSTOM_END_TEXTURE_PERSIST_UNIT);
-#undef set_optional_sampler
-                GLint group_loc = try_program_uniform_location(i, "group");
-                if (group_loc >= 0) glUniform1i(group_loc, 0);
+                int32_t group_loc = try_program_param(i, "group");
+                if (group_loc >= 0) param_1i(group_loc, 0);
                 else if (custom_shaders.end.num_groups > 1) {
                     // Every group is dispatched by setting this uniform, so without it
                     // all of them render as group zero, which for a multi pass pipeline
@@ -769,11 +648,10 @@ init_custom_programs(void) {
                         custom_shaders.end.num_groups);
                 }
                 UniformBlock ubd = program_uniform_block(i, "KittyCustomShaderData");
-                glUniformBlockBinding(program_id(i), ubd.index, CUSTOM_END_DATA_BINDING_POINT);
                 if (custom_end_vao_idx == -1) {
                     custom_end_vao_idx = create_vao();
-                    add_buffer_to_vao(custom_end_vao_idx, GL_UNIFORM_BUFFER);
-                    alloc_vao_buffer(custom_end_vao_idx, ubd.size, 0, GL_STREAM_DRAW);
+                    add_buffer_to_vao(custom_end_vao_idx, GPU_BUFFER_UNIFORM);
+                    alloc_vao_buffer(custom_end_vao_idx, ubd.size, 0, GPU_UPDATE_EVERY_USE);
                 }
             }
         }
@@ -802,6 +680,9 @@ init_custom_programs(void) {
         // after shader compilation (the focus-in event fired before shaders were
         // compiled and was consumed without being processed).
         if (osw->is_focused) record_os_window_focus_change_for_shaders(osw, true);
+        // Similarly, make progress-start fire on the first render if progress
+        // bars are already being shown
+        osw->progress_bar_visible = false;
     }
     debug_rendering(
         "Custom shaders: %zu program(s), %zu group(s), textures_mask=0x%x, initially_active=%d\n",
@@ -859,6 +740,8 @@ shader_anim_event_mask_str(ShaderAnimEventMask mask) {
         {1u << SHADER_ANIM_EVENT_COMMAND_FINISH, "command-finish"},
         {1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_ENTER, "alternate-screen-enter"},
         {1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_EXIT, "alternate-screen-exit"},
+        {1u << SHADER_ANIM_EVENT_PROGRESS_START, "progress-start"},
+        {1u << SHADER_ANIM_EVENT_PROGRESS_STOP, "progress-stop"},
     };
     bool first = true;
     for (size_t i = 0; i < sizeof(events) / sizeof(events[0]); i++) {
@@ -1042,34 +925,49 @@ custom_shader_needs_render(const ShaderAnimState *before, const ShaderAnimState 
 void
 bind_shader_globals_to_current_context(void) {
     if (shader_globals_vao_idx == -1) return;
-    bind_vao_uniform_buffer(shader_globals_vao_idx, BORDER_COLORS_GLOBAL_BUFFER, BORDER_COLORS_BINDING_POINT);
+    bind_vao_uniform_buffer(shader_globals_vao_idx, BORDER_COLORS_GLOBAL_BUFFER, program_uniform_block(BORDERS_PROGRAM, "Colors").slot);
 }
 
-#define CELL_BUFFERS enum { cell_data_buffer, selection_buffer, uniform_buffer, color_table_buffer, padding_cell_data_buffer, padding_selection_buffer };
+#define REGION_UNIFORM_BUFFER_BASE 6
+#define CELL_BUFFERS                                       \
+    enum {                                                 \
+        cell_data_buffer,                                  \
+        selection_buffer,                                  \
+        uniform_buffer,                                    \
+        color_table_buffer,                                \
+        padding_cell_data_buffer,                          \
+        padding_selection_buffer,                          \
+        region_uniform_buffer = REGION_UNIFORM_BUFFER_BASE \
+    }; /* followed by MAX_SMOOTH_SCROLL_REGIONS uniform buffers for the passes drawing the shifted smooth scroll regions */
 
 ssize_t
 create_cell_vao(void) {
+    CELL_BUFFERS;
+    static_assert(padding_selection_buffer + 1 == region_uniform_buffer, "Fix REGION_UNIFORM_BUFFER_BASE");
     ssize_t vao_idx = create_vao();
 #define A(name, size, dtype, offset, stride) \
     add_attribute_to_vao(                    \
         vao_idx, program_attribute_location(CELL_PROGRAM, name), /*size=*/size, /*dtype=*/dtype, /*stride=*/stride, /*offset=*/offset, /*divisor=*/1);
-#define A1(name, size, dtype, offset) A(name, size, dtype, (void *)(offsetof(GPUCell, offset)), sizeof(GPUCell))
 
-    add_buffer_to_vao(vao_idx, GL_ARRAY_BUFFER);
-    A1("sprite_idx", 2, GL_UNSIGNED_INT, sprite_idx);
-    A1("colors", 3, GL_UNSIGNED_INT, fg);
+    add_buffer_to_vao(vao_idx, GPU_BUFFER_VERTEX);
+    A("cell_input", 2, GPU_ATTRIB_U32, 0, sizeof(CellGPUData));
 
-    add_buffer_to_vao(vao_idx, GL_ARRAY_BUFFER);
-    A("is_selected", 1, GL_UNSIGNED_BYTE, NULL, 0);
+    add_buffer_to_vao(vao_idx, GPU_BUFFER_VERTEX);
+    A("is_selected", 1, GPU_ATTRIB_U8, 0, (uint32_t)selection_stride);
 
-    size_t bufnum = add_buffer_to_vao(vao_idx, GL_UNIFORM_BUFFER);
-    alloc_vao_buffer(vao_idx, program_uniform_block(CELL_PROGRAM, "CellRenderData").size, bufnum, GL_STREAM_DRAW);
+    size_t bufnum = add_buffer_to_vao(vao_idx, GPU_BUFFER_UNIFORM);
+    alloc_vao_buffer(vao_idx, program_uniform_block(CELL_PROGRAM, "CellRenderData").size, bufnum, GPU_UPDATE_EVERY_USE);
 
-    size_t ctbufnum = add_buffer_to_vao(vao_idx, GL_UNIFORM_BUFFER);
-    alloc_vao_buffer(vao_idx, program_uniform_block(CELL_PROGRAM, "ColorTable").size, ctbufnum, GL_STATIC_DRAW);
+    size_t ctbufnum = add_buffer_to_vao(vao_idx, GPU_BUFFER_UNIFORM);
+    alloc_vao_buffer(vao_idx, program_uniform_block(CELL_PROGRAM, "ColorTable").size, ctbufnum, GPU_UPDATE_RARELY);
 
-    add_buffer_to_vao(vao_idx, GL_ARRAY_BUFFER); // padding_cell_data_buffer (slot 4)
-    add_buffer_to_vao(vao_idx, GL_ARRAY_BUFFER); // padding_selection_buffer  (slot 5)
+    add_buffer_to_vao(vao_idx, GPU_BUFFER_VERTEX); // padding_cell_data_buffer (slot 4)
+    add_buffer_to_vao(vao_idx, GPU_BUFFER_VERTEX); // padding_selection_buffer  (slot 5)
+    // The uniform buffers for drawing the shifted smooth scroll regions, see draw_smooth_scroll_regions()
+    for (unsigned i = 0; i < MAX_SMOOTH_SCROLL_REGIONS; i++) {
+        size_t rb = add_buffer_to_vao(vao_idx, GPU_BUFFER_UNIFORM);
+        alloc_vao_buffer(vao_idx, program_uniform_block(CELL_PROGRAM, "CellRenderData").size, rb, GPU_UPDATE_EVERY_USE);
+    }
 
     return vao_idx;
 #undef A
@@ -1151,28 +1049,32 @@ cell_update_uniform_block(
         // space so the vertex shader does not do a gamma LUT lookup for them
         // once per vertex. These must come first and the fourth component of
         // each is unused padding, see CellRenderData in background.slang.
-        GLfloat default_fg_lin[4], default_bg_lin[4], highlight_fg_lin[4], highlight_bg_lin[4];
-        GLfloat main_cursor_fg_lin[4], main_cursor_bg_lin[4], url_color_lin[4];
-        GLfloat extra_cursor_fg_lin[4], extra_cursor_bg_lin[4];
+        float default_fg_lin[4], default_bg_lin[4], highlight_fg_lin[4], highlight_bg_lin[4];
+        float main_cursor_fg_lin[4], main_cursor_bg_lin[4], url_color_lin[4];
+        float extra_cursor_fg_lin[4], extra_cursor_bg_lin[4];
+        // The rectangles [x1, y1, x2, y2) of cells that are not drawn as they
+        // are drawn shifted by the passes for the smooth scroll regions
+        uint32_t skip_rects[MAX_SMOOTH_SCROLL_REGIONS][4];
 
-        GLfloat use_cell_bg_for_selection_fg, use_cell_fg_for_selection_color, use_cell_for_selection_bg;
+        float use_cell_bg_for_selection_fg, use_cell_fg_for_selection_color, use_cell_for_selection_bg;
 
-        GLuint default_fg, url_style, inverted, main_cursor_is_special, extra_cursor_fg, extra_cursor_bg;
+        uint32_t default_fg, url_style, inverted, main_cursor_is_special, extra_cursor_fg, extra_cursor_bg;
 
-        GLuint columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
-        GLuint cursor_x1, cursor_x2, cursor_y1, cursor_y2;
-        GLfloat cursor_opacity, inactive_text_alpha, fg_override_threshold, row_offset, dim_opacity, blink_opacity;
+        uint32_t columns, lines, sprites_xnum, sprites_ynum, cursor_shape, cell_width, cell_height;
+        uint32_t cursor_x1, cursor_x2, cursor_y1, cursor_y2;
+        float cursor_opacity, inactive_text_alpha, fg_override_threshold, row_offset, dim_opacity, blink_opacity;
 
-        GLuint bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
-        GLfloat bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
+        uint32_t bg_colors0, bg_colors1, bg_colors2, bg_colors3, bg_colors4, bg_colors5, bg_colors6, bg_colors7;
+        float bg_opacities0, bg_opacities1, bg_opacities2, bg_opacities3, bg_opacities4, bg_opacities5, bg_opacities6, bg_opacities7;
+        uint32_t num_skip_rects;
     };
     // Send the uniform data
     ColorProfile *cp = screen->paused_rendering.expires_at ? &screen->paused_rendering.color_profile : screen->color_profile;
     if (cp->dirty || screen->reload_all_gpu_data) {
         const ArrayInformation ai = program_uniform_array(CELL_PROGRAM, "color_table");
         uint8_t *base = (uint8_t *)map_vao_buffer_for_write_only(vao_idx, color_table_buf, 0, program_uniform_block(CELL_PROGRAM, "ColorTable").size);
-        GLuint *ct_buf = (GLuint *)(base + ai.offset);
-        copy_color_table_to_buffer(cp, ct_buf, 0, ai.stride / sizeof(GLuint));
+        uint32_t *ct_buf = (uint32_t *)(base + ai.offset);
+        copy_color_table_to_buffer(cp, ct_buf, 0, ai.stride / sizeof(uint32_t));
         unmap_vao_buffer(vao_idx, color_table_buf);
     }
     // This struct is a hand written mirror of the std140 layout of
@@ -1185,7 +1087,9 @@ cell_update_uniform_block(
         if ((size_t)crd_block.size < sizeof(struct GPUCellRenderData))
             fatal("The CellRenderData uniform block is %d bytes but the C struct mirroring it is %zu bytes", crd_block.size, sizeof(struct GPUCellRenderData));
     }
-    struct GPUCellRenderData *rd = (struct GPUCellRenderData *)map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, crd_block.size);
+    // Built in local memory as it is copied into the buffers for the smooth
+    // scroll region passes as well, and the mapped buffers are write only
+    struct GPUCellRenderData crd_data = {0}, *rd = &crd_data;
 #define COLOR(name) colorprofile_to_color(cp, cp->overridden.name, cp->configured.name).rgb
     // The shaders need these only in linear space, they are converted and
     // written into rd just before the buffer is unmapped. The cursor colors
@@ -1232,50 +1136,42 @@ cell_update_uniform_block(
     // its shape, so the main cursor render data must be computed even when the
     // main cursor itself is hidden by DECTCEM.
     if (rd->cursor_opacity != 0 && (cursor->is_visible || cursor->multicursor_count)) {
-        rd->cursor_x1 = cursor->x, rd->cursor_y1 = cursor->y;
-        rd->cursor_x2 = cursor->x, rd->cursor_y2 = cursor->y;
+        const CursorShape cs = (cursor->is_focused || OPT(cursor_shape_unfocused) == NO_CURSOR_SHAPE) ? cursor->shape : OPT(cursor_shape_unfocused);
+        const index_type cursor_x = screen_cursor_drawn_x(screen, cursor->x, cursor->y, cs);
+        rd->cursor_x1 = cursor_x, rd->cursor_y1 = cursor->y;
+        rd->cursor_x2 = cursor_x, rd->cursor_y2 = cursor->y;
         if (pixel_scroll_enabled(screen)) {
             rd->cursor_y1 += 1;
             rd->cursor_y2 += 1;
         }
-        CursorShape cs = (cursor->is_focused || OPT(cursor_shape_unfocused) == NO_CURSOR_SHAPE) ? cursor->shape : OPT(cursor_shape_unfocused);
         rd->cursor_shape = cs;
         color_type cell_fg = rd->default_fg, cell_bg = rd->bg_colors0;
         index_type cell_color_x = cursor->x;
         bool reversed = false;
-        if (cursor->x < screen->columns && cursor->y < screen->lines) {
-            if (screen->paused_rendering.expires_at) {
-                linebuf_init_line(screen->paused_rendering.linebuf, cursor->y);
-                line_for_cursor = screen->paused_rendering.linebuf->line;
-            } else {
-                linebuf_init_line(screen->linebuf, cursor->y);
-                line_for_cursor = screen->linebuf->line;
-                if (screen_is_overlay_active(screen) && cursor->y == screen->overlay_line.ynum) {
-                    // The linebuf holds the original line, the pre-edit text is
-                    // drawn over it only in the overlay cells, so use those to size
-                    // and color the cursor, for example when it is over a wide character.
-                    overlay_line_for_cursor = *line_for_cursor;
-                    overlay_line_for_cursor.cpu_cells = screen->overlay_line.cpu_cells;
-                    overlay_line_for_cursor.gpu_cells = screen->overlay_line.gpu_cells;
-                    line_for_cursor = &overlay_line_for_cursor;
-                }
-            }
-        }
+        // Size and color the cursor using the cell under it as rendered, for
+        // example when it is over a wide character or pre-edit text
+        line_for_cursor = screen_line_for_cursor(screen, cursor->x, cursor->y, &overlay_line_for_cursor);
         if (line_for_cursor) {
             colors_for_cell(line_for_cursor, cp, &cell_color_x, &cell_fg, &cell_bg, &reversed);
             const CPUCell *cursor_cell;
             const bool large_cursor = ((cursor_cell = &line_for_cursor->cpu_cells[cursor->x])->is_multicell) && cursor_cell->x == 0 && cursor_cell->y == 0;
             if (large_cursor) {
+                // The cursor covers the cells of the char that are present, a
+                // char can be cut off at the edges of the screen or split by a
+                // smooth scroll region, with its other cells in the overflow buffers
+                const index_type num_rows = screen_multicell_char_rows_for_cursor(screen, cursor_cell, cursor->x, cursor->y);
+                const index_type num_cols = multicell_char_columns(line_for_cursor->cpu_cells, line_for_cursor->xnum, cursor->x).limit - cursor->x;
                 switch (cs) {
-                    case CURSOR_BEAM: rd->cursor_y2 += cursor_cell->scale - 1; break;
+                    case CURSOR_BEAM: rd->cursor_y2 += num_rows - 1; break;
                     case CURSOR_UNDERLINE:
-                        rd->cursor_y1 += cursor_cell->scale - 1;
+                        // under the lowest row of the char that is present
+                        rd->cursor_y1 += num_rows - 1;
                         rd->cursor_y2 = rd->cursor_y1;
-                        rd->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
+                        rd->cursor_x2 += num_cols - 1;
                         break;
                     case CURSOR_BLOCK:
-                        rd->cursor_y2 += cursor_cell->scale - 1;
-                        rd->cursor_x2 += mcd_x_limit(cursor_cell) - 1;
+                        rd->cursor_y2 += num_rows - 1;
+                        rd->cursor_x2 += num_cols - 1;
                         break;
                     case CURSOR_HOLLOW:
                     case NUM_OF_CURSOR_SHAPES:
@@ -1285,7 +1181,7 @@ cell_update_uniform_block(
         }
         // If you change the following algorithm remember to change it in the cell shader for extra cursors too
         if (rd->main_cursor_is_special) {
-            if (line_for_cursor && line_for_cursor->gpu_cells[cell_color_x].attrs.dim) {
+            if (line_for_cursor && line_cell_style(line_for_cursor, cell_color_x)->attrs.dim) {
                 cell_fg = dimmed_cursor_color(cell_fg, cell_bg, OPT(dim_opacity));
                 pick_cursor_color(cell_fg, cell_bg, &main_cursor_fg, &main_cursor_bg, rd->default_fg, rd->bg_colors0);
             } else if (cell_bg == cell_fg) {
@@ -1343,10 +1239,118 @@ cell_update_uniform_block(
     linear_color_vec4(rd->extra_cursor_fg_lin, dynamic_color_for_gpu(cp, rd->extra_cursor_fg));
     linear_color_vec4(rd->extra_cursor_bg_lin, dynamic_color_for_gpu(cp, rd->extra_cursor_bg));
     color_type default_bg = rd->bg_colors0;
+    // The smooth scroll regions that are drawn shifted, in separate passes, each a
+    // grid of the cells of its strip, see SmoothScrollRenderRegion
+    const SmoothScrollRender *ssr = &screen->smooth_scroll_render;
+    const unsigned row_offset = pixel_scroll_enabled(screen);
+    const uint32_t cy1 = rd->cursor_y1 - row_offset, cy2 = rd->cursor_y2 - row_offset;
+    for (unsigned i = 0, n = 0; i < ssr->count; i++) {
+        const SmoothScrollRenderRegion *r = ssr->regions + i;
+        if (!smooth_scroll_render_region_is_shifted(r)) continue;
+        struct GPUCellRenderData regd = crd_data;
+        regd.num_skip_rects = 0;
+        // The strip is drawn as a grid of its cells, for vertical scrolling in
+        // a viewport that is the rectangle of the region, shifted by the row
+        // offset, for horizontal scrolling in a viewport that is the
+        // rectangle widened by a column on each side and shifted by the
+        // offset, see draw_smooth_scroll_regions()
+        const unsigned sw = smooth_scroll_render_region_strip_width(r), sh = smooth_scroll_render_region_strip_height(r);
+        const unsigned strip_x = r->horizontal ? 1 : 0, strip_y = r->horizontal ? 0 : 1;
+        regd.columns = sw;
+        regd.lines = r->height;
+        regd.row_offset = r->horizontal ? 0.f : (float)r->offset / (float)MAX(1u, screen->cell_size.height) - 1.f;
+        const bool has_cursor = rd->cursor_x1 >= r->left && rd->cursor_x2 < r->left + r->width && cy1 >= r->top && cy2 < r->top + r->height;
+        if (has_cursor) {
+            regd.cursor_x1 = rd->cursor_x1 - r->left + strip_x;
+            regd.cursor_x2 = rd->cursor_x2 - r->left + strip_x;
+            regd.cursor_y1 = cy1 - r->top + strip_y;
+            regd.cursor_y2 = cy2 - r->top + strip_y;
+        } else {
+            regd.cursor_x1 = sw + 1;
+            regd.cursor_x2 = sw;
+            regd.cursor_y1 = sh + 1;
+            regd.cursor_y2 = sh;
+        }
+        void *dest = map_vao_buffer_for_write_only(vao_idx, REGION_UNIFORM_BUFFER_BASE + i, 0, crd_block.size);
+        memcpy(dest, &regd, sizeof(regd));
+        unmap_vao_buffer(vao_idx, REGION_UNIFORM_BUFFER_BASE + i);
+        uint32_t *sr = rd->skip_rects[n++];
+        sr[0] = r->left;
+        sr[1] = r->top + row_offset;
+        sr[2] = r->left + r->width;
+        sr[3] = r->top + r->height + row_offset;
+        rd->num_skip_rects = n;
+    }
+    void *dest = map_vao_buffer_for_write_only(vao_idx, uniform_buffer, 0, crd_block.size);
+    memcpy(dest, rd, sizeof(*rd));
     unmap_vao_buffer(vao_idx, uniform_buffer);
     rd = NULL;
     return default_bg;
 }
+
+// CellStyle table texture {{{
+// The cell shaders get the style of each cell from a texture holding the style
+// table of its screen. Each CellStyle is four R32UI texels, fg, bg, decoration_fg
+// and attrs, in the same layout as the C struct, so styles are uploaded
+// directly from the table. The texture width is a multiple of four, so the
+// texels of a style are always in a single row.
+#define TEXELS_PER_STYLE (sizeof(CellStyle) / sizeof(uint32_t))
+static_assert(sizeof(CellStyle) == 4 * sizeof(uint32_t), "Fix TEXELS_PER_STYLE and the shaders");
+
+static void
+upload_style_texels(gpu_texture_t texture, uint32_t width, const uint32_t *texels, uint32_t start, uint32_t limit) {
+    // Upload the texels in [start, limit) as a partial first row, full rows and a partial last row
+    while (start < limit) {
+        const uint32_t y = start / width, x = start % width;
+        uint32_t w, h;
+        if (x || limit - start < width) {
+            w = MIN(width - x, limit - start);
+            h = 1;
+        } else {
+            w = width;
+            h = (limit - start) / width;
+        }
+        const GPUPixelData pixels = {.layout = GPU_PIXELS_R32UI, .row_alignment = 4, .data = texels + start};
+        gpu_texture_upload(texture, x, y, 0, w, h, &pixels);
+        start += w * h;
+    }
+}
+
+static void
+sync_style_texture(Screen *screen) {
+    // Upload styles added to the table since the last upload, or all of them
+    // if the table was garbage collected since then
+    const CellStyleTable *t = screen->style_table;
+    __typeof__(screen->style_texture) *st = &screen->style_texture;
+    bool upload_all = st->generation != t->generation || !st->texture;
+    const uint32_t needed = t->count * TEXELS_PER_STYLE;
+    if (!st->texture || needed > st->width * st->height) {
+        const uint32_t width = (uint32_t)MIN(4096, max_texture_size) & ~(uint32_t)(TEXELS_PER_STYLE - 1);
+        const uint32_t max_texels = MAX_NUM_OF_STYLES * TEXELS_PER_STYLE;
+        const uint32_t capacity = MIN(MAX(needed * 2, 1024u * TEXELS_PER_STYLE), max_texels);
+        const uint32_t height = (capacity + width - 1) / width;
+        if ((int32_t)height > max_texture_size) fatal("Max texture size too small for the style table");
+        const GPUTextureDesc desc = {
+            .kind = GPU_TEXTURE_2D, .format = GPU_FORMAT_R32UI, .width = width, .height = height, .filter = GPU_FILTER_NEAREST, .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+        if (st->texture) {
+            if (!gpu_texture_reset(st->texture, &desc, NULL)) fatal("Failed to re-allocate the style table texture with error: %s", gpu_last_error());
+        } else st->texture = create_texture_or_die(&desc, NULL);
+        st->width = width;
+        st->height = height;
+        upload_all = true;
+    }
+    const uint32_t start = upload_all ? 0 : st->count * TEXELS_PER_STYLE;
+    upload_style_texels(st->texture, st->width, (const uint32_t *)t->styles, start, needed);
+    st->count = t->count;
+    st->generation = t->generation;
+}
+
+static void
+bind_style_texture(int program, const Screen *screen) {
+    uint32_t slot;
+    if (screen->style_texture.texture && try_program_texture_slot(program, "cell_styles", &slot)) gpu_bind_texture(slot, screen->style_texture.texture);
+}
+// }}}
 
 static bool
 cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_data) {
@@ -1361,11 +1365,17 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
     bool cursor_pos_changed = cursor->x != screen->last_rendered.cursor.x || cursor->y != screen->last_rendered.cursor.y;
     bool disable_ligatures = screen->disable_ligatures == DISABLE_LIGATURES_CURSOR;
     bool screen_resized = screen->last_rendered.columns != screen->columns || screen->last_rendered.lines != screen->lines;
+    // Garbage collecting the style table changes the style indices of cells, so all cell data must be uploaded again
+    const bool styles_remapped = screen->style_texture.texture && screen->style_texture.generation != screen->style_table->generation;
+    if (styles_remapped) screen->paused_rendering.cell_data_updated = false;
+    // The strips of the shifted smooth scroll regions are after the cells of the screen
+    const bool smooth_scroll_changed = screen_prepare_smooth_scroll_render(screen);
+    const size_t num_strip_cells = screen->smooth_scroll_render.num_strip_cells;
 
 #define update_cell_data                                                                               \
     {                                                                                                  \
         const unsigned int render_lines = render_lines_for_screen(screen);                             \
-        sz = sizeof(GPUCell) * render_lines * screen->columns;                                         \
+        sz = sizeof(CellGPUData) * (render_lines * screen->columns + num_strip_cells);                 \
         address = alloc_and_map_vao_buffer_for_full_rewrite(vao_idx, sz, cell_data_buffer);            \
         screen_update_cell_data(screen, address, fonts_data, disable_ligatures && cursor_pos_changed); \
         unmap_vao_buffer(vao_idx, cell_data_buffer);                                                   \
@@ -1375,18 +1385,26 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
 
     if (screen->paused_rendering.expires_at) {
         if (!screen->paused_rendering.cell_data_updated) update_cell_data;
-    } else if (screen->reload_all_gpu_data || screen->scroll_changed || screen->is_dirty || screen_resized || (disable_ligatures && cursor_pos_changed))
+    } else if (
+        screen->reload_all_gpu_data || screen->scroll_changed || screen->is_dirty || screen_resized || styles_remapped || smooth_scroll_changed ||
+        (disable_ligatures && cursor_pos_changed))
         update_cell_data;
+    // After updating cell data as rendering lines can add styles
+    if (!screen->style_texture.texture || screen->style_texture.count != screen->style_table->count ||
+        screen->style_texture.generation != screen->style_table->generation) {
+        sync_style_texture(screen);
+        changed = true;
+    }
 
-#define update_selection_data                                                               \
-    {                                                                                       \
-        const unsigned int render_lines = render_lines_for_screen(screen);                  \
-        sz = (size_t)render_lines * screen->columns;                                        \
-        address = alloc_and_map_vao_buffer_for_full_rewrite(vao_idx, sz, selection_buffer); \
-        screen_apply_selection(screen, address, sz);                                        \
-        unmap_vao_buffer(vao_idx, selection_buffer);                                        \
-        address = NULL;                                                                     \
-        changed = true;                                                                     \
+#define update_selection_data                                                                                  \
+    {                                                                                                          \
+        const unsigned int render_lines = render_lines_for_screen(screen);                                     \
+        sz = (size_t)render_lines * screen->columns + num_strip_cells;                                         \
+        address = alloc_and_map_vao_buffer_for_full_rewrite(vao_idx, sz * selection_stride, selection_buffer); \
+        screen_apply_selection(screen, address, sz, selection_stride);                                         \
+        unmap_vao_buffer(vao_idx, selection_buffer);                                                           \
+        address = NULL;                                                                                        \
+        changed = true;                                                                                        \
     }
 
     if (screen->paused_rendering.expires_at) {
@@ -1396,7 +1414,8 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
         }
         screen->paused_rendering.cell_data_updated = true;
     } else {
-        if (screen->reload_all_gpu_data || screen_resized || screen_is_selection_dirty(screen)) update_selection_data;
+        // The selection data of the strips is copied from that of the screen, so it is also updated when the strips change
+        if (screen->reload_all_gpu_data || screen_resized || screen_is_selection_dirty(screen) || smooth_scroll_changed) update_selection_data;
         if (screen_update_graphics_layers(screen)) changed = true;
     }
     screen->last_rendered.scrolled_by = rendered_scrolled_by(screen);
@@ -1410,26 +1429,26 @@ cell_prepare_to_render(ssize_t vao_idx, Screen *screen, FONTS_DATA_HANDLE fonts_
 }
 
 static void
-draw_graphics(int program, ImageRenderData *data, GLuint start, GLuint count, float extra_alpha) {
+draw_graphics(int program, ImageRenderData *data, uint32_t start, uint32_t count, float extra_alpha) {
     bind_program(program);
-    if (program != GRAPHICS_ALPHA_MASK_PROGRAM) glUniform1f(program_uniform_location(program, "extra_alpha"), extra_alpha);
-    glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
-    GLint src_rect_loc = program_uniform_location(program, "src_rect");
-    GLint dest_rect_loc = program_uniform_location(program, "dest_rect");
+    if (program != GRAPHICS_ALPHA_MASK_PROGRAM) param_1f(program_param(program, "extra_alpha"), extra_alpha);
+    int32_t src_rect_loc = program_param(program, "src_rect");
+    int32_t dest_rect_loc = program_param(program, "dest_rect");
     const bool is_indexed = program == GRAPHICS_INDEXED_PROGRAM || program == GRAPHICS_INDEXED_UNSCALED_PROGRAM;
-    const GLint has_alpha_loc = is_indexed ? program_uniform_location(program, "has_alpha") : -1;
-    for (GLuint i = 0; i < count;) {
+    const int32_t has_alpha_loc = is_indexed ? program_param(program, "has_alpha") : -1;
+    const uint32_t image_slot = program_texture_slot(program, "image");
+    for (uint32_t i = 0; i < count;) {
         ImageRenderData *group = data + start + i;
-        glBindTexture(GL_TEXTURE_2D, group->texture_id);
-        if (has_alpha_loc > -1) glUniform1ui(has_alpha_loc, group->indexed_px_sz == 2);
+        gpu_bind_texture(image_slot, group->texture_id);
+        if (has_alpha_loc > -1) param_1ui(has_alpha_loc, group->indexed_px_sz == 2);
         if (group->group_count == 0) {
             i++;
             continue;
         }
-        for (GLuint k = 0; k < group->group_count; k++, i++) {
+        for (uint32_t k = 0; k < group->group_count; k++, i++) {
             ImageRenderData *rd = data + start + i;
-            glUniform4f(src_rect_loc, rd->src_rect.left, rd->src_rect.top, rd->src_rect.right, rd->src_rect.bottom);
-            glUniform4f(dest_rect_loc, rd->dest_rect.left, rd->dest_rect.top, rd->dest_rect.right, rd->dest_rect.bottom);
+            param_4f(src_rect_loc, rd->src_rect.left, rd->src_rect.top, rd->src_rect.right, rd->src_rect.bottom);
+            param_4f(dest_rect_loc, rd->dest_rect.left, rd->dest_rect.top, rd->dest_rect.right, rd->dest_rect.bottom);
             draw_quad(true, 0);
         }
     }
@@ -1438,51 +1457,41 @@ draw_graphics(int program, ImageRenderData *data, GLuint start, GLuint count, fl
 static ImageRenderData *
 load_alpha_mask_texture(size_t width, size_t height, uint8_t *canvas) {
     static ImageRenderData data = {.group_count = 1};
-    if (!data.texture_id) { glGenTextures(1, &data.texture_id); }
-    glBindTexture(GL_TEXTURE_2D, data.texture_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, canvas);
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D, .format = GPU_FORMAT_R8, .width = width, .height = height, .filter = GPU_FILTER_NEAREST, .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+    const GPUPixelData pixels = {.layout = GPU_PIXELS_R8, .row_alignment = 1, .data = canvas};
+    define_texture(&data.texture_id, &desc, &pixels);
     return &data;
 }
 
 static void
-setup_texture_as_render_target(unsigned width, unsigned height, GLuint *texture_id, GLuint *framebuffer_id) {
-    glGenTextures(1, texture_id);
-    glGenFramebuffers(1, framebuffer_id);
-    glBindTexture(GL_TEXTURE_2D, *texture_id);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // We use GL_RGBA16 to avoid incorrect colors due to quantization loss when
+setup_texture_as_render_target(unsigned width, unsigned height, gpu_texture_t *texture_id, gpu_render_target_t *framebuffer_id) {
+    // We use 16 bit color channels to avoid incorrect colors due to quantization loss when
     // blending, see https://github.com/kovidgoyal/kitty/issues/8953
     static struct {
         bool ok;
-        int fmt;
-    } status = {false, GL_RGBA16};
-    glTexImage2D(GL_TEXTURE_2D, 0, status.fmt, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    bind_framebuffer_for_output(*framebuffer_id);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *texture_id, 0);
+        GPUTextureFormat fmt;
+    } status = {false, GPU_FORMAT_RGBA16};
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D, .format = status.fmt, .width = width, .height = height, .filter = GPU_FILTER_LINEAR, .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+    *texture_id = create_texture_or_die(&desc, NULL);
+    *framebuffer_id = gpu_render_target_create(*texture_id);
+    if (!*framebuffer_id) fatal("Failed to create a GPU render target with error: %s", gpu_last_error());
     if (!status.ok) {
-        if (check_framebuffer_status() == NULL) {
+        if (gpu_render_target_status(*framebuffer_id) == NULL) {
             status.ok = true;
         } else {
-            if (status.fmt == GL_RGBA16) {
-                // Driver does not support 16 bit FBO so let it choose the
-                // format. It will probably end up choosing 8 bit but
-                // inaccurate colors are better than completely broken rendering.
-                // See https://github.com/kovidgoyal/kitty/issues/9068
-                status.fmt = GL_RGBA;
+            if (status.fmt == GPU_FORMAT_RGBA16) {
+                // Driver does not support 16 bit render targets so fall back
+                // to 8 bit. Inaccurate colors are better than completely
+                // broken rendering. See https://github.com/kovidgoyal/kitty/issues/9068
+                status.fmt = GPU_FORMAT_RGBA8;
                 free_framebuffer(framebuffer_id);
                 free_texture(texture_id);
                 setup_texture_as_render_target(width, height, texture_id, framebuffer_id);
                 log_error("WARNING: Your GPU driver does not support 16bit textures as framebuffer targets, some colors may be slightly inaccurate.");
             } else {
-                fatal("Your GPU driver does not support indirect rendering to a GL_RGBA texture via a framebuffer");
+                fatal("Your GPU driver does not support indirect rendering to a RGBA texture via a framebuffer");
             }
         }
     }
@@ -1494,29 +1503,19 @@ set_cell_uniforms(bool force) {
     if (!constants_set || force) {
         float text_contrast = 1.0f + OPT(text_contrast) * 0.01f;
         float text_gamma_adjustment = OPT(text_gamma_adjustment) < 0.01f ? 1.0f : 1.0f / OPT(text_gamma_adjustment);
-        for (int i = GRAPHICS_PROGRAM; i <= GRAPHICS_INDEXED_UNSCALED_PROGRAM; i++) {
-            bind_program(i);
-            glUniform1i(program_uniform_location(i, "image"), GRAPHICS_UNIT);
-        }
         // These are set for every cell program, but the background program draws no
         // text and so does not have them.
-#define set_optional(setter, name, value)                  \
-    {                                                      \
-        GLint loc = try_program_uniform_location(i, name); \
-        if (loc >= 0) setter(loc, value);                  \
+#define set_optional(setter, name, value)         \
+    {                                             \
+        int32_t loc = try_program_param(i, name); \
+        if (loc >= 0) setter(loc, value);         \
     }
         for (int i = CELL_PROGRAM; i < CELL_PROGRAM_SENTINEL; i++) {
             bind_program(i);
-            set_optional(glUniform1i, "sprites", SPRITE_MAP_UNIT);
-            set_optional(glUniform1i, "sprite_decorations_map", SPRITE_DECORATIONS_MAP_UNIT);
-            set_optional(glUniform1f, "text_contrast", text_contrast);
-            set_optional(glUniform1f, "text_gamma_adjustment", text_gamma_adjustment);
+            set_optional(param_1f, "text_contrast", text_contrast);
+            set_optional(param_1f, "text_gamma_adjustment", text_gamma_adjustment);
         }
 #undef set_optional
-        bind_program(BLIT_PROGRAM);
-        glUniform1i(program_uniform_location(BLIT_PROGRAM, "image"), GRAPHICS_UNIT);
-        bind_program(SCREENSHOT_PROGRAM);
-        glUniform1i(program_uniform_location(SCREENSHOT_PROGRAM, "image"), GRAPHICS_UNIT);
         constants_set = true;
     }
 }
@@ -1546,18 +1545,18 @@ get_visual_bell_intensity(Screen *screen) {
 }
 
 static void
-draw_visual_bell_flash(GLfloat intensity, const color_type flash) {
+draw_visual_bell_flash(float intensity, const color_type flash) {
     bind_program(TINT_PROGRAM);
-    GLfloat attenuation = 0.4f;
+    float attenuation = 0.4f;
 #define C(shift) srgb_color((flash >> shift) & 0xFF)
-    const GLfloat r = C(16), g = C(8), b = C(0);
-    const GLfloat max_channel = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    const float r = C(16), g = C(8), b = C(0);
+    const float max_channel = r > g ? (r > b ? r : b) : (g > b ? g : b);
 #undef C
 #define C(x) (x * intensity * attenuation)
     if (max_channel > 0.45) attenuation = 0.6f; // light color
-    glUniform4f(program_uniform_location(TINT_PROGRAM, "tint_color"), C(r), C(g), C(b), C(1));
+    param_4f(program_param(TINT_PROGRAM, "tint_color"), C(r), C(g), C(b), C(1));
 #undef C
-    glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), -1, 1, 1, -1);
+    param_4f(program_param(TINT_PROGRAM, "edges"), -1, -1, 1, 1);
     draw_quad(true, 0);
 }
 
@@ -1590,7 +1589,7 @@ draw_drag_preview_overlay(const UIRenderData *ui) {
     const monotonic_t elapsed = monotonic() - screen->start_drag_overlay_at;
     const monotonic_t fade_ms = ms_to_monotonic_t(150ll);
     float intensity = elapsed >= fade_ms ? 1.0f : (float)elapsed / (float)fade_ms;
-    GLfloat left = -1.f, top = 1.f, right = 1.f, bottom = -1.f;
+    float left = -1.f, top = -1.f, right = 1.f, bottom = 1.f;
     switch (screen->drag_overlay_quadrant) {
         case 1: right = 0.f; break;  // left half
         case 2: left = 0.f; break;   // right half
@@ -1604,9 +1603,9 @@ draw_drag_preview_overlay(const UIRenderData *ui) {
     float a = intensity * 0.25f;
     color_type hint = get_flash_color(screen);
 #define C(shift) (srgb_color((hint >> shift) & 0xFF) * a)
-    glUniform4f(program_uniform_location(TINT_PROGRAM, "tint_color"), C(16), C(8), C(0), a);
+    param_4f(program_param(TINT_PROGRAM, "tint_color"), C(16), C(8), C(0), a);
 #undef C
-    glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), left, top, right, bottom);
+    param_4f(program_param(TINT_PROGRAM, "edges"), left, top, right, bottom);
     draw_quad(true, 0);
 }
 
@@ -1691,28 +1690,28 @@ draw_bar(const UIRenderData *ui, const WindowBarData *bar, Viewport border_rect,
     // bleed onto the rendered title.
     const float drawn_thickness = (float)MIN(thickness, border_width - 0.5);
     static ImageRenderData data = {.group_count = 1};
-    gpu_data_for_image(&data, -1, 1, 1, -1);
-    glGenTextures(1, &data.texture_id);
-    glBindTexture(GL_TEXTURE_2D, data.texture_id);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_SRGB_ALPHA, bar->width, bar->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, bar->buf);
+    gpu_data_for_image(&data, -1, -1, 1, 1);
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D,
+        .format = GPU_FORMAT_SRGB8_ALPHA8,
+        .width = bar->width,
+        .height = bar->height,
+        .filter = GPU_FILTER_NEAREST,
+        .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+    const GPUPixelData pixels = {.layout = GPU_PIXELS_RGBA8, .row_alignment = 1, .data = bar->buf};
+    data.texture_id = create_texture_or_die(&desc, &pixels);
     bind_program(GRAPHICS_PROGRAM);
-    const unsigned sh = ui->full_framebuffer_height;
     // first blank the area to be drawn to background
-    enable_scissor_using_top_left_origin(border_rect, sh);
+    enable_scissor(border_rect);
     blank_canvas(ui->bg_alpha, bg, false);
     disable_scissor();
     // then draw the rendered text
-    save_viewport_using_top_left_origin(border_rect.left + border_width, border_rect.top + border_width, bar->width, bar->height, sh);
+    save_viewport(border_rect.left + border_width, border_rect.top + border_width, bar->width, bar->height);
     draw_graphics(GRAPHICS_PROGRAM, &data, 0, 1, 1.f);
     restore_viewport();
     free_texture(&data.texture_id);
     // finally draw border with transparent bg
-    draw_rounded_rect(border_rect, sh, drawn_thickness, ui->cell_width, fg, bg, 0.f, 0, 0.f);
+    draw_rounded_rect(border_rect, drawn_thickness, ui->cell_width, fg, bg, 0.f, 0, 0.f);
 }
 
 static unsigned
@@ -1839,17 +1838,16 @@ draw_window_number(const UIRenderData *ui) {
     if (lr.height_px + title_bar_height < ui->screen_height) letter_y += (ui->screen_height - lr.height_px - title_bar_height) / 2;
     bind_program(GRAPHICS_ALPHA_MASK_PROGRAM);
     ImageRenderData *ird = load_alpha_mask_texture(lr.width_px, lr.height_px, lr.canvas);
-    gpu_data_for_image(ird, -1, 1, 1, -1);
-    glUniform1i(program_uniform_location(GRAPHICS_ALPHA_MASK_PROGRAM, "image"), GRAPHICS_UNIT);
+    gpu_data_for_image(ird, -1, -1, 1, 1);
     color_type digit_color = colorprofile_to_color_with_fallback(
         ui->screen->color_profile,
         ui->screen->color_profile->overridden.highlight_bg,
         ui->screen->color_profile->configured.highlight_bg,
         ui->screen->color_profile->overridden.default_fg,
         ui->screen->color_profile->configured.default_fg);
-    color_vec3(program_uniform_location(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_fg"), digit_color);
-    glUniform4f(program_uniform_location(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_bg_premult"), 0.f, 0.f, 0.f, 0.f);
-    save_viewport_using_top_left_origin(ui->screen_left + letter_x, ui->screen_top + letter_y, lr.width_px, lr.height_px, ui->full_framebuffer_height);
+    color_vec3(program_param(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_fg"), digit_color);
+    param_4f(program_param(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_bg_premult"), 0.f, 0.f, 0.f, 0.f);
+    save_viewport(ui->screen_left + letter_x, ui->screen_top + letter_y, lr.width_px, lr.height_px);
     draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, ird, 0, 1, 1.f);
     restore_viewport();
 #undef lr
@@ -1861,7 +1859,7 @@ set_color_uniform_with_opacity(color_type color, float opacity) {
     float r = srgb_color((color >> 16) & 0xFF) * opacity;
     float g = srgb_color((color >> 8) & 0xFF) * opacity;
     float b = srgb_color(color & 0xFF) * opacity;
-    glUniform4f(program_uniform_location(TINT_PROGRAM, "tint_color"), r, g, b, opacity);
+    param_4f(program_param(TINT_PROGRAM, "tint_color"), r, g, b, opacity);
 }
 
 static color_type
@@ -1886,118 +1884,135 @@ draw_scrollbar(const UIRenderData *ui) {
     screen_scrollbar_geometry(screen, &bar_frac, &visible_fraction);
     float opacity = OPT(scrollbar_handle_opacity);
     float track_opacity = window->scrollbar.is_hovering ? OPT(scrollbar_track_hover_opacity) : OPT(scrollbar_track_opacity);
-    GLsizei scrollbar_width_px = (GLsizei)(OPT(scrollbar_width) * ui->cell_width);
-    if (window->scrollbar.is_hovering) scrollbar_width_px = (GLsizei)(OPT(scrollbar_hover_width) * ui->cell_width);
-    GLsizei scrollbar_gap_px = (GLsizei)(OPT(scrollbar_gap) * ui->cell_width);
+    int32_t scrollbar_width_px = (int32_t)(OPT(scrollbar_width) * ui->cell_width);
+    if (window->scrollbar.is_hovering) scrollbar_width_px = (int32_t)(OPT(scrollbar_hover_width) * ui->cell_width);
+    int32_t scrollbar_gap_px = (int32_t)(OPT(scrollbar_gap) * ui->cell_width);
     unsigned scrollbar_radius = (unsigned)(OPT(scrollbar_radius) * ui->cell_width);
 
     // Calculate window boundaries including padding
-    GLsizei window_right_edge = ui->screen_left + ui->screen_width + window->render_data.geometry.spaces.right;
-    GLsizei window_top_edge = ui->screen_top - window->render_data.geometry.spaces.top;
-    GLsizei window_height = ui->screen_height + window->render_data.geometry.spaces.top + window->render_data.geometry.spaces.bottom;
+    int32_t window_right_edge = ui->screen_left + ui->screen_width + window->render_data.geometry.spaces.right;
+    int32_t window_top_edge = ui->screen_top - window->render_data.geometry.spaces.top;
+    int32_t window_height = ui->screen_height + window->render_data.geometry.spaces.top + window->render_data.geometry.spaces.bottom;
 
     // Position scrollbar on right side with gap
-    GLsizei scrollbar_left = window_right_edge - scrollbar_width_px - scrollbar_gap_px;
-    GLsizei scrollbar_top = window_top_edge + scrollbar_gap_px;
-    GLsizei scrollbar_height = window_height - 2 * scrollbar_gap_px;
+    int32_t scrollbar_left = window_right_edge - scrollbar_width_px - scrollbar_gap_px;
+    int32_t scrollbar_top = window_top_edge + scrollbar_gap_px;
+    int32_t scrollbar_height = window_height - 2 * scrollbar_gap_px;
 
     // Calculate thumb size and position
     float min_thumb_height_fraction = (OPT(scrollbar_min_handle_height) * ui->cell_height) / (float)window_height;
     float thumb_height_fraction = MAX(min_thumb_height_fraction, visible_fraction);
 
-    // Convert to OpenGL coordinates (range -1.0 to 1.0, total span = 2.0)
+    // Convert to NDC (range -1.0 to 1.0, total span = 2.0, -1 is the top)
     const float GL_COORD_SPAN = 2.0f;
     float thumb_height_gl = thumb_height_fraction * GL_COORD_SPAN;
     float available_space = GL_COORD_SPAN - thumb_height_gl;
-    float thumb_bottom_gl = -1.0f + available_space * bar_frac;
-    float thumb_top_gl = thumb_bottom_gl + thumb_height_gl;
+    float thumb_bottom_gl = 1.0f - available_space * bar_frac;
+    float thumb_top_gl = thumb_bottom_gl - thumb_height_gl;
 
     // Store thumb position for mouse interaction (normalized window coordinates)
     float scrollbar_top_in_window = (float)(window_top_edge + scrollbar_gap_px) / (float)ui->full_framebuffer_height;
     float scrollbar_height_in_window = (float)(window_height - 2 * scrollbar_gap_px) / (float)ui->full_framebuffer_height;
-    float thumb_top_fraction = (1.0f - thumb_top_gl) / 2.0f;
-    float thumb_bottom_fraction = (1.0f - thumb_bottom_gl) / 2.0f;
+    float thumb_top_fraction = (1.0f + thumb_top_gl) / 2.0f;
+    float thumb_bottom_fraction = (1.0f + thumb_bottom_gl) / 2.0f;
     window->scrollbar.thumb_top = scrollbar_top_in_window + thumb_top_fraction * scrollbar_height_in_window;
     window->scrollbar.thumb_bottom = scrollbar_top_in_window + thumb_bottom_fraction * scrollbar_height_in_window;
 
     // Set viewport for scrollbar area
-    save_viewport_using_top_left_origin(scrollbar_left, scrollbar_top, scrollbar_width_px, scrollbar_height, ui->full_framebuffer_height);
+    save_viewport(scrollbar_left, scrollbar_top, scrollbar_width_px, scrollbar_height);
 
     // Draw scrollbar track (background)
     if (track_opacity > 0) {
         bind_program(TINT_PROGRAM);
         set_color_uniform_with_opacity(track_color, track_opacity);
-        glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), -1.f, 1.f, 1.f, -1.f);
+        param_4f(program_param(TINT_PROGRAM, "edges"), -1.f, -1.f, 1.f, 1.f);
         draw_quad(true, 0);
     }
 
     // Draw scrollbar thumb (handle)
     if (scrollbar_radius > 0) {
         // Rounded thumb - use separate viewport and rounded rect program
-        GLsizei thumb_height_px = (GLsizei)(thumb_height_fraction * scrollbar_height);
-        GLsizei thumb_top_px = scrollbar_top + (GLsizei)(thumb_top_fraction * scrollbar_height);
+        int32_t thumb_height_px = (int32_t)(thumb_height_fraction * scrollbar_height);
+        int32_t thumb_top_px = scrollbar_top + (int32_t)(thumb_top_fraction * scrollbar_height);
 
         restore_viewport();
 
         bind_program(ROUNDED_RECT_PROGRAM);
-        color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "color"), bar_color, opacity);
-        color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "background_color"), 0, 0.0f);
-        color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "outer_color"), 0, 0.0f);
+        color_vec4(program_param(ROUNDED_RECT_PROGRAM, "color"), bar_color, opacity);
+        color_vec4(program_param(ROUNDED_RECT_PROGRAM, "background_color"), 0, 0.0f);
+        color_vec4(program_param(ROUNDED_RECT_PROGRAM, "outer_color"), 0, 0.0f);
 
-        float y = (float)ui->full_framebuffer_height - (float)(thumb_top_px + thumb_height_px);
-        glUniform4f(program_uniform_location(ROUNDED_RECT_PROGRAM, "rect"), (float)scrollbar_left, y, (float)scrollbar_width_px, (float)thumb_height_px);
+        param_2f(program_param(ROUNDED_RECT_PROGRAM, "size"), (float)scrollbar_width_px, (float)thumb_height_px);
 
         float thickness = (float)MAX(scrollbar_width_px, thumb_height_px);
-        glUniform2f(program_uniform_location(ROUNDED_RECT_PROGRAM, "params"), thickness, (float)scrollbar_radius);
+        param_2f(program_param(ROUNDED_RECT_PROGRAM, "params"), thickness, (float)scrollbar_radius);
 
-        save_viewport_using_top_left_origin(scrollbar_left, thumb_top_px, scrollbar_width_px, thumb_height_px, ui->full_framebuffer_height);
+        save_viewport(scrollbar_left, thumb_top_px, scrollbar_width_px, thumb_height_px);
         draw_quad(true, 0);
         restore_viewport();
     } else {
         set_color_uniform_with_opacity(bar_color, opacity);
-        glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), -1.f, thumb_top_gl, 1.f, thumb_bottom_gl);
+        param_4f(program_param(TINT_PROGRAM, "edges"), -1.f, thumb_top_gl, 1.f, thumb_bottom_gl);
         draw_quad(true, 0);
         restore_viewport();
     }
 }
 
 static bool
+custom_shaders_draw_progress_bars(void) {
+    return custom_shaders.end.active && custom_shaders.end.bypass_builtin_progress_bar;
+}
+
+bool
+builtin_progress_bar_enabled(void) {
+    return OPT(progress_bar) != PROGRESS_BAR_HIDDEN && !custom_shaders_draw_progress_bars();
+}
+
+// How long after a change in progress frames are rendered so that custom
+// shaders can animate the change, see docs/custom-shaders.rst
+#define PROGRESS_CHANGE_ANIMATION_TIME s_double_to_monotonic_t(1.0)
+
+bool
+progress_bar_is_animating(const Screen *screen, monotonic_t now) {
+    if (screen->progress_state == PROGRESS_STATE_INDETERMINATE) return OPT(progress_bar) != PROGRESS_BAR_HIDDEN || custom_shaders_draw_progress_bars();
+    return screen->progress_changed_at && now - screen->progress_changed_at < PROGRESS_CHANGE_ANIMATION_TIME && custom_shaders_draw_progress_bars();
+}
+
+static bool
 has_progress_bar(Screen *screen) {
-    if (OPT(progress_bar) == PROGRESS_BAR_HIDDEN) return false;
-    return screen && screen->progress_state != PROGRESS_STATE_UNSET;
+    return screen && screen->progress_state != PROGRESS_STATE_UNSET && builtin_progress_bar_enabled();
 }
 
 static void
 draw_progress_handle(
-    const UIRenderData *ui,
     color_type bar_color,
     float opacity,
     unsigned bar_radius,
-    GLsizei track_left,
-    GLsizei track_top,
-    GLsizei track_width,
-    GLsizei track_height,
+    int32_t track_left,
+    int32_t track_top,
+    int32_t track_width,
+    int32_t track_height,
     float handle_start,
     float handle_size,
     bool is_horizontal) {
     // handle_start and handle_size are fractions of the track length (0..1)
     // For horizontal: handle moves left-to-right; For vertical: handle moves top-to-bottom
     // Use lroundf to avoid sub-pixel jitter at the leading edge
-    GLsizei handle_left, handle_top;
-    GLsizei handle_w, handle_h;
+    int32_t handle_left, handle_top;
+    int32_t handle_w, handle_h;
     if (is_horizontal) {
-        GLsizei handle_start_px = (GLsizei)lroundf(handle_start * track_width);
-        GLsizei handle_end_px = (GLsizei)lroundf((handle_start + handle_size) * track_width);
-        GLsizei handle_w_px = handle_end_px - handle_start_px;
+        int32_t handle_start_px = (int32_t)lroundf(handle_start * track_width);
+        int32_t handle_end_px = (int32_t)lroundf((handle_start + handle_size) * track_width);
+        int32_t handle_w_px = handle_end_px - handle_start_px;
         if (handle_w_px < 1) handle_w_px = 1;
         handle_left = track_left + handle_start_px;
         handle_top = track_top;
         handle_w = handle_w_px;
         handle_h = track_height;
     } else {
-        GLsizei handle_start_px = (GLsizei)lroundf(handle_start * track_height);
-        GLsizei handle_end_px = (GLsizei)lroundf((handle_start + handle_size) * track_height);
-        GLsizei handle_h_px = handle_end_px - handle_start_px;
+        int32_t handle_start_px = (int32_t)lroundf(handle_start * track_height);
+        int32_t handle_end_px = (int32_t)lroundf((handle_start + handle_size) * track_height);
+        int32_t handle_h_px = handle_end_px - handle_start_px;
         if (handle_h_px < 1) handle_h_px = 1;
         handle_left = track_left;
         handle_top = track_top + handle_start_px;
@@ -2007,22 +2022,21 @@ draw_progress_handle(
 
     if (bar_radius > 0) {
         bind_program(ROUNDED_RECT_PROGRAM);
-        color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "color"), bar_color, opacity);
-        color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "background_color"), 0, 0.0f);
-        color_vec4(program_uniform_location(ROUNDED_RECT_PROGRAM, "outer_color"), 0, 0.0f);
+        color_vec4(program_param(ROUNDED_RECT_PROGRAM, "color"), bar_color, opacity);
+        color_vec4(program_param(ROUNDED_RECT_PROGRAM, "background_color"), 0, 0.0f);
+        color_vec4(program_param(ROUNDED_RECT_PROGRAM, "outer_color"), 0, 0.0f);
 
-        float y = (float)ui->full_framebuffer_height - (float)(handle_top + handle_h);
-        glUniform4f(program_uniform_location(ROUNDED_RECT_PROGRAM, "rect"), (float)handle_left, y, (float)handle_w, (float)handle_h);
+        param_2f(program_param(ROUNDED_RECT_PROGRAM, "size"), (float)handle_w, (float)handle_h);
 
         float thickness = (float)(is_horizontal ? handle_h : handle_w);
-        glUniform2f(program_uniform_location(ROUNDED_RECT_PROGRAM, "params"), thickness, (float)bar_radius);
+        param_2f(program_param(ROUNDED_RECT_PROGRAM, "params"), thickness, (float)bar_radius);
 
-        save_viewport_using_top_left_origin(handle_left, handle_top, handle_w, handle_h, ui->full_framebuffer_height);
+        save_viewport(handle_left, handle_top, handle_w, handle_h);
         draw_quad(true, 0);
         restore_viewport();
     } else {
         // Use GL coordinates within the track viewport, snapped to pixel boundaries
-        GLsizei track_len = is_horizontal ? track_width : track_height;
+        int32_t track_len = is_horizontal ? track_width : track_height;
         float start_snapped = (float)lroundf(handle_start * track_len) / (float)track_len;
         float end_snapped = (float)lroundf((handle_start + handle_size) * track_len) / (float)track_len;
         float start_gl = -1.0f + 2.0f * start_snapped;
@@ -2031,12 +2045,12 @@ draw_progress_handle(
         set_color_uniform_with_opacity(bar_color, opacity);
         if (is_horizontal) {
             // edges: left, top, right, bottom
-            save_viewport_using_top_left_origin(track_left, track_top, track_width, track_height, ui->full_framebuffer_height);
-            glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), start_gl, 1.f, end_gl, -1.f);
+            save_viewport(track_left, track_top, track_width, track_height);
+            param_4f(program_param(TINT_PROGRAM, "edges"), start_gl, -1.f, end_gl, 1.f);
         } else {
-            save_viewport_using_top_left_origin(track_left, track_top, track_width, track_height, ui->full_framebuffer_height);
-            // For vertical: start_gl is top in GL coords (inverted y), so bottom_gl = -end_gl, top_gl = -start_gl
-            glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), -1.f, -start_gl, 1.f, -end_gl);
+            save_viewport(track_left, track_top, track_width, track_height);
+            // For vertical: the handle moves top to bottom, as NDC y does
+            param_4f(program_param(TINT_PROGRAM, "edges"), -1.f, start_gl, 1.f, end_gl);
         }
         draw_quad(true, 0);
         restore_viewport();
@@ -2055,19 +2069,19 @@ draw_progress_bar(const UIRenderData *ui) {
     color_type track_color = scrollbar_color(screen, OPT(scrollbar_track_color));
     float opacity = OPT(scrollbar_handle_opacity);
     float track_opacity = OPT(scrollbar_track_hover_opacity);
-    GLsizei bar_thickness_px = (GLsizei)(OPT(scrollbar_width) * ui->cell_width);
-    GLsizei gap_px = (GLsizei)(OPT(scrollbar_gap) * ui->cell_width);
+    int32_t bar_thickness_px = (int32_t)(OPT(scrollbar_width) * ui->cell_width);
+    int32_t gap_px = (int32_t)(OPT(scrollbar_gap) * ui->cell_width);
     unsigned bar_radius = (unsigned)(OPT(scrollbar_radius) * ui->cell_width);
     if (bar_thickness_px < 1) return;
 
     // Calculate window boundaries including padding
-    GLsizei window_left_edge = ui->screen_left - (GLsizei)window->render_data.geometry.spaces.left;
-    GLsizei window_top_edge = ui->screen_top - (GLsizei)window->render_data.geometry.spaces.top;
-    GLsizei window_width = ui->screen_width + (GLsizei)(window->render_data.geometry.spaces.left + window->render_data.geometry.spaces.right);
-    GLsizei window_height = ui->screen_height + (GLsizei)(window->render_data.geometry.spaces.top + window->render_data.geometry.spaces.bottom);
+    int32_t window_left_edge = ui->screen_left - (int32_t)window->render_data.geometry.spaces.left;
+    int32_t window_top_edge = ui->screen_top - (int32_t)window->render_data.geometry.spaces.top;
+    int32_t window_width = ui->screen_width + (int32_t)(window->render_data.geometry.spaces.left + window->render_data.geometry.spaces.right);
+    int32_t window_height = ui->screen_height + (int32_t)(window->render_data.geometry.spaces.top + window->render_data.geometry.spaces.bottom);
 
     // Position the track depending on the chosen edge
-    GLsizei track_left, track_top, track_width, track_height;
+    int32_t track_left, track_top, track_width, track_height;
     switch (pos) {
         case PROGRESS_BAR_BOTTOM:
             track_left = window_left_edge + gap_px;
@@ -2109,11 +2123,11 @@ draw_progress_bar(const UIRenderData *ui) {
     }
 
     // Draw track (background)
-    save_viewport_using_top_left_origin(track_left, track_top, track_width, track_height, ui->full_framebuffer_height);
+    save_viewport(track_left, track_top, track_width, track_height);
     if (track_opacity > 0) {
         bind_program(TINT_PROGRAM);
         set_color_uniform_with_opacity(track_color, track_opacity);
-        glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), -1.f, 1.f, 1.f, -1.f);
+        param_4f(program_param(TINT_PROGRAM, "edges"), -1.f, -1.f, 1.f, 1.f);
         draw_quad(true, 0);
     }
     restore_viewport();
@@ -2131,12 +2145,11 @@ draw_progress_bar(const UIRenderData *ui) {
         if (!is_horizontal) pos_frac = 1.0f - pos_frac; // vertical: bounce bottom-to-top first
         float handle_start = pos_frac * (1.0f - handle_size);
         if (opacity > 0.0f) {
-            draw_progress_handle(
-                ui, bar_color, opacity, bar_radius, track_left, track_top, track_width, track_height, handle_start, handle_size, is_horizontal);
+            draw_progress_handle(bar_color, opacity, bar_radius, track_left, track_top, track_width, track_height, handle_start, handle_size, is_horizontal);
         }
     } else if (fill_fraction > 0.0f && opacity > 0.0f) {
         float handle_start = is_horizontal ? 0.0f : 1.0f - fill_fraction;
-        draw_progress_handle(ui, bar_color, opacity, bar_radius, track_left, track_top, track_width, track_height, handle_start, fill_fraction, is_horizontal);
+        draw_progress_handle(bar_color, opacity, bar_radius, track_left, track_top, track_width, track_height, handle_start, fill_fraction, is_horizontal);
     }
 }
 
@@ -2185,7 +2198,7 @@ draw_window_logo(const UIRenderData *ui) {
     w.top = (int)(ui->screen_height * wl->position.canvas_y - w.height * wl->position.image_y);
     float left = gl_pos_x(w.left, ui->screen_width), top = gl_pos_y(w.top, ui->screen_height);
     ImageRenderData d = {.texture_id = wl->instance->texture_id};
-    gpu_data_for_image(&d, left, top, left + gl_size(w.width, ui->screen_width), top - gl_size(w.height, ui->screen_height));
+    gpu_data_for_image(&d, left, top, left + gl_size(w.width, ui->screen_width), top + gl_size(w.height, ui->screen_height));
     draw_graphics(GRAPHICS_PROGRAM, &d, 0, 1, ui->inactive_text_alpha * OPT(window_logo_alpha));
 }
 
@@ -2206,16 +2219,57 @@ current_framebuffer_is_ok(void) {
 
 enum { DRAW_NEITHER_BG = 0, DRAW_DEFAULT_BG = 1, DRAW_NON_DEFAULT_BG = 2, DRAW_BOTH_BG = 3 };
 
+static void configure_cell_vao_attributes(ssize_t vao_idx, unsigned int base_cell, unsigned int cell_step);
+
+static Viewport
+smooth_scroll_region_rect(const UIRenderData *ui, const SmoothScrollRenderRegion *r) {
+    // The rectangle of the region in framebuffer pixels
+    return (Viewport){
+        .left = ui->screen_left + r->left * ui->cell_width,
+        .top = ui->screen_top + r->top * ui->cell_height + (unsigned)MAX(0, r->y_offset),
+        .width = r->width * ui->cell_width,
+        .height = r->height * ui->cell_height};
+}
+
+static void
+draw_smooth_scroll_regions(int program, const UIRenderData *ui, ssize_t vao_idx, bool for_final_output) {
+    // Draw the strips of the shifted smooth scroll regions, each as a grid of
+    // cells in the rectangle of the region, shifted by its offset and clipped
+    // to it, see SmoothScrollRenderRegion. The cells of the rectangles were
+    // skipped when drawing the screen.
+    const SmoothScrollRender *ssr = &ui->screen->smooth_scroll_render;
+    const uint32_t slot = program_uniform_block(program, "CellRenderData").slot;
+    for (unsigned i = 0; i < ssr->count; i++) {
+        const SmoothScrollRenderRegion *r = ssr->regions + i;
+        if (!smooth_scroll_render_region_is_shifted(r)) continue;
+        const Viewport vp = smooth_scroll_region_rect(ui, r);
+        bind_vao_uniform_buffer(vao_idx, REGION_UNIFORM_BUFFER_BASE + i, slot);
+        configure_cell_vao_attributes(vao_idx, r->base_cell, 1);
+        if (r->horizontal) {
+            // The viewport can extend beyond the framebuffer, the scissor rectangle clips to the rectangle of the region
+            const int32_t x = (int32_t)vp.left - (int32_t)ui->cell_width + r->offset;
+            save_viewport(x, (int32_t)vp.top, vp.width + 2 * ui->cell_width, vp.height);
+        } else save_viewport((int32_t)vp.left, (int32_t)vp.top, vp.width, vp.height);
+        enable_scissor(vp);
+        draw_quad(!for_final_output, smooth_scroll_render_region_strip_width(r) * smooth_scroll_render_region_strip_height(r));
+        disable_scissor();
+        restore_viewport();
+    }
+    configure_cell_vao_attributes(vao_idx, 0, 1);
+}
+
 static void
 call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for_final_output, unsigned draw_bg_bitfield) {
     bind_program(program);
+    bind_style_texture(program, ui->screen);
     CELL_BUFFERS;
-    bind_vao_uniform_buffer(vao_idx, uniform_buffer, CELL_RENDER_DATA_BINDING_POINT);
-    bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
-    glUniform1ui(program_uniform_location(program, "draw_bg_bitfield"), draw_bg_bitfield);
-    if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
+    bind_vao_uniform_buffer(vao_idx, uniform_buffer, program_uniform_block(program, "CellRenderData").slot);
+    bind_vao_uniform_buffer(vao_idx, color_table_buffer, program_uniform_block(program, "ColorTable").slot);
+    param_1ui(program_param(program, "draw_bg_bitfield"), draw_bg_bitfield);
+    if (for_final_output) gpu_set_srgb_output(true);
     draw_quad(!for_final_output, render_lines_for_screen(ui->screen) * ui->screen->columns);
-    if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
+    if (UNLIKELY(ui->screen->smooth_scroll_render.num_strip_cells)) draw_smooth_scroll_regions(program, ui, vao_idx, for_final_output);
+    if (for_final_output) gpu_set_srgb_output(false);
 }
 
 static void
@@ -2230,63 +2284,29 @@ configure_cell_vao_attributes(ssize_t vao_idx, unsigned int base_cell, unsigned 
     // layout after padding draws (base_cell=0, cell_step=1). The VAO must be
     // bound before calling this.
     CELL_BUFFERS;
-    const GLsizei cell_stride = (GLsizei)(cell_step * sizeof(GPUCell));
-    const uintptr_t cell_base = (uintptr_t)base_cell * sizeof(GPUCell);
-    set_vao_attribute(
-        vao_idx,
-        cell_data_buffer,
-        program_attribute_location(CELL_PROGRAM, "sprite_idx"),
-        2,
-        GL_UNSIGNED_INT,
-        cell_stride,
-        (void *)(cell_base + offsetof(GPUCell, sprite_idx)),
-        1);
-    set_vao_attribute(
-        vao_idx,
-        cell_data_buffer,
-        program_attribute_location(CELL_PROGRAM, "colors"),
-        3,
-        GL_UNSIGNED_INT,
-        cell_stride,
-        (void *)(cell_base + offsetof(GPUCell, fg)),
-        1);
+    const uint32_t cell_stride = (uint32_t)(cell_step * sizeof(CellGPUData));
+    const size_t cell_base = (size_t)base_cell * sizeof(CellGPUData);
+    set_vao_attribute(vao_idx, cell_data_buffer, program_attribute_location(CELL_PROGRAM, "cell_input"), 2, GPU_ATTRIB_U32, cell_stride, cell_base, 1);
     set_vao_attribute(
         vao_idx,
         selection_buffer,
         program_attribute_location(CELL_PROGRAM, "is_selected"),
         1,
-        GL_UNSIGNED_BYTE,
-        (GLsizei)(cell_step * sizeof(GLubyte)),
-        (void *)((uintptr_t)base_cell * sizeof(GLubyte)),
+        GPU_ATTRIB_U8,
+        (uint32_t)(cell_step * selection_stride),
+        (size_t)base_cell * selection_stride,
         1);
 }
 
 static void
 configure_padding_vao_attributes(ssize_t vao_idx) {
     // Point the instanced cell attributes at the dedicated padding buffers
-    // (base=0, stride=sizeof(GPUCell)), which are pre-packed before each
+    // (base=0, stride=sizeof(CellGPUData)), which are pre-packed before each
     // combined draw. The VAO must be bound before calling this.
     CELL_BUFFERS;
+    set_vao_attribute(vao_idx, padding_cell_data_buffer, program_attribute_location(CELL_PROGRAM, "cell_input"), 2, GPU_ATTRIB_U32, sizeof(CellGPUData), 0, 1);
     set_vao_attribute(
-        vao_idx,
-        padding_cell_data_buffer,
-        program_attribute_location(CELL_PROGRAM, "sprite_idx"),
-        2,
-        GL_UNSIGNED_INT,
-        sizeof(GPUCell),
-        (void *)offsetof(GPUCell, sprite_idx),
-        1);
-    set_vao_attribute(
-        vao_idx,
-        padding_cell_data_buffer,
-        program_attribute_location(CELL_PROGRAM, "colors"),
-        3,
-        GL_UNSIGNED_INT,
-        sizeof(GPUCell),
-        (void *)offsetof(GPUCell, fg),
-        1);
-    set_vao_attribute(
-        vao_idx, padding_selection_buffer, program_attribute_location(CELL_PROGRAM, "is_selected"), 1, GL_UNSIGNED_BYTE, sizeof(GLubyte), NULL, 1);
+        vao_idx, padding_selection_buffer, program_attribute_location(CELL_PROGRAM, "is_selected"), 1, GPU_ATTRIB_U8, (uint32_t)selection_stride, 0, 1);
 }
 
 static void
@@ -2312,61 +2332,62 @@ draw_window_padding(const UIRenderData *ui, unsigned int cl, unsigned int ct, un
     const float fL = (float)ui->screen_left, T = (float)ui->screen_top;
     const float R = fL + (float)ui->screen_width, B = T + (float)ui->screen_height;
 #define NX(px) (2.f * (px) / fbw - 1.f)
-#define NY(px) (1.f - 2.f * (px) / fbh)
+#define NY(px) (2.f * (px) / fbh - 1.f)
     const float dx = 2.f * cw / fbw, dy = 2.f * ch / fbh;
 
     bind_program(PADDING_PROGRAM);
+    bind_style_texture(PADDING_PROGRAM, ui->screen);
     bind_vertex_array(vao_idx);
     CELL_BUFFERS;
-    bind_vao_uniform_buffer(vao_idx, uniform_buffer, CELL_RENDER_DATA_BINDING_POINT);
-    bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
-    if (for_final_output) glEnable(GL_FRAMEBUFFER_SRGB);
+    bind_vao_uniform_buffer(vao_idx, uniform_buffer, program_uniform_block(PADDING_PROGRAM, "CellRenderData").slot);
+    bind_vao_uniform_buffer(vao_idx, color_table_buffer, program_uniform_block(PADDING_PROGRAM, "ColorTable").slot);
+    if (for_final_output) gpu_set_srgb_output(true);
 
     // Point instanced attributes at the padding-specific buffers once for both draws.
     configure_padding_vao_attributes(vao_idx);
 
-#define PL(x) program_uniform_location(PADDING_PROGRAM, #x)
+#define PL(x) program_param(PADDING_PROGRAM, #x)
 
     // Horizontal combined draw: top strip (strip 0) + bottom strip (strip 1).
     // Cell data is packed contiguously via GPU-side copies (no CPU round-trip).
     if (ct || cb) {
         const unsigned int nH = (ct ? 1u : 0u) + (cb ? 1u : 0u);
-        alloc_vao_buffer(vao_idx, (GLsizeiptr)(sizeof(GPUCell) * nH * columns), padding_cell_data_buffer, GL_DYNAMIC_DRAW);
-        alloc_vao_buffer(vao_idx, (GLsizeiptr)(sizeof(GLubyte) * nH * columns), padding_selection_buffer, GL_DYNAMIC_DRAW);
+        alloc_vao_buffer(vao_idx, (size_t)(sizeof(CellGPUData) * nH * columns), padding_cell_data_buffer, GPU_UPDATE_OFTEN);
+        alloc_vao_buffer(vao_idx, selection_stride * nH * columns, padding_selection_buffer, GPU_UPDATE_OFTEN);
 
         unsigned int sidx = 0u;
         if (ct) {
             copy_vao_buffer_region(
                 vao_idx,
                 cell_data_buffer,
-                (GLintptr)(sizeof(GPUCell) * top_row * columns),
+                (size_t)(sizeof(CellGPUData) * top_row * columns),
                 padding_cell_data_buffer,
-                (GLintptr)(sizeof(GPUCell) * sidx * columns),
-                (GLsizeiptr)(columns * sizeof(GPUCell)));
+                (size_t)(sizeof(CellGPUData) * sidx * columns),
+                (size_t)(columns * sizeof(CellGPUData)));
             copy_vao_buffer_region(
                 vao_idx,
                 selection_buffer,
-                (GLintptr)(sizeof(GLubyte) * top_row * columns),
+                selection_stride * top_row * columns,
                 padding_selection_buffer,
-                (GLintptr)(sizeof(GLubyte) * sidx * columns),
-                (GLsizeiptr)(columns * sizeof(GLubyte)));
+                selection_stride * sidx * columns,
+                selection_stride * columns);
             sidx++;
         }
         if (cb) {
             copy_vao_buffer_region(
                 vao_idx,
                 cell_data_buffer,
-                (GLintptr)(sizeof(GPUCell) * bottom_row * columns),
+                (size_t)(sizeof(CellGPUData) * bottom_row * columns),
                 padding_cell_data_buffer,
-                (GLintptr)(sizeof(GPUCell) * sidx * columns),
-                (GLsizeiptr)(sizeof(GPUCell) * columns));
+                (size_t)(sizeof(CellGPUData) * sidx * columns),
+                (size_t)(sizeof(CellGPUData) * columns));
             copy_vao_buffer_region(
                 vao_idx,
                 selection_buffer,
-                (GLintptr)(sizeof(GLubyte) * bottom_row * columns),
+                selection_stride * bottom_row * columns,
                 padding_selection_buffer,
-                (GLintptr)(sizeof(GLubyte) * sidx * columns),
-                (GLsizeiptr)(columns * sizeof(GLubyte)));
+                selection_stride * sidx * columns,
+                selection_stride * columns);
         }
 
         // Strip-0 is top (or bottom when only bottom exists); strip-1 is bottom.
@@ -2374,16 +2395,16 @@ draw_window_padding(const UIRenderData *ui, unsigned int cl, unsigned int ct, un
         // the shader lerp is a no-op for all instances (strip_f is always 0.0).
         const unsigned int base0 = (ct ? top_row : bottom_row) * columns;
         const unsigned int base1 = bottom_row * columns;
-        glUniform1ui(PL(is_horizontal), 1u);
-        glUniform1ui(PL(along_count), columns);
-        glUniform1ui(PL(instance_step), 1u);
-        glUniform1ui(PL(base_instance), base0);
-        glUniform1ui(PL(base_instance2), base1);
-        glUniform2f(PL(across), ct ? NY(T - ct) : NY(B), ct ? NY(T) : NY(B + cb));
-        glUniform2f(PL(across2), NY(B), NY(B + cb));
-        glUniform1f(PL(along_start), NX(fL));
-        glUniform1f(PL(along_step), dx);
-        glUniform2f(PL(along_clamp), NX(fL), NX(R));
+        param_1ui(PL(is_horizontal), 1u);
+        param_1ui(PL(along_count), columns);
+        param_1ui(PL(instance_step), 1u);
+        param_1ui(PL(base_instance), base0);
+        param_1ui(PL(base_instance2), base1);
+        param_2f(PL(across), ct ? NY(T - ct) : NY(B), ct ? NY(T) : NY(B + cb));
+        param_2f(PL(across2), NY(B), NY(B + cb));
+        param_1f(PL(along_start), NX(fL));
+        param_1f(PL(along_step), dx);
+        param_2f(PL(along_clamp), NX(fL), NX(R));
         draw_quad(!for_final_output, nH * columns);
     }
 
@@ -2393,51 +2414,53 @@ draw_window_padding(const UIRenderData *ui, unsigned int cl, unsigned int ct, un
     if (cl || cr) {
         const unsigned int nV = (cl ? 1u : 0u) + (cr ? 1u : 0u);
         // VLA sizes: lines is bounded by the window height / cell height (~<500).
-        GPUCell gathered_cells[2 * lines];
-        GLubyte gathered_sel[2 * lines];
+        CellGPUData gathered_cells[2 * lines];
+        uint8_t gathered_sel[2 * lines * selection_stride];
 
         const unsigned int strip0_col = cl ? 0u : (columns - 1u);
         const unsigned int strip1_col = columns - 1u;
 
-        const GPUCell *cells = (const GPUCell *)map_vao_buffer_for_reading(vao_idx, cell_data_buffer);
+        const CellGPUData *cells = (const CellGPUData *)map_vao_buffer_for_reading(vao_idx, cell_data_buffer);
         for (unsigned int i = 0; i < lines; i++) {
             gathered_cells[i] = cells[(top_row + i) * columns + strip0_col];
             if (nV == 2u) gathered_cells[lines + i] = cells[(top_row + i) * columns + strip1_col];
         }
         unmap_vao_buffer(vao_idx, cell_data_buffer);
 
-        const GLubyte *sel = (const GLubyte *)map_vao_buffer_for_reading(vao_idx, selection_buffer);
+        const uint8_t *sel = (const uint8_t *)map_vao_buffer_for_reading(vao_idx, selection_buffer);
+#define SEL(idx) (sel + selection_stride * (idx))
         for (unsigned int i = 0; i < lines; i++) {
-            gathered_sel[i] = sel[(top_row + i) * columns + strip0_col];
-            if (nV == 2u) gathered_sel[lines + i] = sel[(top_row + i) * columns + strip1_col];
+            memcpy(gathered_sel + selection_stride * i, SEL((top_row + i) * columns + strip0_col), selection_stride);
+            if (nV == 2u) memcpy(gathered_sel + selection_stride * (lines + i), SEL((top_row + i) * columns + strip1_col), selection_stride);
         }
+#undef SEL
         unmap_vao_buffer(vao_idx, selection_buffer);
 
-        void *dst = alloc_and_map_vao_buffer(vao_idx, (GLsizeiptr)(sizeof(GPUCell) * nV * lines), padding_cell_data_buffer);
-        memcpy(dst, gathered_cells, sizeof(GPUCell) * nV * lines);
+        void *dst = alloc_and_map_vao_buffer(vao_idx, (size_t)(sizeof(CellGPUData) * nV * lines), padding_cell_data_buffer);
+        memcpy(dst, gathered_cells, sizeof(CellGPUData) * nV * lines);
         unmap_vao_buffer(vao_idx, padding_cell_data_buffer);
 
-        dst = alloc_and_map_vao_buffer(vao_idx, (GLsizeiptr)(sizeof(GLubyte) * nV * lines), padding_selection_buffer);
-        memcpy(dst, gathered_sel, sizeof(GLubyte) * nV * lines);
+        dst = alloc_and_map_vao_buffer(vao_idx, selection_stride * nV * lines, padding_selection_buffer);
+        memcpy(dst, gathered_sel, selection_stride * nV * lines);
         unmap_vao_buffer(vao_idx, padding_selection_buffer);
 
         const unsigned int base0 = top_row * columns + (cl ? 0u : (columns - 1u));
         const unsigned int base1 = top_row * columns + (columns - 1u);
-        glUniform1ui(PL(is_horizontal), 0u);
-        glUniform1ui(PL(along_count), lines);
-        glUniform1ui(PL(instance_step), columns);
-        glUniform1ui(PL(base_instance), base0);
-        glUniform1ui(PL(base_instance2), base1);
-        glUniform2f(PL(across), cl ? NX(fL - cl) : NX(R), cl ? NX(fL) : NX(R + cr));
-        glUniform2f(PL(across2), NX(R), NX(R + cr));
-        glUniform1f(PL(along_start), NY(T));
-        glUniform1f(PL(along_step), -dy);
-        glUniform2f(PL(along_clamp), NY(T - ct), NY(B + cb));
+        param_1ui(PL(is_horizontal), 0u);
+        param_1ui(PL(along_count), lines);
+        param_1ui(PL(instance_step), columns);
+        param_1ui(PL(base_instance), base0);
+        param_1ui(PL(base_instance2), base1);
+        param_2f(PL(across), cl ? NX(fL - cl) : NX(R), cl ? NX(fL) : NX(R + cr));
+        param_2f(PL(across2), NX(R), NX(R + cr));
+        param_1f(PL(along_start), NY(T));
+        param_1f(PL(along_step), dy);
+        param_2f(PL(along_clamp), NY(T - ct), NY(B + cb));
         draw_quad(!for_final_output, nV * lines);
     }
 
 #undef PL
-    if (for_final_output) glDisable(GL_FRAMEBUFFER_SRGB);
+    if (for_final_output) gpu_set_srgb_output(false);
     // Restore the canonical cell attribute layout so subsequent cell rendering is unaffected.
     configure_cell_vao_attributes(vao_idx, 0u, 1u);
     unbind_program();
@@ -2448,8 +2471,8 @@ draw_window_padding(const UIRenderData *ui, unsigned int cl, unsigned int ct, un
 static void
 draw_tint(const UIRenderData *ui) {
     bind_program(TINT_PROGRAM);
-    color_vec4_premult(program_uniform_location(TINT_PROGRAM, "tint_color"), ui->background_color, OPT(background_tint));
-    glUniform4f(program_uniform_location(TINT_PROGRAM, "edges"), -1, 1, 1, -1);
+    color_vec4_premult(program_param(TINT_PROGRAM, "tint_color"), ui->background_color, OPT(background_tint));
+    param_4f(program_param(TINT_PROGRAM, "edges"), -1, -1, 1, 1);
     draw_quad(true, 0);
 }
 
@@ -2464,20 +2487,35 @@ program_for_image(const ImageRenderData *rd) {
 }
 
 static void
-draw_image_layer(const UIRenderData *ui, ssize_t vao_idx, GLuint start, GLuint count) {
-    if (!ui->grd.num_of_indexed_refs) {
+draw_image_layer(const UIRenderData *ui, ssize_t vao_idx, uint32_t start, uint32_t count) {
+    if (!ui->grd.num_of_indexed_refs && !ui->grd.num_of_smooth_scroll_refs) {
         draw_graphics(GRAPHICS_PROGRAM, ui->grd.images, start, count, ui->inactive_text_alpha);
         return;
     }
     CELL_BUFFERS;
     // The color table may not be bound yet, for example, when the window has a background image
-    bind_vao_uniform_buffer(vao_idx, color_table_buffer, COLOR_TABLE_BINDING_POINT);
+    if (ui->grd.num_of_indexed_refs) bind_vao_uniform_buffer(vao_idx, color_table_buffer, program_uniform_block(GRAPHICS_INDEXED_PROGRAM, "ColorTable").slot);
+    // Images moving with a smooth scroll region are clipped to its rectangle
+    const SmoothScrollRender *ssr = &ui->screen->smooth_scroll_render;
     const ImageRenderData *data = ui->grd.images;
-    for (GLuint run_start = start, end = start + count; run_start < end;) {
+    for (uint32_t run_start = start, end = start + count; run_start < end;) {
         const int program = program_for_image(data + run_start);
-        GLuint run_end = run_start + 1;
-        while (run_end < end && program_for_image(data + run_end) == program) run_end++;
+        const uint8_t region = data[run_start].smooth_scroll_region;
+        uint32_t run_end = run_start + 1;
+        while (run_end < end && program_for_image(data + run_end) == program && data[run_end].smooth_scroll_region == region) run_end++;
+        const bool clipped = region && region <= ssr->count;
+        if (clipped) {
+            const SmoothScrollRenderRegion *r = ssr->regions + region - 1;
+            Viewport vp = smooth_scroll_region_rect(ui, r);
+            if (r->uses_history) {
+                // The images in the scrollback above the region are visible when the screen is scrolled back
+                vp.height += vp.top - ui->screen_top;
+                vp.top = ui->screen_top;
+            }
+            enable_scissor(vp);
+        }
         draw_graphics(program, ui->grd.images, run_start, run_end - run_start, ui->inactive_text_alpha);
+        if (clipped) disable_scissor();
         run_start = run_end;
     }
 }
@@ -2510,15 +2548,14 @@ blank_canvas(float background_opacity, color_type color_in_srgb, bool for_final_
     if (for_final_output) {
         // we need to write pre-multiplied sRGB color to framebuffer
 #define C(shift) ((((color_in_srgb >> shift) & 0xFF) / 255.f) * background_opacity)
-        glClearColor(C(16), C(8), C(0), background_opacity);
+        gpu_clear(C(16), C(8), C(0), background_opacity);
 #undef C
     } else {
         // we need to write pre-multiplied linear color to framebuffer
 #define C(shift) srgb_color((color_in_srgb >> shift) & 0xFF) * background_opacity
-        glClearColor(C(16), C(8), C(0), background_opacity);
+        gpu_clear(C(16), C(8), C(0), background_opacity);
 #undef C
     }
-    glClear(GL_COLOR_BUFFER_BIT);
 }
 
 bool
@@ -2584,7 +2621,7 @@ draw_cells(
         .now = now,
     };
     screen->reload_all_gpu_data = false;
-    save_viewport_using_top_left_origin(ui.screen_left, ui.screen_top, ui.screen_width, ui.screen_height, ui.full_framebuffer_height);
+    save_viewport(ui.screen_left, ui.screen_top, ui.screen_width, ui.screen_height);
     if (ui.os_window->needs_layers) draw_cells_with_layers(&ui, srd->vao_idx);
     else draw_cells_without_layers(&ui, srd->vao_idx);
     restore_viewport();
@@ -2612,7 +2649,7 @@ draw_cells(
 // Borders {{{
 
 static void
-populate_border_colors(GLuint colors[9], color_type active_window_bg, unsigned int num_visible_windows, bool all_windows_have_same_bg, const OSWindow *w) {
+populate_border_colors(uint32_t colors[9], color_type active_window_bg, unsigned int num_visible_windows, bool all_windows_have_same_bg, const OSWindow *w) {
     colors[0] = (num_visible_windows > 1 && !all_windows_have_same_bg) ? OPT(background) : active_window_bg;
     colors[1] = OPT(active_border_color);
     colors[2] = OPT(inactive_border_color);
@@ -2628,22 +2665,22 @@ ssize_t
 create_border_vao(void) {
     ssize_t vao_idx = create_vao();
 
-    add_buffer_to_vao(vao_idx, GL_ARRAY_BUFFER);
+    add_buffer_to_vao(vao_idx, GPU_BUFFER_VERTEX);
     add_attribute_to_vao(
         vao_idx,
         program_attribute_location(BORDERS_PROGRAM, "rect"),
         /*size=*/4,
-        /*dtype=*/GL_FLOAT,
+        /*dtype=*/GPU_ATTRIB_F32,
         /*stride=*/sizeof(BorderRect),
-        /*offset=*/(void *)offsetof(BorderRect, left),
+        /*offset=*/offsetof(BorderRect, left),
         /*divisor=*/1);
     add_attribute_to_vao(
         vao_idx,
         program_attribute_location(BORDERS_PROGRAM, "rect_color"),
         /*size=*/1,
-        /*dtype=*/GL_UNSIGNED_INT,
+        /*dtype=*/GPU_ATTRIB_U32,
         /*stride=*/sizeof(BorderRect),
-        /*offset=*/(void *)(offsetof(BorderRect, color)),
+        /*offset=*/offsetof(BorderRect, color),
         /*divisor=*/1);
 
     return vao_idx;
@@ -2671,17 +2708,17 @@ draw_borders(
         if (borders_buf_address) memcpy(borders_buf_address, rect_buf, sz);
         unmap_vao_buffer(vao_idx, 0);
     }
-    GLuint colors[9];
+    uint32_t colors[9];
     populate_border_colors(colors, active_window_bg, num_visible_windows, all_windows_have_same_bg, w);
     void *colors_buf =
         map_vao_buffer_for_write_only(shader_globals_vao_idx, BORDER_COLORS_GLOBAL_BUFFER, 0, program_uniform_block(BORDERS_PROGRAM, "Colors").size);
     const ArrayInformation border_colors_array = program_uniform_array(BORDERS_PROGRAM, "colors");
     write_uint_array_to_ubo(colors_buf, colors, arraysz(colors), &border_colors_array);
     unmap_vao_buffer(shader_globals_vao_idx, BORDER_COLORS_GLOBAL_BUFFER);
-    glUniform1f(program_uniform_location(BORDERS_PROGRAM, "background_opacity"), background_opacity);
-    if (!w->needs_layers) glEnable(GL_FRAMEBUFFER_SRGB);
+    param_1f(program_param(BORDERS_PROGRAM, "background_opacity"), background_opacity);
+    if (!w->needs_layers) gpu_set_srgb_output(true);
     draw_quad(has_background_image, num_border_rects);
-    if (!w->needs_layers) glDisable(GL_FRAMEBUFFER_SRGB);
+    if (!w->needs_layers) gpu_set_srgb_output(false);
     unbind_program();
     unbind_vertex_array();
 }
@@ -2689,7 +2726,7 @@ draw_borders(
 void
 draw_rounded_borders(BorderRects *br, color_type active_window_bg, unsigned int num_visible_windows, bool all_windows_have_same_bg, OSWindow *w) {
     if (!br->num_rounded_rects) return;
-    GLuint colors[9];
+    uint32_t colors[9];
     populate_border_colors(colors, active_window_bg, num_visible_windows, all_windows_have_same_bg, w);
     // The corner regions between the rounded outline and its bounding rect
     // must be painted every frame: when not rendering in layers the
@@ -2698,7 +2735,7 @@ draw_rounded_borders(BorderRects *br, color_type active_window_bg, unsigned int 
     // uses for non-border rects, so corners match the surrounding gaps.
     float corner_bg_alpha = has_bgimage(w) ? OPT(background_tint) * OPT(background_tint_gaps) : effective_os_window_alpha(w);
     bind_vertex_array(br->vao_idx);
-    if (!w->needs_layers) glEnable(GL_FRAMEBUFFER_SRGB);
+    if (!w->needs_layers) gpu_set_srgb_output(true);
     for (unsigned i = 0; i < br->num_border_rects; i++) {
         const BorderRect *r = br->rect_buf + i;
         if (!r->radius || !r->thickness) continue;
@@ -2706,9 +2743,9 @@ draw_rounded_borders(BorderRects *br, color_type active_window_bg, unsigned int 
         unsigned radius = MIN(r->radius, MIN(rect.width, rect.height) / 2);
         unsigned color_index = r->color & 0xff;
         color_type color = color_index == 3 ? r->color >> 8 : colors[MIN(color_index, 8u)];
-        draw_rounded_rect(rect, w->viewport_height, (float)r->thickness, radius, color, 0, 0.f, colors[0], corner_bg_alpha);
+        draw_rounded_rect(rect, (float)r->thickness, radius, color, 0, 0.f, colors[0], corner_bg_alpha);
     }
-    if (!w->needs_layers) glDisable(GL_FRAMEBUFFER_SRGB);
+    if (!w->needs_layers) gpu_set_srgb_output(false);
     unbind_program();
     // Deliberately leave the VAO bound: this runs after all cell drawing and
     // subsequent draw_quad() calls (e.g. the fullscreen blit in
@@ -2722,19 +2759,19 @@ void
 draw_cursor_trail(CursorTrail *trail, Window *active_window) {
     bind_program(TRAIL_PROGRAM);
 
-    glUniform4fv(program_uniform_location(TRAIL_PROGRAM, "x_coords"), 1, trail->corner_x);
-    glUniform4fv(program_uniform_location(TRAIL_PROGRAM, "y_coords"), 1, trail->corner_y);
+    param_floats(program_param(TRAIL_PROGRAM, "x_coords"), 4, 1, trail->corner_x);
+    param_floats(program_param(TRAIL_PROGRAM, "y_coords"), 4, 1, trail->corner_y);
 
-    glUniform2fv(program_uniform_location(TRAIL_PROGRAM, "cursor_edge_x"), 1, trail->cursor_edge_x);
-    glUniform2fv(program_uniform_location(TRAIL_PROGRAM, "cursor_edge_y"), 1, trail->cursor_edge_y);
+    param_floats(program_param(TRAIL_PROGRAM, "cursor_edge_x"), 2, 1, trail->cursor_edge_x);
+    param_floats(program_param(TRAIL_PROGRAM, "cursor_edge_y"), 2, 1, trail->cursor_edge_y);
 
     color_type trail_color = OPT(cursor_trail_color);
     if (trail_color == 0) { // 0 means "none" was specified
         trail_color = active_window ? active_window->render_data.screen->last_rendered.cursor_bg : OPT(foreground);
     }
-    color_vec3(program_uniform_location(TRAIL_PROGRAM, "trail_color"), trail_color);
+    color_vec3(program_param(TRAIL_PROGRAM, "trail_color"), trail_color);
 
-    glUniform1f(program_uniform_location(TRAIL_PROGRAM, "trail_opacity"), trail->opacity);
+    param_1f(program_param(TRAIL_PROGRAM, "trail_opacity"), trail->opacity);
 
     draw_quad(true, 0);
     unbind_program();
@@ -2757,10 +2794,10 @@ draw_bg_image(OSWindow *os_window, Tab *tab) {
         .bgcolor = OPT(background),
         .opacity = effective_os_window_alpha(os_window),
     };
-    GLfloat iwidth = bg->width, iheight = bg->height;
-    GLfloat vwidth = s.os_window.width, vheight = s.os_window.height;
+    float iwidth = bg->width, iheight = bg->height;
+    float vwidth = s.os_window.width, vheight = s.os_window.height;
     if (CENTER_SCALED == layout) {
-        GLfloat ifrac = iwidth / iheight;
+        float ifrac = iwidth / iheight;
         if (ifrac > (vwidth / vheight)) {
             iheight = vheight;
             iwidth = iheight * ifrac;
@@ -2769,9 +2806,9 @@ draw_bg_image(OSWindow *os_window, Tab *tab) {
             iheight = iwidth / ifrac;
         }
     }
-    GLfloat tiled = 0.f;
+    float tiled = 0.f;
     ;
-    GLfloat left = -1.0, top = 1.0, right = 1.0, bottom = -1.0;
+    float left = -1.0, top = -1.0, right = 1.0, bottom = 1.0;
     switch (layout) {
         case TILING:
         case MIRRORED:
@@ -2779,24 +2816,22 @@ draw_bg_image(OSWindow *os_window, Tab *tab) {
         case SCALED: break;
         case CENTER_CLAMPED:
         case CENTER_SCALED: {
-            GLfloat wfrac = (vwidth - iwidth) / vwidth;
-            GLfloat hfrac = (vheight - iheight) / vheight;
+            float wfrac = (vwidth - iwidth) / vwidth;
+            float hfrac = (vheight - iheight) / vheight;
             left += wfrac;
             right -= wfrac;
-            top -= hfrac;
-            bottom += hfrac;
+            top += hfrac;
+            bottom -= hfrac;
         } break;
     }
     bind_program(BGIMAGE_PROGRAM);
     // altough we dont use this VO we need to ensure *some* VAO is bound at this point.
     bind_vertex_array(tab->border_rects.vao_idx);
-    glUniform4f(program_uniform_location(BGIMAGE_PROGRAM, "sizes"), vwidth, vheight, iwidth, iheight);
-    glUniform1f(program_uniform_location(BGIMAGE_PROGRAM, "tiled"), tiled);
-    glUniform4f(program_uniform_location(BGIMAGE_PROGRAM, "positions"), left, top, right, bottom);
-    glUniform1i(program_uniform_location(BGIMAGE_PROGRAM, "image"), GRAPHICS_UNIT);
-    color_vec4(program_uniform_location(BGIMAGE_PROGRAM, "background"), s.bgcolor, s.opacity);
-    glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
-    glBindTexture(GL_TEXTURE_2D, bg->texture_id);
+    param_4f(program_param(BGIMAGE_PROGRAM, "sizes"), vwidth, vheight, iwidth, iheight);
+    param_1f(program_param(BGIMAGE_PROGRAM, "tiled"), tiled);
+    param_4f(program_param(BGIMAGE_PROGRAM, "positions"), left, top, right, bottom);
+    color_vec4(program_param(BGIMAGE_PROGRAM, "background"), s.bgcolor, s.opacity);
+    gpu_bind_texture(program_texture_slot(BGIMAGE_PROGRAM, "image"), bg->texture_id);
     draw_quad(false, 0);
     unbind_program();
 }
@@ -2806,18 +2841,104 @@ gpu_data_for_centered_image(ImageRenderData *ans, unsigned int screen_width_px, 
     float width_frac = 2 * MIN(1, width / (float)screen_width_px), height_frac = 2 * MIN(1, height / (float)screen_height_px);
     float hmargin = (2 - width_frac) / 2;
     float vmargin = (2 - height_frac) / 2;
-    gpu_data_for_image(ans, -1 + hmargin, 1 - vmargin, -1 + hmargin + width_frac, 1 - vmargin - height_frac);
+    gpu_data_for_image(ans, -1 + hmargin, -1 + vmargin, -1 + hmargin + width_frac, -1 + vmargin + height_frac);
+}
+
+// Draw an alpha mask directly into the window, after any layers have been
+// composited. The output is encoded to sRGB if the window supports it,
+// otherwise the colors are passed to the shader without linearizing them.
+static void
+draw_alpha_mask(ImageRenderData *data, color_type fg, color_type bg, float background_opacity) {
+    const bool srgb = global_state.supports_framebuffer_srgb;
+    bind_program(GRAPHICS_ALPHA_MASK_PROGRAM);
+    const int32_t fg_loc = program_param(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_fg"), bg_loc = program_param(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_bg_premult");
+    if (srgb) {
+        color_vec3(fg_loc, fg);
+        color_vec4_premult(bg_loc, bg, background_opacity);
+        gpu_set_srgb_output(true);
+    } else {
+#define C(color, shift) (((color >> shift) & 0xff) / 255.f)
+        param_3f(fg_loc, C(fg, 16), C(fg, 8), C(fg, 0));
+        param_4f(bg_loc, C(bg, 16) * background_opacity, C(bg, 8) * background_opacity, C(bg, 0) * background_opacity, background_opacity);
+#undef C
+    }
+    draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, data, 0, 1, 1.0);
+    if (srgb) gpu_set_srgb_output(false);
 }
 
 static void
 draw_centered_alpha_mask(size_t screen_width, size_t screen_height, size_t width, size_t height, uint8_t *canvas, float background_opacity) {
     ImageRenderData *data = load_alpha_mask_texture(width, height, canvas);
     gpu_data_for_centered_image(data, screen_width, screen_height, width, height);
-    bind_program(GRAPHICS_ALPHA_MASK_PROGRAM);
-    glUniform1i(program_uniform_location(GRAPHICS_ALPHA_MASK_PROGRAM, "image"), GRAPHICS_UNIT);
-    color_vec3(program_uniform_location(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_fg"), OPT(foreground));
-    color_vec4_premult(program_uniform_location(GRAPHICS_ALPHA_MASK_PROGRAM, "amask_bg_premult"), OPT(background), background_opacity);
-    draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, data, 0, 1, 1.0);
+    draw_alpha_mask(data, OPT(foreground), OPT(background), background_opacity);
+}
+
+// Render lines of text, each centered horizontally, into a single alpha mask
+// surrounded by padding pixels on every side. Returns a canvas with a NULL
+// pointer on failure.
+static StringCanvas
+render_centered_lines(FONTS_DATA_HANDLE fonts_data, const char *const *lines, size_t num_lines, size_t padding) {
+    StringCanvas ans = {0}, rendered[4] = {0};
+    if (num_lines > arraysz(rendered)) return ans;
+    size_t width = 0, height = 0;
+    bool ok = true;
+    for (size_t i = 0; i < num_lines && ok; i++) {
+        rendered[i] = render_simple_text(fonts_data, lines[i]);
+        if (!rendered[i].canvas) ok = false;
+        else {
+            width = MAX(width, rendered[i].width);
+            height += rendered[i].height;
+        }
+    }
+    if (ok) {
+        ans.width = width + 2 * padding;
+        ans.height = height + 2 * padding;
+        ans.canvas = calloc(ans.width * ans.height, 1);
+        if (ans.canvas) {
+            size_t y = padding;
+            for (size_t i = 0; i < num_lines; i++) {
+                const size_t x = padding + (width - rendered[i].width) / 2;
+                for (size_t r = 0; r < rendered[i].height; r++, y++)
+                    memcpy(ans.canvas + y * ans.width + x, rendered[i].canvas + r * rendered[i].width, rendered[i].width);
+            }
+        }
+    }
+    for (size_t i = 0; i < num_lines; i++) free(rendered[i].canvas);
+    if (!ans.canvas) ans = (StringCanvas){0};
+    return ans;
+}
+
+// Tell the user that software rendering is in use, see the gpu_driver option.
+// Shown at the top of every OS window for SOFTWARE_RENDERING_BANNER_DURATION
+// after it is first rendered, render_os_window() redraws the window to remove it.
+static void
+draw_software_rendering_banner(OSWindow *w, monotonic_t now) {
+    if (!global_state.software_rendering || w->software_rendering_banner.done || w->live_resize.in_progress || !w->fonts_data) return;
+    if (!w->software_rendering_banner.shown) {
+        w->software_rendering_banner.shown = true;
+        w->software_rendering_banner.shown_at = now;
+    }
+    static const char *const lines[] = {"Software rendering is in use,", "so kitty will be slow"};
+    const size_t padding = MAX(4u, w->fonts_data->fcm.cell_height / 2);
+    StringCanvas banner = render_centered_lines(w->fonts_data, lines, arraysz(lines), padding);
+    if (!banner.canvas) {
+        log_error("Failed to render the software rendering banner");
+        w->software_rendering_banner.done = true;
+        return;
+    }
+    const float vw = (float)w->viewport_width, vh = (float)w->viewport_height;
+    if (vw > 0 && vh > 0) {
+        ImageRenderData *data = load_alpha_mask_texture(banner.width, banner.height, banner.canvas);
+        // In normalized device coordinates, horizontally centered, a little below the top edge
+        const float half_width = MIN(1.f, banner.width / vw);
+        const float top = MIN(1.f, -1.f + 2.f * padding / vh), bottom = MIN(1.f, top + 2.f * banner.height / vh);
+        gpu_data_for_image(data, -half_width, top, half_width, bottom);
+        save_viewport(0, 0, w->viewport_width, w->viewport_height);
+        // Inverted colors, so that it stands out from the terminal contents
+        draw_alpha_mask(data, OPT(background), OPT(foreground), 1.f);
+        restore_viewport();
+    }
+    free(banner.canvas);
 }
 
 static void
@@ -2848,6 +2969,14 @@ blank_os_window(OSWindow *osw) {
     blank_canvas(effective_os_window_alpha(osw), color, true);
 }
 
+// (Re)create a render target that draws into texture, freeing any existing one
+static void
+create_render_target_for(gpu_render_target_t *fb, gpu_texture_t texture) {
+    if (*fb) free_framebuffer(fb);
+    *fb = gpu_render_target_create(texture);
+    if (!*fb) fatal("Failed to create a GPU render target with error: %s", gpu_last_error());
+}
+
 static void
 start_os_window_rendering(OSWindow *os_window, Tab *tab) {
     // note that during live resize rendering is done in layers
@@ -2871,10 +3000,9 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
             global_state.layers_render_texture.texture_generation++;
         }
         // Create per-window framebuffer if needed and attach the global texture to it
-        if (!os_window->indirect_output.framebuffer_id) glGenFramebuffers(1, &os_window->indirect_output.framebuffer_id);
-        if (os_window->indirect_output.attached_texture_generation != global_state.layers_render_texture.texture_generation) {
-            bind_framebuffer_for_output(os_window->indirect_output.framebuffer_id);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_id, 0);
+        if (!os_window->indirect_output.framebuffer_id ||
+            os_window->indirect_output.attached_texture_generation != global_state.layers_render_texture.texture_generation) {
+            create_render_target_for(&os_window->indirect_output.framebuffer_id, global_state.layers_render_texture.texture_id);
             os_window->indirect_output.attached_texture_generation = global_state.layers_render_texture.texture_generation;
         }
         if (custom_shaders.end.num_groups > 1) {
@@ -2888,10 +3016,7 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
             }
             // Create/re-attach per-window extra FBO when generation changes
             if (os_window->indirect_output.extra_fbo_generation != global_state.layers_render_texture.texture_generation) {
-                if (os_window->indirect_output.extra_fbo_id) free_framebuffer(&os_window->indirect_output.extra_fbo_id);
-                glGenFramebuffers(1, &os_window->indirect_output.extra_fbo_id);
-                bind_framebuffer_for_output(os_window->indirect_output.extra_fbo_id);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.extra_texture_id, 0);
+                create_render_target_for(&os_window->indirect_output.extra_fbo_id, global_state.layers_render_texture.extra_texture_id);
                 os_window->indirect_output.extra_fbo_generation = global_state.layers_render_texture.texture_generation;
             }
         }
@@ -2905,10 +3030,7 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
                     &global_state.layers_render_texture.texture_a_fbo_id);
             }
             if (os_window->indirect_output.fbo_a_generation != global_state.layers_render_texture.texture_generation) {
-                if (os_window->indirect_output.fbo_a_id) free_framebuffer(&os_window->indirect_output.fbo_a_id);
-                glGenFramebuffers(1, &os_window->indirect_output.fbo_a_id);
-                bind_framebuffer_for_output(os_window->indirect_output.fbo_a_id);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_a_id, 0);
+                create_render_target_for(&os_window->indirect_output.fbo_a_id, global_state.layers_render_texture.texture_a_id);
                 os_window->indirect_output.fbo_a_generation = global_state.layers_render_texture.texture_generation;
             }
         } else {
@@ -2924,10 +3046,7 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
                     &global_state.layers_render_texture.texture_b_fbo_id);
             }
             if (os_window->indirect_output.fbo_b_generation != global_state.layers_render_texture.texture_generation) {
-                if (os_window->indirect_output.fbo_b_id) free_framebuffer(&os_window->indirect_output.fbo_b_id);
-                glGenFramebuffers(1, &os_window->indirect_output.fbo_b_id);
-                bind_framebuffer_for_output(os_window->indirect_output.fbo_b_id);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, global_state.layers_render_texture.texture_b_id, 0);
+                create_render_target_for(&os_window->indirect_output.fbo_b_id, global_state.layers_render_texture.texture_b_id);
                 os_window->indirect_output.fbo_b_generation = global_state.layers_render_texture.texture_generation;
             }
         } else {
@@ -2954,7 +3073,7 @@ start_os_window_rendering(OSWindow *os_window, Tab *tab) {
         }
         set_framebuffer_to_use_for_output(os_window->indirect_output.framebuffer_id);
         bind_framebuffer_for_output(0);
-        save_viewport_using_bottom_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height);
+        save_viewport(0, 0, os_window->viewport_width, os_window->viewport_height);
         clear_current_framebuffer();
         draw_bg_image(os_window, tab);
     }
@@ -3017,7 +3136,7 @@ map_pointer_position(const OSWindow *os_window, double *x, double *y) {
 // pointer map can depend only on the pipeline, the viewport size and which
 // groups are active, so this is done only when those change.
 static void
-update_pointer_map(OSWindow *os_window, GLint group_loc) {
+update_pointer_map(OSWindow *os_window, int32_t group_loc) {
     const uint32_t groups = active_pointer_map_groups(os_window);
     if (os_window->pointer_map.pipeline_generation == custom_shaders.generation && os_window->pointer_map.groups == groups &&
         (os_window->pointer_map.data || !groups)) {
@@ -3034,25 +3153,36 @@ update_pointer_map(OSWindow *os_window, GLint group_loc) {
     if (!pointer_map_target.framebuffer_id)
         setup_texture_as_render_target(POINTER_MAP_SIZE, POINTER_MAP_SIZE, &pointer_map_target.texture_id, &pointer_map_target.framebuffer_id);
     // The pointer map does not sample any textures, but every sampler must be bound to a valid one
-    static const int units[] = {GRAPHICS_UNIT, CUSTOM_END_TEXTURE_A_UNIT, CUSTOM_END_TEXTURE_B_UNIT, CUSTOM_END_TEXTURE_PERSIST_UNIT};
-    for (size_t i = 0; i < arraysz(units); i++) {
-        glActiveTexture(GL_TEXTURE0 + units[i]);
-        glBindTexture(GL_TEXTURE_2D, global_state.layers_render_texture.texture_id);
+    static const char *const names[] = {"backbuffer", "a", "b", "persist"};
+    for (size_t i = 0; i < arraysz(names); i++) {
+        uint32_t slot;
+        if (try_program_texture_slot(CUSTOM_END_PROGRAM, names[i], &slot)) gpu_bind_texture(slot, global_state.layers_render_texture.texture_id);
     }
+    // The windows texture is an integer texture, so it needs one of its own,
+    // run_custom_end_shader() has created it before calling us
+    uint32_t windows_slot;
+    if (os_window->shader_windows.texture && try_program_texture_slot(CUSTOM_END_PROGRAM, "kitty_windows", &windows_slot))
+        gpu_bind_texture(windows_slot, os_window->shader_windows.texture);
     bind_framebuffer_for_output(pointer_map_target.framebuffer_id);
-    glViewport(0, 0, POINTER_MAP_SIZE, POINTER_MAP_SIZE);
-    glUniform1i(group_loc, -1);
+    gpu_set_viewport(0, 0, POINTER_MAP_SIZE, POINTER_MAP_SIZE);
+    param_1i(group_loc, -1);
     // Absent when no group with a pointer_map() is turned on and off by events
-    GLint active_groups_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "active_groups");
-    if (active_groups_loc >= 0) glUniform1ui(active_groups_loc, groups);
+    int32_t active_groups_loc = try_program_param(CUSTOM_END_PROGRAM, "active_groups");
+    if (active_groups_loc >= 0) param_1ui(active_groups_loc, groups);
     draw_quad(false, 0);
     static uint8_t pixels[POINTER_MAP_SIZE * POINTER_MAP_SIZE * 4];
-    glReadPixels(0, 0, POINTER_MAP_SIZE, POINTER_MAP_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    // See encode_pointer_map() in pipeline.slang
-    for (size_t i = 0; i < POINTER_MAP_SIZE * POINTER_MAP_SIZE; i++) {
-        const uint8_t *p = pixels + 4 * i;
-        os_window->pointer_map.data[2 * i] = (float)(p[0] * 256 + p[2]) / 65535.f;
-        os_window->pointer_map.data[2 * i + 1] = (float)(p[1] * 256 + p[3]) / 65535.f;
+    gpu_read_pixels(0, 0, POINTER_MAP_SIZE, POINTER_MAP_SIZE, pixels);
+    // See encode_pointer_map() in pipeline.slang. Rows are read back top to
+    // bottom, while rows of the pointer map are in order of increasing UV y,
+    // that is, bottom to top.
+    for (size_t row = 0; row < POINTER_MAP_SIZE; row++) {
+        const uint8_t *src = pixels + 4 * POINTER_MAP_SIZE * row;
+        float *dst = os_window->pointer_map.data + 2 * POINTER_MAP_SIZE * (POINTER_MAP_SIZE - 1 - row);
+        for (size_t col = 0; col < POINTER_MAP_SIZE; col++) {
+            const uint8_t *p = src + 4 * col;
+            dst[2 * col] = (float)(p[0] * 256 + p[2]) / 65535.f;
+            dst[2 * col + 1] = (float)(p[1] * 256 + p[3]) / 65535.f;
+        }
     }
     os_window->pointer_map.groups = groups;
 }
@@ -3062,6 +3192,129 @@ free_pointer_map_target(void) {
     if (pointer_map_target.texture_id) free_texture(&pointer_map_target.texture_id);
     if (pointer_map_target.framebuffer_id) free_framebuffer(&pointer_map_target.framebuffer_id);
 }
+
+// The visible windows texture for custom shaders {{{
+// Fill ans with the space in pixels the layout reserved around the content of
+// w: margin, border (only if the layout reserves it), padding, cell-size
+// compensation and a visible title bar, as (left, bottom, right, top).
+static void
+window_padding_in_pixels(const Window *w, uint32_t ans[4]) {
+    const WindowGeometry *g = &w->render_data.geometry;
+    ans[0] = g->spaces.left;
+    ans[1] = g->spaces.bottom;
+    ans[2] = g->spaces.right;
+    ans[3] = g->spaces.top;
+    // The content geometry excludes the title bar. Include it before
+    // extending to the outer padding, so the effect boundary cannot
+    // cut through a title bar at either edge of the window.
+    const WindowRenderData *trd = &w->window_title_render_data;
+    if (trd->screen && trd->geometry.right > trd->geometry.left && trd->geometry.bottom > trd->geometry.top) {
+        if (trd->geometry.top < g->top) ans[3] += g->top - trd->geometry.top;
+        if (trd->geometry.bottom > g->bottom) ans[1] += trd->geometry.bottom - g->bottom;
+    }
+}
+
+// As above, in viewport UV units
+static void
+window_padding_in_uv(const Window *w, float width, float height, float ans[4]) {
+    uint32_t px[4];
+    window_padding_in_pixels(w, px);
+    ans[0] = (float)px[0] / width;
+    ans[1] = (float)px[1] / height;
+    ans[2] = (float)px[2] / width;
+    ans[3] = (float)px[3] / height;
+}
+
+// Describe w in the CUSTOM_SHADER_WINDOW_TEXELS texels at t, see KittyWindows in
+// shaders/custom/types.slang for the layout, which must be kept in sync. Only
+// integers are used, as reinterpreting their bits as floats in shaders needs
+// GLSL extensions.
+static void
+describe_window_for_custom_shaders(const OSWindow *os_window, const Window *w, bool is_active, uint32_t *t) {
+    const WindowGeometry *g = &w->render_data.geometry;
+    // In pixels, with the origin at the top left of the viewport
+    t[0] = g->left;
+    t[1] = g->top;
+    t[2] = g->right;
+    t[3] = g->bottom;
+    window_padding_in_pixels(w, t + 4);
+    const Screen *s = w->render_data.screen;
+    uint32_t flags = (uint32_t)s->progress_state & 7u;
+    if (is_active) flags |= 1u << 3;
+    if (s->linebuf == s->alt_linebuf) flags |= 1u << 4;
+    if (s->command_state.running) flags |= 1u << 5;
+    if (os_window->last_bell_window_id == w->id) flags |= 1u << 6;
+    flags |= ((uint32_t)s->progress_previous_state & 7u) << 7;
+    t[8] = flags;
+    // The percentage is meaningful only in these states
+#define PERCENT(state, percent) ((state) == PROGRESS_STATE_SET || (state) == PROGRESS_STATE_PAUSED ? (uint32_t)(percent) : 0u)
+    t[9] = PERCENT(s->progress_state, s->progress_percent) | (PERCENT(s->progress_previous_state, s->progress_previous_percent) << 8);
+#undef PERCENT
+    // The change time is split into seconds and nanoseconds so that it is
+    // exact however long kitty runs, and it, rather than the time since
+    // the change, is used so that the texels do not change from frame to
+    // frame, avoiding re-uploads.
+    if (s->progress_changed_at) {
+        t[10] = (uint32_t)(s->progress_changed_at / MONOTONIC_T_1e9);
+        t[11] = (uint32_t)(s->progress_changed_at % MONOTONIC_T_1e9);
+    } else {
+        t[10] = UINT32_MAX;
+        t[11] = 0;
+    }
+    for (unsigned i = 12; i < CUSTOM_SHADER_WINDOW_TEXELS; i++) t[i] = 0;
+}
+
+// Upload the description of the visible windows of the active tab to the
+// texture of os_window, if it changed since the last upload, and return the
+// number of windows described.
+static uint32_t
+sync_custom_shader_windows_texture(OSWindow *os_window) {
+    __typeof__(os_window->shader_windows) *sw = &os_window->shader_windows;
+    const float vpw = (float)os_window->viewport_width, vph = (float)os_window->viewport_height;
+    size_t count = 0;
+    Tab *tab = NULL;
+    if (os_window->num_tabs > 0 && os_window->active_tab < os_window->num_tabs && vpw > 0 && vph > 0) {
+        tab = os_window->tabs + os_window->active_tab;
+        for (unsigned i = 0; i < tab->num_windows; i++) {
+            const Window *w = tab->windows + i;
+            if (w->visible && w->render_data.screen && w->render_data.geometry.right > w->render_data.geometry.left) count++;
+        }
+    }
+    const uint32_t rows = MAX(1u, (uint32_t)((count + CUSTOM_SHADER_WINDOWS_PER_ROW - 1) / CUSTOM_SHADER_WINDOWS_PER_ROW));
+    const uint32_t width = CUSTOM_SHADER_WINDOW_TEXELS * CUSTOM_SHADER_WINDOWS_PER_ROW;
+    if ((int32_t)rows > max_texture_size) fatal("Max texture size too small for the custom shader windows texture");
+    const size_t num_texels = (size_t)rows * width;
+    uint32_t *texels = calloc(num_texels, sizeof(uint32_t));
+    if (!texels) fatal("Out of memory allocating the custom shader windows texture data");
+    if (count) {
+        size_t n = 0;
+        for (unsigned i = 0; i < tab->num_windows; i++) {
+            const Window *w = tab->windows + i;
+            if (w->visible && w->render_data.screen && w->render_data.geometry.right > w->render_data.geometry.left)
+                describe_window_for_custom_shaders(os_window, w, i == tab->active_window, texels + CUSTOM_SHADER_WINDOW_TEXELS * n++);
+        }
+    }
+    const bool resized = !sw->texture || rows > sw->height;
+    if (resized) {
+        const GPUTextureDesc desc = {
+            .kind = GPU_TEXTURE_2D, .format = GPU_FORMAT_R32UI, .width = width, .height = rows, .filter = GPU_FILTER_NEAREST, .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+        if (sw->texture) {
+            if (!gpu_texture_reset(sw->texture, &desc, NULL)) fatal("Failed to re-allocate the custom shader windows texture with error: %s", gpu_last_error());
+        } else sw->texture = create_texture_or_die(&desc, NULL);
+        sw->height = rows;
+    }
+    const size_t used = count * CUSTOM_SHADER_WINDOW_TEXELS;
+    if (resized || count != sw->uploaded_count || (used && memcmp(texels, sw->uploaded, used * sizeof(uint32_t)) != 0)) {
+        // Upload whole rows, the trailing zeros mark the unused entries
+        const GPUPixelData pixels = {.layout = GPU_PIXELS_R32UI, .row_alignment = 4, .data = texels};
+        gpu_texture_upload(sw->texture, 0, 0, 0, width, rows, &pixels);
+        free(sw->uploaded);
+        sw->uploaded = texels;
+        sw->uploaded_count = count;
+    } else free(texels);
+    return (uint32_t)count;
+}
+// }}}
 
 static void
 run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) {
@@ -3103,6 +3356,7 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         float active_window_command_running;
         float active_window_alternate_screen_age;
         float active_window_command_state_age;
+        uint32_t num_windows;
     };
     // This struct is a hand written mirror of the std140 layout of
     // KittyCustomShaderData in types.slang, so check that they match once.
@@ -3116,14 +3370,21 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
                 data_block.size,
                 sizeof(struct GPUCustomEndData));
     }
+    // Only pipelines that use KittyTextures.windows pay for describing the windows.
+    // Done before mapping the uniform buffer, as this uploads to a texture.
+    uint32_t windows_slot = 0;
+    const bool has_windows_slot = try_program_texture_slot(CUSTOM_END_PROGRAM, "kitty_windows", &windows_slot);
+    const uint32_t num_windows = has_windows_slot ? sync_custom_shader_windows_texture(os_window) : 0;
     struct GPUCustomEndData *d = (struct GPUCustomEndData *)map_vao_buffer_for_write_only(custom_end_vao_idx, 0, 0, data_block.size);
     memset(d, 0, sizeof(struct GPUCustomEndData));
-    d->src_rect[1] = sy;
+    d->num_windows = num_windows;
+    // The viewport is in the top left corner of the texture, see gpu/api.h
     d->src_rect[2] = sx;
+    d->src_rect[3] = sy;
     d->dest_rect[0] = -1;
-    d->dest_rect[1] = 1;
+    d->dest_rect[1] = -1;
     d->dest_rect[2] = 1;
-    d->dest_rect[3] = -1;
+    d->dest_rect[3] = 1;
 #define FILL_COLOR(dst, c)                         \
     do {                                           \
         (dst)[0] = srgb_color(((c) >> 16) & 0xFF); \
@@ -3144,26 +3405,8 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         if (t->num_windows) {
             Window *w = t->windows + t->active_window;
             active_win_geom = w->render_data.geometry;
-            if (os_window->viewport_width && os_window->viewport_height) {
-                const float width = (float)os_window->viewport_width, height = (float)os_window->viewport_height;
-                // spaces is all the space the layout reserved around the window:
-                // margin, border (only if the layout reserves it), padding and
-                // cell-size compensation.
-                const WindowGeometry *sg = &w->render_data.geometry;
-                d->active_window_padding[0] = (float)sg->spaces.left / width;
-                d->active_window_padding[1] = (float)sg->spaces.bottom / height;
-                d->active_window_padding[2] = (float)sg->spaces.right / width;
-                d->active_window_padding[3] = (float)sg->spaces.top / height;
-                // The content geometry excludes the title bar. Include it before
-                // extending to the outer padding, so the effect boundary cannot
-                // cut through a title bar at either edge of the window.
-                const WindowRenderData *trd = &w->window_title_render_data;
-                if (trd->screen && trd->geometry.right > trd->geometry.left && trd->geometry.bottom > trd->geometry.top) {
-                    if (trd->geometry.top < active_win_geom.top) d->active_window_padding[3] += (float)(active_win_geom.top - trd->geometry.top) / height;
-                    if (trd->geometry.bottom > active_win_geom.bottom)
-                        d->active_window_padding[1] += (float)(trd->geometry.bottom - active_win_geom.bottom) / height;
-                }
-            }
+            if (os_window->viewport_width && os_window->viewport_height)
+                window_padding_in_uv(w, (float)os_window->viewport_width, (float)os_window->viewport_height, d->active_window_padding);
             Screen *s = w->render_data.screen;
             if (s) {
                 active_bg = colorprofile_to_color(s->color_profile, s->color_profile->overridden.default_bg, s->color_profile->configured.default_bg).rgb;
@@ -3180,7 +3423,9 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
     }
     FILL_COLOR(d->active_window_background, active_bg);
 #undef FILL_COLOR
+    // NDC y increases downwards while UV y, as seen by custom shaders, increases upwards
 #define NDC_TO_UV(v) (((v) + 1.0f) * 0.5f)
+#define NDC_Y_TO_UV(v) ((1.0f - (v)) * 0.5f)
     // Convert to seconds via double, as float32 cannot represent times since
     // kitty started precisely once kitty has been running for a few hours.
 #define SECONDS(t) ((float)monotonic_t_to_s_double(t))
@@ -3197,9 +3442,9 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
                 if (!m->at) break;
                 for (int k = 0; k < 2; k++) {
                     d->cursor_trail_history_from[i][k] = NDC_TO_UV(m->from_x[k]);
-                    d->cursor_trail_history_from[i][k + 2] = NDC_TO_UV(m->from_y[k]);
+                    d->cursor_trail_history_from[i][k + 2] = NDC_Y_TO_UV(m->from_y[k]);
                     d->cursor_trail_history_to[i][k] = NDC_TO_UV(m->to_x[k]);
-                    d->cursor_trail_history_to[i][k + 2] = NDC_TO_UV(m->to_y[k]);
+                    d->cursor_trail_history_to[i][k + 2] = NDC_Y_TO_UV(m->to_y[k]);
                 }
                 d->cursor_trail_history_age[i / 4][i % 4] = SECONDS(now - m->at);
             }
@@ -3207,19 +3452,19 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         if (ct) {
             for (int i = 0; i < 4; i++) {
                 d->cursor_trail_corners_x[i] = NDC_TO_UV(ct->corner_x[i]);
-                d->cursor_trail_corners_y[i] = NDC_TO_UV(ct->corner_y[i]);
+                d->cursor_trail_corners_y[i] = NDC_Y_TO_UV(ct->corner_y[i]);
                 d->cursor_trail_prev_corners_x[i] = NDC_TO_UV(ct->previous_corner_x[i]);
-                d->cursor_trail_prev_corners_y[i] = NDC_TO_UV(ct->previous_corner_y[i]);
+                d->cursor_trail_prev_corners_y[i] = NDC_Y_TO_UV(ct->previous_corner_y[i]);
             }
-            d->cursor_trail_edge[0] = NDC_TO_UV(ct->cursor_edge_x[0]); // left
-            d->cursor_trail_edge[1] = NDC_TO_UV(ct->cursor_edge_x[1]); // right
-            d->cursor_trail_edge[2] = NDC_TO_UV(ct->cursor_edge_y[0]); // top
-            d->cursor_trail_edge[3] = NDC_TO_UV(ct->cursor_edge_y[1]); // bottom
+            d->cursor_trail_edge[0] = NDC_TO_UV(ct->cursor_edge_x[0]);   // left
+            d->cursor_trail_edge[1] = NDC_TO_UV(ct->cursor_edge_x[1]);   // right
+            d->cursor_trail_edge[2] = NDC_Y_TO_UV(ct->cursor_edge_y[0]); // top
+            d->cursor_trail_edge[3] = NDC_Y_TO_UV(ct->cursor_edge_y[1]); // bottom
             if (ct->prev_edge_valid) {
-                d->cursor_trail_prev_edge[0] = NDC_TO_UV(ct->prev_cursor_edge_x[0]); // left
-                d->cursor_trail_prev_edge[1] = NDC_TO_UV(ct->prev_cursor_edge_x[1]); // right
-                d->cursor_trail_prev_edge[2] = NDC_TO_UV(ct->prev_cursor_edge_y[0]); // top
-                d->cursor_trail_prev_edge[3] = NDC_TO_UV(ct->prev_cursor_edge_y[1]); // bottom
+                d->cursor_trail_prev_edge[0] = NDC_TO_UV(ct->prev_cursor_edge_x[0]);   // left
+                d->cursor_trail_prev_edge[1] = NDC_TO_UV(ct->prev_cursor_edge_x[1]);   // right
+                d->cursor_trail_prev_edge[2] = NDC_Y_TO_UV(ct->prev_cursor_edge_y[0]); // top
+                d->cursor_trail_prev_edge[3] = NDC_Y_TO_UV(ct->prev_cursor_edge_y[1]); // bottom
             }
             d->cursor_trail_color[3] = ct->opacity;
             d->cursor_trail_state = 1.0f;
@@ -3230,6 +3475,7 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         }
     }
 #undef NDC_TO_UV
+#undef NDC_Y_TO_UV
 #define FILL_COLOR3(dst, c)                        \
     do {                                           \
         (dst)[0] = srgb_color(((c) >> 16) & 0xFF); \
@@ -3304,38 +3550,39 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         }
     }
     unmap_vao_buffer(custom_end_vao_idx, 0);
-    bind_vao_uniform_buffer(custom_end_vao_idx, 0, CUSTOM_END_DATA_BINDING_POINT);
+    bind_vao_uniform_buffer(custom_end_vao_idx, 0, program_uniform_block(CUSTOM_END_PROGRAM, "KittyCustomShaderData").slot);
 
     // A custom shader need not reference any of these, in which case the driver
     // drops them and glUniform*() on the resulting -1 location is a no-op.
-    GLint group_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "group");
-    GLint viewport_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "viewport");
-    GLint anim_progress_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "animation_progress");
-    GLint convert_to_srgb_loc = try_program_uniform_location(CUSTOM_END_PROGRAM, "convert_to_srgb");
+    int32_t group_loc = try_program_param(CUSTOM_END_PROGRAM, "group");
+    int32_t viewport_loc = try_program_param(CUSTOM_END_PROGRAM, "viewport");
+    int32_t anim_progress_loc = try_program_param(CUSTOM_END_PROGRAM, "animation_progress");
+    int32_t convert_to_srgb_loc = try_program_param(CUSTOM_END_PROGRAM, "convert_to_srgb");
     if (custom_shaders.end.has_pointer_map && group_loc >= 0) update_pointer_map(os_window, group_loc);
     const unsigned num_groups = (unsigned)custom_shaders.end.num_groups;
     const unsigned textures_mask = custom_shaders.end.textures;
     const int vw = os_window->viewport_width, vh = os_window->viewport_height;
 
     // Named texture IDs and their render-target FBOs, indexed by NamedTexture enum value
-    const GLuint named_tex_ids[4] = {
+    const gpu_texture_t named_tex_ids[4] = {
         0, // DEFAULT — unused
         global_state.layers_render_texture.texture_a_id,
         global_state.layers_render_texture.texture_b_id,
         os_window->persist_texture_id,
     };
-    const GLuint named_tex_fbos[4] = {
+    const gpu_render_target_t named_tex_fbos[4] = {
         0, // DEFAULT — unused
         os_window->indirect_output.fbo_a_id,
         os_window->indirect_output.fbo_b_id,
         os_window->persist_fbo_id,
     };
-    static const int named_tex_units[4] = {
-        GRAPHICS_UNIT, // DEFAULT maps to backbuffer slot
-        CUSTOM_END_TEXTURE_A_UNIT,
-        CUSTOM_END_TEXTURE_B_UNIT,
-        CUSTOM_END_TEXTURE_PERSIST_UNIT,
-    };
+    // The binding slots of the named textures, indexed by NamedTexture enum
+    // value, false in has_named_tex_slot when the program does not use the texture
+    static const char *const named_tex_names[4] = {"backbuffer", "a", "b", "persist"};
+    uint32_t named_tex_slots[4] = {0};
+    bool has_named_tex_slot[4];
+    for (size_t i = 0; i < arraysz(named_tex_names); i++)
+        has_named_tex_slot[i] = try_program_texture_slot(CUSTOM_END_PROGRAM, named_tex_names[i], named_tex_slots + i);
 
     // Pre-scan to find the last group that will actually run this frame.
     // That group gets convert_to_srgb=true so its draw call replaces the
@@ -3361,17 +3608,17 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         // Skip inactive groups. Non-attached, non-animated groups always run; all others require
         // shader_group_anim[g].active (set by update_custom_shader_animations, including attach logic).
         if (group_is_animated(cg) && !os_window->shader_group_anim[g].active) continue;
-        const GLuint backbuffer = backbuffer_is_main ? global_state.layers_render_texture.texture_id : global_state.layers_render_texture.extra_texture_id;
+        const gpu_texture_t backbuffer =
+            backbuffer_is_main ? global_state.layers_render_texture.texture_id : global_state.layers_render_texture.extra_texture_id;
 
         // Bind backbuffer to the backbuffer texture unit
-        glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
-        glBindTexture(GL_TEXTURE_2D, backbuffer);
+        if (has_named_tex_slot[CUSTOM_SHADER_TEXTURE_DEFAULT]) gpu_bind_texture(named_tex_slots[CUSTOM_SHADER_TEXTURE_DEFAULT], backbuffer);
 
         // Bind each named texture to its own unit.
         // If the texture is the output for this group, or is not declared in the
         // pipeline, fall back to backbuffer so the sampler is always valid.
         for (int t = CUSTOM_SHADER_TEXTURE_A; t <= CUSTOM_SHADER_TEXTURE_PERSIST; t++) {
-            GLuint tex;
+            gpu_texture_t tex;
             if (!is_last && cg->output_texture == (NamedTexture)t) {
                 tex = backbuffer; // can't read from the render target we're writing to
             } else if (textures_mask & (1u << t)) {
@@ -3379,9 +3626,9 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
             } else {
                 tex = backbuffer; // not present — fall back to backbuffer
             }
-            glActiveTexture(GL_TEXTURE0 + named_tex_units[t]);
-            glBindTexture(GL_TEXTURE_2D, tex);
+            if (has_named_tex_slot[t]) gpu_bind_texture(named_tex_slots[t], tex);
         }
+        if (has_windows_slot) gpu_bind_texture(windows_slot, os_window->shader_windows.texture);
 
         // Set the output framebuffer
         if (is_last) {
@@ -3401,9 +3648,9 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
         if (is_last) {
             // Last group always covers the full screen region
             if (os_window->live_resize.in_progress) {
-                glViewport(0, os_window->live_resize.height - vh, vw, vh);
+                gpu_set_viewport(0, 0, vw, vh); // the top left corner of the larger framebuffer
             } else {
-                glViewport(0, 0, vw, vh);
+                gpu_set_viewport(0, 0, vw, vh);
             }
             vp_x = 0.f;
             vp_y = 0.f;
@@ -3413,22 +3660,22 @@ run_custom_end_shader(OSWindow *os_window, float sx, float sy, monotonic_t now) 
             float px = cg->viewport_pos.x, py = cg->viewport_pos.y;
             float sw = cg->viewport_size.w, sh = cg->viewport_size.h;
             // viewport_pos/size are standard UV (origin at bottom-left, y increasing
-            // upward), which matches GL pixel coords directly — no y-flip needed.
-            GLint x0 = MAX(0, (GLint)(px * vw));
-            GLint y0 = MAX(0, (GLint)(py * vh));
-            GLint x1 = MIN(vw, (GLint)((px + sw) * vw));
-            GLint y1 = MIN(vh, (GLint)((py + sh) * vh));
-            glViewport(x0, y0, MAX(0, x1 - x0), MAX(0, y1 - y0));
+            // upward), while the GPU viewport has its origin at the top left.
+            int32_t x0 = MAX(0, (int32_t)(px * vw));
+            int32_t y0 = MAX(0, (int32_t)(py * vh)); // from the bottom
+            int32_t x1 = MIN(vw, (int32_t)((px + sw) * vw));
+            int32_t y1 = MIN(vh, (int32_t)((py + sh) * vh)); // from the bottom
+            gpu_set_viewport(x0, vh - y1, MAX(0, x1 - x0), MAX(0, y1 - y0));
             vp_x = px;
             vp_y = py;
             vp_w = sw;
             vp_h = sh;
         }
 
-        glUniform1i(group_loc, (GLint)g);
-        glUniform4f(viewport_loc, vp_x, vp_y, vp_w, vp_h);
-        glUniform1f(anim_progress_loc, anim_progress[g]);
-        glUniform1i(convert_to_srgb_loc, is_last ? 1 : 0);
+        param_1i(group_loc, (int32_t)g);
+        param_4f(viewport_loc, vp_x, vp_y, vp_w, vp_h);
+        param_1f(anim_progress_loc, anim_progress[g]);
+        param_1i(convert_to_srgb_loc, is_last ? 1 : 0);
         // debug_rendering("Custom shader draw group %u: anim_progress=%.4f viewport=(%.2f,%.2f,%.2f,%.2f)\n", g, anim_progress[g], vp_x, vp_y, vp_w, vp_h);
         draw_quad(false, 0);
     }
@@ -3444,21 +3691,18 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
         if (custom_shaders.end.active && os_window->shader_anim.has_active_shaders) {
             // debug_rendering("Custom end shader running (groups=%zu)\n", custom_shaders.end.num_groups);
             restore_viewport();
-            if (os_window->live_resize.in_progress)
-                save_viewport_using_top_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height, os_window->live_resize.height);
+            if (os_window->live_resize.in_progress) save_viewport(0, 0, os_window->viewport_width, os_window->viewport_height);
             run_custom_end_shader(os_window, sx, sy, now);
         } else {
             // debug_rendering("Custom shaders inactive, falling back to blit\n");
             set_framebuffer_to_use_for_output(0);
             bind_framebuffer_for_output(0);
             bind_program(BLIT_PROGRAM);
-            glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
-            glBindTexture(GL_TEXTURE_2D, global_state.layers_render_texture.texture_id);
-            glUniform4f(program_uniform_location(BLIT_PROGRAM, "src_rect"), 0, sy, sx, 0);
-            glUniform4f(program_uniform_location(BLIT_PROGRAM, "dest_rect"), -1, 1, 1, -1);
+            gpu_bind_texture(program_texture_slot(BLIT_PROGRAM, "image"), global_state.layers_render_texture.texture_id);
+            param_4f(program_param(BLIT_PROGRAM, "src_rect"), 0, 0, sx, sy);
+            param_4f(program_param(BLIT_PROGRAM, "dest_rect"), -1, -1, 1, 1);
             restore_viewport();
-            if (os_window->live_resize.in_progress)
-                save_viewport_using_top_left_origin(0, 0, os_window->viewport_width, os_window->viewport_height, os_window->live_resize.height);
+            if (os_window->live_resize.in_progress) save_viewport(0, 0, os_window->viewport_width, os_window->viewport_height);
             draw_quad(false, 0);
         }
         if (os_window->live_resize.in_progress) {
@@ -3466,6 +3710,7 @@ stop_os_window_rendering(OSWindow *os_window, Tab *tab, Window *active_window, m
             draw_resizing_text(os_window);
         }
     }
+    draw_software_rendering_banner(os_window, now);
     os_window->last_rendered_at = now;
     os_window->frame_counter++;
 }
@@ -3487,8 +3732,7 @@ setup_os_window_for_rendering(OSWindow *os_window, Tab *tab, Window *active_wind
 // Setting the thumbnail dimensions to zero disables scaling.
 // If no_scaling is true, thumb_w/thumb_h are ignored and the region is read
 // back directly from the framebuffer with no GPU resampling, for a pixel
-// perfect capture (the output is in GL's native bottom-up row order, unlike
-// the scaled path below which flips to top-down).
+// perfect capture. In both cases rows are output top to bottom.
 void
 take_screenshot_of_rectangular_region(OSWindow *os_window, Region region, unsigned char *dst_buf, unsigned *thumb_w, unsigned *thumb_h, bool no_scaling) {
     unsigned vh = os_window->viewport_height;
@@ -3500,9 +3744,7 @@ take_screenshot_of_rectangular_region(OSWindow *os_window, Region region, unsign
     if (no_scaling) {
         *thumb_w = src_width;
         *thumb_h = src_height;
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glReadPixels((GLint)region.left, (GLint)(vh - region.bottom), (GLsizei)src_width, (GLsizei)src_height, GL_RGBA, GL_UNSIGNED_BYTE, dst_buf);
-        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        gpu_read_pixels((int32_t)region.left, (int32_t)region.top, src_width, src_height, dst_buf);
         return;
     }
 
@@ -3513,61 +3755,52 @@ take_screenshot_of_rectangular_region(OSWindow *os_window, Region region, unsign
     *thumb_h = MIN(src_height, *thumb_h);
 
     // Create a texture to hold the current framebuffer content
-    GLuint src_texture = 0;
-    glGenTextures(1, &src_texture);
-    glBindTexture(GL_TEXTURE_2D, src_texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    const GPUTextureDesc desc = {
+        .kind = GPU_TEXTURE_2D, .format = GPU_FORMAT_RGBA8, .width = vw, .height = vh, .filter = GPU_FILTER_LINEAR, .wrap = GPU_WRAP_CLAMP_TO_EDGE};
+    gpu_texture_t src_texture = create_texture_or_die(&desc, NULL);
 
     // Copy the current framebuffer to the texture
-    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, vw, vh, 0);
+    gpu_copy_to_texture(src_texture, 0, 0, vw, vh);
 
     // Create a temporary framebuffer for GPU-based scaling
-    GLuint temp_texture = 0, temp_framebuffer = 0;
+    gpu_texture_t temp_texture = 0;
+    gpu_render_target_t temp_framebuffer = 0;
     setup_texture_as_render_target(*thumb_w, *thumb_h, &temp_texture, &temp_framebuffer);
 
     // Save current state
-    GLint current_framebuffer;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &current_framebuffer);
+    gpu_render_target_t current_framebuffer = gpu_get_render_target();
 
     // Bind our temporary framebuffer for rendering
     bind_framebuffer_for_output(temp_framebuffer);
-    save_viewport_using_bottom_left_origin(0, 0, *thumb_w, *thumb_h);
+    save_viewport(0, 0, *thumb_w, *thumb_h);
 
     // Use the screenshot program to render the scaled framebuffer with proper color space handling
     bind_program(SCREENSHOT_PROGRAM);
 
-    // Set source rectangle (normalized coordinates: 0 to 1)
-    // Note: OpenGL texture origin is bottom-left, but Region uses top-left origin
-    // Convert from screen coordinates (top-left origin) to OpenGL texture coordinates (bottom-left origin)
+    // Set source rectangle (normalized texture coordinates: 0 to 1, origin at top-left, like Region)
     float src_left_norm = (float)region.left / (float)vw;
     float src_right_norm = (float)region.right / (float)vw;
-    float src_bottom_norm = (float)(vh - region.bottom) / (float)vh;
-    float src_top_norm = (float)(vh - region.top) / (float)vh;
-    glUniform4f(program_uniform_location(SCREENSHOT_PROGRAM, "src_rect"), src_left_norm, src_top_norm, src_right_norm, src_bottom_norm);
+    float src_bottom_norm = (float)region.bottom / (float)vh;
+    float src_top_norm = (float)region.top / (float)vh;
+    param_4f(program_param(SCREENSHOT_PROGRAM, "src_rect"), src_left_norm, src_top_norm, src_right_norm, src_bottom_norm);
 
     // Set destination rectangle (NDC coordinates: -1 to 1)
-    glUniform4f(program_uniform_location(SCREENSHOT_PROGRAM, "dest_rect"), -1.0f, -1.0f, 1.0f, 1.0f);
+    param_4f(program_param(SCREENSHOT_PROGRAM, "dest_rect"), -1.0f, -1.0f, 1.0f, 1.0f);
 
     // Set the source texture size for proper downscaling
-    glUniform2f(program_uniform_location(SCREENSHOT_PROGRAM, "src_size"), (float)vw, (float)vh);
+    param_2f(program_param(SCREENSHOT_PROGRAM, "src_size"), (float)vw, (float)vh);
 
     // Bind the source texture
-    glActiveTexture(GL_TEXTURE0 + GRAPHICS_UNIT);
-    glBindTexture(GL_TEXTURE_2D, src_texture);
+    gpu_bind_texture(program_texture_slot(SCREENSHOT_PROGRAM, "image"), src_texture);
 
     // Draw the scaled quad
     draw_quad(false, 0);
 
     // Read the scaled result
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glReadPixels(0, 0, *thumb_w, *thumb_h, GL_RGBA, GL_UNSIGNED_BYTE, dst_buf);
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    gpu_read_pixels(0, 0, *thumb_w, *thumb_h, dst_buf);
 
     // Restore previous state
-    bind_framebuffer_for_output(current_framebuffer);
+    gpu_set_render_target(current_framebuffer);
     restore_viewport();
 
     // Clean up temporary resources
@@ -3581,7 +3814,33 @@ take_screenshot_of_rectangular_region(OSWindow *os_window, Region region, unsign
 
 static PyObject *
 pygpu_driver_version_string(PyObject *self UNUSED, PyObject *args UNUSED) {
-    return PyUnicode_FromString(global_state.gl_version ? gl_version_string() : "");
+    wait_for_gpu_driver(); // the driver may still be loading, see glfw_init()
+    return PyUnicode_FromString(gpu_version_string());
+}
+
+static PyObject *
+pygpu_driver_name(PyObject *self UNUSED, PyObject *args UNUSED) {
+    wait_for_gpu_driver(); // the driver may still be loading, see glfw_init()
+    return PyUnicode_FromString(gpu_driver_name());
+}
+
+static PyObject *
+pygpu_shader_target(PyObject *self UNUSED, PyObject *args UNUSED) {
+    wait_for_gpu_driver(); // the driver may still be loading, see glfw_init()
+    return PyUnicode_FromString(gpu_shader_target());
+}
+
+static PyObject *
+pyload_gpu_driver(PyObject *self UNUSED, PyObject *args) {
+    const char *path;
+    int debug_rendering = 0;
+    if (!PyArg_ParseTuple(args, "s|p", &path, &debug_rendering)) return NULL;
+    const char *err = load_gpu_driver(path, debug_rendering != 0, GPU_RENDERER_ANY);
+    if (err) {
+        PyErr_SetString(PyExc_OSError, err);
+        return NULL;
+    }
+    Py_RETURN_NONE;
 }
 
 static void
@@ -3617,6 +3876,8 @@ shader_anim_event_bit(const char *s, CustomShaderPipeline *p) {
     if (strcmp(s, "command-finish") == 0) return 1u << SHADER_ANIM_EVENT_COMMAND_FINISH;
     if (strcmp(s, "alternate-screen-enter") == 0) return 1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_ENTER;
     if (strcmp(s, "alternate-screen-exit") == 0) return 1u << SHADER_ANIM_EVENT_ALTERNATE_SCREEN_EXIT;
+    if (strcmp(s, "progress-start") == 0) return 1u << SHADER_ANIM_EVENT_PROGRESS_START;
+    if (strcmp(s, "progress-stop") == 0) return 1u << SHADER_ANIM_EVENT_PROGRESS_STOP;
     static const char user_prefix[] = "user:";
     if (strncmp(s, user_prefix, sizeof(user_prefix) - 1) == 0) {
         const char *name = s + sizeof(user_prefix) - 1;
@@ -3709,7 +3970,9 @@ transfer_pipeline_to_struct(PyObject *pg, CustomShaderPipeline *p) {
 
         PyObject *astep = PyDict_GetItemString(g, "animation_step");
         cg->animation_step = (astep && PyLong_Check(astep)) ? (monotonic_t)PyLong_AsLong(astep) : ANIMATION_SAMPLE_WAIT;
-        cg->animation_step = cg->animation_step == 0 ? MONOTONIC_T_MAX : MAX(cg->animation_step, OPT(repaint_delay));
+        // The rate at which frames are actually drawn is limited by the render_interval option,
+        // see animation_wakeup_floor()
+        cg->animation_step = cg->animation_step == 0 ? MONOTONIC_T_MAX : MAX(cg->animation_step, ms_to_monotonic_t(1ll));
 
         PyObject *ae_events = PyDict_GetItemString(g, "animation_end_events");
         if (is_seq(ae_events)) cg->animation_end_events = parse_anim_event_sequence(ae_events, p);
@@ -3730,26 +3993,44 @@ transfer_pipeline_to_struct(PyObject *pg, CustomShaderPipeline *p) {
     p->all_animation_start_events = 0;
     for (size_t i = 0; i < p->num_groups; i++) p->all_animation_start_events |= p->groups[i].animation_start_events | p->groups[i].animation_toggle_events;
     p->bypass_builtin_trail = (p->all_animation_start_events & (1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE)) != 0;
+    p->bypass_builtin_progress_bar = (p->all_animation_start_events & (1u << SHADER_ANIM_EVENT_PROGRESS_START)) != 0;
 #undef is_seq
     return true;
 }
 
-static bool
-attach_shaders(PyObject *sources, GLuint program_id, GLenum shader_type) {
-    RAII_ALLOC(const GLchar *, c_sources, calloc(PyTuple_GET_SIZE(sources), sizeof(GLchar *)));
+// Concatenate the tuple of source strings into a single string, the returned
+// object owns the memory the string points to
+// Join shader sources, which are either all text (str) or all binary (bytes),
+// such as SPIR-V, into a single bytes object
+static PyObject *
+join_shader_sources(PyObject *sources) {
+    bool all_bytes = true, all_text = true;
     for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(sources); i++) {
-        PyObject *temp = PyTuple_GET_ITEM(sources, i);
-        if (!PyUnicode_Check(temp)) {
-            PyErr_SetString(PyExc_TypeError, "shaders must be strings");
-            return false;
-        }
-        c_sources[i] = PyUnicode_AsUTF8(temp);
+        PyObject *x = PyTuple_GET_ITEM(sources, i);
+        all_bytes = all_bytes && PyBytes_Check(x);
+        all_text = all_text && PyUnicode_Check(x);
     }
-    GLuint shader_id = compile_shaders(shader_type, PyTuple_GET_SIZE(sources), c_sources);
-    if (shader_id == 0) return false;
-    glAttachShader(program_id, shader_id);
-    glDeleteShader(shader_id);
-    return true;
+    if (!all_bytes && !all_text) {
+        PyErr_SetString(PyExc_TypeError, "shaders must be all str or all bytes");
+        return NULL;
+    }
+    if (all_bytes) {
+        Py_ssize_t total = 0;
+        for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(sources); i++) total += PyBytes_GET_SIZE(PyTuple_GET_ITEM(sources, i));
+        PyObject *ans = PyBytes_FromStringAndSize(NULL, total);
+        if (!ans) return NULL;
+        char *dest = PyBytes_AS_STRING(ans);
+        for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(sources); i++) {
+            PyObject *x = PyTuple_GET_ITEM(sources, i);
+            memcpy(dest, PyBytes_AS_STRING(x), PyBytes_GET_SIZE(x));
+            dest += PyBytes_GET_SIZE(x);
+        }
+        return ans;
+    }
+    RAII_PyObject(empty, PyUnicode_FromString(""));
+    if (!empty) return NULL;
+    RAII_PyObject(text, PyUnicode_Join(empty, sources));
+    return text ? PyUnicode_AsUTF8String(text) : NULL;
 }
 
 static PyObject *
@@ -3771,53 +4052,33 @@ compile_program(PyObject UNUSED *self, PyObject *args) {
         PyErr_Format(PyExc_ValueError, "Unknown program: %d", which);
         return NULL;
     }
-    Program *program = program_ptr(which);
     if (!PyTuple_GET_SIZE(vertex_shaders)) {
         if (which == CUSTOM_END_PROGRAM) {
             free_custom_shader_pipeline(&custom_shaders.end);
             zero_at_ptr(&custom_shaders.end);
             custom_shaders.generation++;
         }
-        if (program->id != 0) {
-            glDeleteProgram(program->id);
-            program->id = 0;
-        }
+        free_program(which);
         Py_RETURN_NONE;
     }
-    if (program->id != 0) {
-        if (allow_recompile) {
-            glDeleteProgram(program->id);
-            program->id = 0;
-        } else {
-            PyErr_SetString(PyExc_ValueError, "program already compiled");
-            return NULL;
-        }
+    if (program_pipeline(which) && !allow_recompile) {
+        PyErr_SetString(PyExc_ValueError, "program already compiled");
+        return NULL;
     }
-#define fail_compile()                \
-    {                                 \
-        glDeleteProgram(program->id); \
-        return NULL;                  \
-    }
-    program->id = glCreateProgram();
-    if (!attach_shaders(vertex_shaders, program->id, GL_VERTEX_SHADER)) fail_compile();
-    if (!attach_shaders(fragment_shaders, program->id, GL_FRAGMENT_SHADER)) fail_compile();
-    glLinkProgram(program->id);
-    GLint ret = GL_FALSE;
-    glGetProgramiv(program->id, GL_LINK_STATUS, &ret);
-    if (ret != GL_TRUE) {
-        GLsizei len;
-        static char glbuf[4096];
-        glGetProgramInfoLog(program->id, sizeof(glbuf), &len, glbuf);
-        PyErr_Format(PyExc_ValueError, "Failed to link GLSL shaders:\n%s", glbuf);
-        fail_compile();
-    }
-#undef fail_compile
+    RAII_PyObject(vertex_source, join_shader_sources(vertex_shaders));
+    if (!vertex_source) return NULL;
+    RAII_PyObject(fragment_source, join_shader_sources(fragment_shaders));
+    if (!fragment_source) return NULL;
+    Py_ssize_t vsz, fsz;
+    char *vcode, *fcode;
+    if (PyBytes_AsStringAndSize(vertex_source, &vcode, &vsz) != 0 || PyBytes_AsStringAndSize(fragment_source, &fcode, &fsz) != 0) return NULL;
+    if (!compile_gpu_program(which, vcode, (size_t)vsz, fcode, (size_t)fsz, metadata)) return NULL;
     if (which == CUSTOM_END_PROGRAM) {
         free_custom_shader_pipeline(&custom_shaders.end);
         zero_at_ptr(&custom_shaders.end);
         PyObject *pg = PyDict_GetItemString(metadata, "pipeline");
         if (pg && !transfer_pipeline_to_struct(pg, &custom_shaders.end)) {
-            glDeleteProgram(program->id);
+            free_program(which);
             return NULL;
         }
         custom_shaders.end.active = true;
@@ -3830,53 +4091,14 @@ compile_program(PyObject UNUSED *self, PyObject *args) {
                 if (g >= 0 && (size_t)g < custom_shaders.end.num_groups) custom_shaders.end.pointer_map_groups |= 1u << g;
             }
             if (PyErr_Occurred()) {
-                glDeleteProgram(program->id);
+                free_program(which);
                 return NULL;
             }
         }
         custom_shaders.generation++;
     }
-    init_uniforms(which);
-    set_program_layout(which, metadata);
-    return Py_BuildValue("I", program->id);
+    Py_RETURN_NONE;
 }
-
-#define PYWRAP0(name) static PyObject *py##name(PYNOARG)
-#define PYWRAP1(name) static PyObject *py##name(PyObject UNUSED *self, PyObject *args)
-#define PA(fmt, ...) \
-    if (!PyArg_ParseTuple(args, fmt, __VA_ARGS__)) return NULL;
-#define ONE_INT(name)                 \
-    PYWRAP1(name) {                   \
-        name(PyLong_AsSsize_t(args)); \
-        Py_RETURN_NONE;               \
-    }
-#define TWO_INT(name)     \
-    PYWRAP1(name) {       \
-        int a, b;         \
-        PA("ii", &a, &b); \
-        name(a, b);       \
-        Py_RETURN_NONE;   \
-    }
-#define NO_ARG(name)    \
-    PYWRAP0(name) {     \
-        name();         \
-        Py_RETURN_NONE; \
-    }
-#define NO_ARG_INT(name) \
-    PYWRAP0(name) { return PyLong_FromSsize_t(name()); }
-
-ONE_INT(bind_program)
-NO_ARG(unbind_program)
-
-PYWRAP0(create_vao) {
-    int ans = create_vao();
-    if (ans < 0) return NULL;
-    return Py_BuildValue("i", ans);
-}
-
-ONE_INT(bind_vertex_array)
-NO_ARG(unbind_vertex_array)
-TWO_INT(unmap_vao_buffer)
 
 static PyObject *
 sprite_map_set_limits(PyObject UNUSED *self, PyObject *args) {
@@ -3893,7 +4115,7 @@ static PyObject *
 pydecorations_map_new_size(PyObject *self UNUSED, PyObject *args) {
     unsigned long count, current_capacity, max_size;
     if (!PyArg_ParseTuple(args, "kkk", &count, &current_capacity, &max_size)) return NULL;
-    GLint w, h;
+    int32_t w, h;
     if (!decorations_map_new_size(count, current_capacity, max_size, &w, &h)) Py_RETURN_NONE;
     return Py_BuildValue("ii", (int)w, (int)h);
 }
@@ -4055,13 +4277,10 @@ pysample_pointer_map(PyObject *self UNUSED, PyObject *args) {
 static PyMethodDef module_methods[] = {
     M(compile_program, METH_VARARGS),
     M(sprite_map_set_limits, METH_VARARGS),
-    MW(create_vao, METH_NOARGS),
     MW(gpu_driver_version_string, METH_NOARGS),
-    MW(bind_vertex_array, METH_O),
-    MW(unbind_vertex_array, METH_NOARGS),
-    MW(unmap_vao_buffer, METH_VARARGS),
-    MW(bind_program, METH_O),
-    MW(unbind_program, METH_NOARGS),
+    MW(gpu_driver_name, METH_NOARGS),
+    MW(gpu_shader_target, METH_NOARGS),
+    MW(load_gpu_driver, METH_VARARGS),
     MW(custom_shader_needs_render, METH_VARARGS),
     MW(decorations_map_new_size, METH_VARARGS),
     MW(simulate_custom_shader_render_ticks, METH_VARARGS),
@@ -4072,10 +4291,17 @@ static PyMethodDef module_methods[] = {
     {NULL, NULL, 0, NULL} /* Sentinel */
 };
 
-void
+bool
 initialize_gpu(void) {
-    gl_init();
+    if (initialize_gpu_driver()) return false;
+    GPUCapabilities caps = {0};
+    gpu_get_capabilities(&caps);
+    global_state.supports_framebuffer_srgb = caps.supports_srgb_output;
+    global_state.software_rendering = caps.is_software;
+    if (caps.is_software) log_error("Using software rendering with the %s GPU driver, kitty will be slow", gpu_driver_name());
+    selection_stride = MAX((size_t)1u, (size_t)caps.vertex_input_alignment);
     query_gpu_texture_limits();
+    return true;
 }
 
 void
@@ -4097,6 +4323,7 @@ finalize(void) {
     default_visual_bell_animation = free_animation(default_visual_bell_animation);
     free_custom_shader_pipeline(&custom_shaders.end);
     free_program_layouts();
+    unload_gpu_driver();
 }
 
 bool
@@ -4127,56 +4354,8 @@ init_shaders(PyObject *module) {
     C(MAX_SHADER_ANIM_USER_EVENTS);
     C(MAX_SHADER_ANIM_USER_EVENT_NAME_LEN);
     C(POINTER_MAP_SIZE);
-    C(GLSL_VERSION);
-    C(GL_VERSION);
-    C(GL_VENDOR);
-    C(GL_SHADING_LANGUAGE_VERSION);
-    C(GL_RENDERER);
-    C(GL_TRIANGLE_FAN);
-    C(GL_TRIANGLE_STRIP);
-    C(GL_TRIANGLES);
-    C(GL_LINE_LOOP);
-    C(GL_COLOR_BUFFER_BIT);
-    C(GL_VERTEX_SHADER);
-    C(GL_FRAGMENT_SHADER);
-    C(GL_TRUE);
-    C(GL_FALSE);
-    C(GL_COMPILE_STATUS);
-    C(GL_LINK_STATUS);
-    C(GL_MAX_ARRAY_TEXTURE_LAYERS);
-    C(GL_TEXTURE_BINDING_BUFFER);
-    C(GL_MAX_TEXTURE_BUFFER_SIZE);
-    C(GL_MAX_TEXTURE_SIZE);
-    C(GL_TEXTURE_2D_ARRAY);
-    C(GL_LINEAR);
-    C(GL_CLAMP_TO_EDGE);
-    C(GL_NEAREST);
-    C(GL_TEXTURE_MIN_FILTER);
-    C(GL_TEXTURE_MAG_FILTER);
-    C(GL_TEXTURE_WRAP_S);
-    C(GL_TEXTURE_WRAP_T);
-    C(GL_UNPACK_ALIGNMENT);
-    C(GL_R8);
-    C(GL_RED);
-    C(GL_UNSIGNED_BYTE);
-    C(GL_UNSIGNED_SHORT);
-    C(GL_R32UI);
-    C(GL_RGB32UI);
-    C(GL_RGBA);
-    C(GL_TEXTURE_BUFFER);
-    C(GL_STATIC_DRAW);
-    C(GL_STREAM_DRAW);
-    C(GL_DYNAMIC_DRAW);
-    C(GL_SRC_ALPHA);
-    C(GL_ONE_MINUS_SRC_ALPHA);
-    C(GL_WRITE_ONLY);
-    C(GL_READ_ONLY);
-    C(GL_READ_WRITE);
-    C(GL_BLEND);
-    C(GL_FLOAT);
-    C(GL_UNSIGNED_INT);
-    C(GL_ARRAY_BUFFER);
-    C(GL_UNIFORM_BUFFER);
+    C(CUSTOM_SHADER_WINDOW_TEXELS);
+    C(CUSTOM_SHADER_WINDOWS_PER_ROW);
     C(ANIMATION_SAMPLE_WAIT);
 
 #undef C

@@ -20,6 +20,12 @@
 */
 #define IRM 4
 
+/* *Bi-Directional Support Mode*: When set (implicit), the terminal lays
+   out text written afterwards. When reset (explicit, the power-on state),
+   the application does.
+*/
+#define BDSM 8
+
 
 // Private modes.
 
@@ -91,11 +97,17 @@
 // Terminal visibility reports
 #define VISIBILITY_REPORTS (2033 << 5)
 
+// Detect each paragraph's direction from its first strong character
+#define BIDI_AUTODETECT (2501 << 5)
+
 // In-band resize notification mode
 #define INBAND_RESIZE_NOTIFICATION (2048 << 5)
 
 // Paste events mode https://rockorager.dev/misc/bracketed-paste-mime/
 #define PASTE_EVENTS (5522 << 5)
+
+// Detailed reporting of scroll wheel and touchpad events, see the misc-protocol docs
+#define WHEEL_EVENTS (5523 << 5)
 
 // Handle Ctrl-C/Ctrl-Z mode
 #define HANDLE_TERMIOS_SIGNALS (19997 << 5)

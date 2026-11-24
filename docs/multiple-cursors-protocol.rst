@@ -50,7 +50,7 @@ one of:
 
 * ``2``: In this case the following co-ordinates are pairs of numbers pointing
   to cells in the form ``y:x`` with the origin in the top left corner at
-  ``1,1``. There can be any number of pairs, the terminal must treat each pair
+  ``1,1`` [bidi]_. There can be any number of pairs, the terminal must treat each pair
   as a new location to set a cursor.
 
 * ``4``: In this case the following co-ordinates are sets of four numbers that
@@ -246,3 +246,6 @@ Footnotes
    color of the cursor and the text under the cursor is adjusted based on the
    color of the cell under the cursor. This also cannot be implemented using
    fake cursors.
+
+.. [bidi] On lines reordered for :ref:`bidirectional text <bidi_support>`,
+   kitty draws extra cursors at the visual column of their cell.

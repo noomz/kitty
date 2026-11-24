@@ -8,6 +8,7 @@
 #include "loop-utils.h"
 #include "safe-wrappers.h"
 #include "state.h"
+#include "gpu.h"
 #include "threading.h"
 #include "screen.h"
 #include "monotonic.h"
@@ -21,6 +22,9 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <limits.h>
+#ifdef __APPLE__
+#include <sys/event.h>
+#endif
 extern PyTypeObject Screen_Type;
 
 #if defined(__APPLE__) || defined(__OpenBSD__)
@@ -38,7 +42,9 @@ extern PyTypeObject Screen_Type;
 // Apple does not implement MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
-#define USE_RENDER_FRAMES (global_state.has_render_frames && OPT(sync_to_monitor))
+// Whether rendering is paced by render frames from the windowing system, see
+// the render_interval option
+#define USE_RENDER_FRAMES (global_state.has_render_frames && OPT(render_interval.sync_to_monitor))
 
 typedef struct {
     char *data;
@@ -86,17 +92,10 @@ static const Child EMPTY_CHILD = {0};
 static Child children[MAX_CHILDREN] = {{0}};
 static Child scratch[MAX_CHILDREN] = {{0}};
 static Child add_queue[MAX_CHILDREN] = {{0}}, remove_queue[MAX_CHILDREN] = {{0}}, remove_notify[MAX_CHILDREN] = {{0}};
-// Pending input of each child, as the I/O thread last saw it. Parallel to children and
-// only used by the I/O thread, so it needs no lock.
-typedef struct {
-    ParserInputWake pending;
-    // The chunk the main loop was last woken for. Its next parse accepts that chunk, so
-    // more reads of it must not wake it again.
-    uint64_t woken_chunk;
-    // Bytes were committed since pending was queried
-    bool stale;
-} ChildInputWake;
-static ChildInputWake child_input_wake[MAX_CHILDREN] = {{{0}}};
+// Set by the I/O thread when it wakes the main loop to parse input, cleared by the main
+// thread before it parses. While set, newly read input needs no further wakeup, since
+// the parse the main loop was woken for will consume it.
+static atomic_bool input_wakeup_pending = false;
 static size_t add_queue_count = 0, remove_queue_count = 0;
 static struct pollfd children_fds[MAX_CHILDREN + EXTRA_FDS] = {{0}};
 static pthread_mutex_t children_lock, talk_lock;
@@ -132,6 +131,188 @@ static void
 set_maximum_wait(monotonic_t val) {
     if (val >= 0 && (val < maximum_wait || maximum_wait < 0)) maximum_wait = val;
 }
+
+// Frame pacing {{{
+// The minimum interval between renders of an OS Window that are not paced by
+// render frames, as happens soon after a resize on Wayland (120 FPS)
+#define POST_RESIZE_MIN_RENDER_INTERVAL (MONOTONIC_T_1e9 / 120)
+// The minimum interval between renders of an OS Window on macOS when the
+// display link has stopped delivering render frames (60 FPS)
+#define STALLED_RENDER_FRAMES_MIN_RENDER_INTERVAL (MONOTONIC_T_1e9 / 60)
+// How often to retry rendering an OS Window whose buffers could not be swapped
+#define SWAP_RETRY_INTERVAL (10 * MONOTONIC_T_1e6)
+// The minimum interval between redraws used when syncing to the monitor
+// without render frames, which is the default value of the removed
+// repaint_delay option.
+#define NO_RENDER_FRAMES_MIN_INTERVAL (10 * MONOTONIC_T_1e6)
+
+// The minimum time between redraws of an OS Window
+static monotonic_t
+min_render_interval(void) {
+    monotonic_t ans = OPT(render_interval.min_interval);
+    // Without render frames, syncing to the monitor is done by blocking
+    // buffer swaps, so throttle rendering to avoid the main loop spending
+    // most of its time blocked in swaps.
+    if (OPT(render_interval.sync_to_monitor) && !global_state.has_render_frames) ans = MAX(ans, NO_RENDER_FRAMES_MIN_INTERVAL);
+    return ans;
+}
+
+// The smallest delay to use when waking up the main loop to draw the next frame of an animation.
+// A max wait of zero causes key input processing to be slow, see https://github.com/kovidgoyal/kitty/pull/8066
+static monotonic_t
+animation_wakeup_floor(void) {
+    return MAX(min_render_interval(), ms_to_monotonic_t(1ll));
+}
+
+// Ensure the main loop ticks again in time to draw the next frame of a continuous animation
+static void
+request_animation_frame(OSWindow *w) {
+    // When syncing to the monitor, the next render frame wakes up the main
+    // loop when it is time to draw the next frame.
+    if (USE_RENDER_FRAMES) w->tick_on_render_frame = true;
+    else set_maximum_wait(animation_wakeup_floor());
+}
+
+// Whether a render frame is requested after every render. On X11 frames are
+// requested only when needed, since a pending frame request interferes with
+// the GPU driver presenting buffers on some X servers, notably Xwayland,
+// increasing latency.
+#ifdef __APPLE__
+#define RENDER_FRAMES_REQUESTED_LAZILY false
+#else
+#define RENDER_FRAMES_REQUESTED_LAZILY (!global_state.is_wayland)
+#endif
+
+#ifndef __APPLE__
+// The time after which to render even if a frame requested lazily, see
+// RENDER_FRAMES_REQUESTED_LAZILY, has not arrived. Some X servers, notably
+// Xwayland, can fail to report vertical blanks for long periods. If frames
+// have been arriving, a missing frame is a glitch, so wait only two frame
+// periods, otherwise the window is likely hidden, so wait longer.
+static monotonic_t
+lazy_render_frame_deadline(OSWindow *w) {
+    const monotonic_t period = os_window_frame_period(w);
+    const bool frames_arriving = w->last_render_frame_received_at > 0 && w->render_frame_requested_at - w->last_render_frame_received_at < 4 * period;
+    return w->render_frame_requested_at + (frames_arriving ? 2 * period : RENDER_FRAME_STALL_TIMEOUT);
+}
+#endif
+
+// Report a stall in the delivery of render frames, at most once per stall, since
+// stalls can last indefinitely, for example, while a Wayland window is hidden,
+// during which this is called on every main loop wakeup
+static void
+report_render_frame_stall(OSWindow *w, monotonic_t waited) {
+    if (!global_state.debug_rendering || w->render_frame_stall_reported) return;
+    w->render_frame_stall_reported = true;
+    if (global_state.is_wayland) {
+        log_error("No render frame received in %.2f seconds", monotonic_t_to_s_double(waited));
+    } else {
+        log_error("No render frame received in %.2f seconds, rendering without them", monotonic_t_to_s_double(waited));
+    }
+}
+
+static bool
+no_render_frame_received_recently(OSWindow *w, monotonic_t now, monotonic_t max_wait) {
+    bool ans = now - w->last_render_frame_received_at > max_wait;
+    if (ans) report_render_frame_stall(w, max_wait);
+    return ans;
+}
+
+// Returns true if the OS Window must not be rendered now, because of the render_interval option
+static bool
+is_render_deferred_by_frame_pacing(OSWindow *w, monotonic_t now) {
+    // Rendering must be retried till the buffers are swapped successfully,
+    // for example, when the window is first shown.
+    if (w->keep_rendering_till_swap) return false;
+    const bool is_thumbnail = w->id == global_state.thumbnail_callback.os_window;
+    if (!is_thumbnail) {
+        const monotonic_t min_interval = min_render_interval();
+        if (min_interval > 0 && w->last_rendered_at) {
+            const monotonic_t since_last_render = now - w->last_rendered_at;
+            if (since_last_render < min_interval) {
+                set_maximum_wait(min_interval - since_last_render);
+                return true;
+            }
+        }
+    }
+    if (USE_RENDER_FRAMES) {
+        if (w->render_state == RENDER_FRAME_READY) return false;
+#ifndef __APPLE__
+        if (RENDER_FRAMES_REQUESTED_LAZILY) {
+            if (w->render_state == RENDER_FRAME_NOT_REQUESTED) {
+                // Render immediately if at least a frame period has elapsed
+                // since the last render, as then a vertical blank has happened since it.
+                if (now - w->last_rendered_at >= os_window_frame_period(w)) return false;
+                request_frame_render(w);
+                if (w->render_state == RENDER_FRAME_READY) return false;
+            }
+            const monotonic_t deadline = lazy_render_frame_deadline(w);
+            if (now >= deadline) {
+                // Missing a frame while they are arriving is a glitch, only
+                // report when the X server has stopped reporting vertical blanks
+                if (deadline - w->render_frame_requested_at >= RENDER_FRAME_STALL_TIMEOUT) report_render_frame_stall(w, now - w->render_frame_requested_at);
+                return false;
+            }
+            if (is_thumbnail) return false;
+            set_maximum_wait(deadline - now);
+            w->tick_on_render_frame = true;
+            return true;
+        }
+#endif
+        if (global_state.is_wayland) {
+            // Never re-request frames on Wayland, as compositors legitimately withhold them
+            // for hidden windows, see https://github.com/kovidgoyal/kitty/issues/10597
+            if (w->render_state == RENDER_FRAME_NOT_REQUESTED) request_frame_render(w);
+            else (void)no_render_frame_received_recently(w, now, RENDER_FRAME_STALL_TIMEOUT);
+        } else if (w->render_state == RENDER_FRAME_NOT_REQUESTED) {
+            request_frame_render(w);
+        } else {
+            // Only reached on macOS, as frames are requested lazily on X11. Here
+            // render_frame_requested_at is the time of the oldest unanswered request,
+            // see request_frame_render()
+            const monotonic_t stalled_at = w->render_frame_requested_at + RENDER_FRAME_STALL_TIMEOUT;
+            if (now >= stalled_at) {
+                // The display link has stopped delivering frames, for example, while the display
+                // is asleep. Render without waiting for them, at a limited rate. Frames are
+                // re-requested after every render, which lets glfw recreate a stuck display link.
+                // No wakeup is scheduled here, so an idle window does not cause periodic wakeups.
+                (void)no_render_frame_received_recently(w, now, RENDER_FRAME_STALL_TIMEOUT);
+                if (is_thumbnail) return false;
+                const monotonic_t since_last_render = now - w->last_rendered_at;
+                if (since_last_render >= STALLED_RENDER_FRAMES_MIN_RENDER_INTERVAL) return false;
+                set_maximum_wait(STALLED_RENDER_FRAMES_MIN_RENDER_INTERVAL - since_last_render);
+                return true;
+            }
+            // Ensure the main loop wakes up to render if the frame never arrives
+            set_maximum_wait(stalled_at - now);
+        }
+        if (is_thumbnail) return false;
+        // dont respect render frames soon after a resize on Wayland as they cause flicker because
+        // we want to fill the newly resized buffer ASAP, not at compositors convenience
+        if (global_state.is_wayland && (now - w->viewport_resized_at) <= s_double_to_monotonic_t(1)) {
+            // The first render after the resize is immediate, subsequent ones
+            // are limited to a reasonable rate, otherwise continuous output
+            // would be rendered as fast as possible during this period.
+            if (w->last_rendered_at <= w->viewport_resized_at) return false;
+            const monotonic_t since_last_render = now - w->last_rendered_at;
+            if (since_last_render >= POST_RESIZE_MIN_RENDER_INTERVAL) return false;
+            set_maximum_wait(POST_RESIZE_MIN_RENDER_INTERVAL - since_last_render);
+        }
+        w->tick_on_render_frame = true;
+        return true;
+    }
+    if (global_state.is_wayland && !is_thumbnail) {
+        // When not syncing to the monitor, frames are still requested after every render on Wayland,
+        // since the compositor withholding them is how it signals that the window is hidden. Stop
+        // rendering till it sends a frame, which wakes up the main loop.
+        if (w->render_state == RENDER_FRAME_REQUESTED && now - w->render_frame_requested_at > RENDER_FRAME_STALL_TIMEOUT) {
+            w->tick_on_render_frame = true;
+            return true;
+        }
+    }
+    return false;
+}
+// }}}
 
 #define KITTY_HANDLED_SIGNALS SIGINT, SIGHUP, SIGTERM, SIGCHLD, SIGUSR1, SIGUSR2, 0
 
@@ -548,9 +729,14 @@ parse_input_once(ChildMonitor *self, PyObject *a UNUSED) {
     Py_RETURN_FALSE;
 }
 
+static void
+wakeup_io_loop_for_write_space(void *self) {
+    wakeup_io_loop((ChildMonitor *)self, false);
+}
+
 static bool
 do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
-    ParseData pd = {.dump_callback = self->dump_callback, .now = now};
+    ParseData pd = {.dump_callback = self->dump_callback, .now = now, .write_space_created = wakeup_io_loop_for_write_space, .write_space_created_data = self};
     const bool had_url_highlight = screen->url_ranges.count > 0;
     const MouseShape pointer_shape_before = screen_pointer_shape(screen);
     self->parse_func(screen, &pd, flush);
@@ -561,43 +747,21 @@ do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     // screen, which has its own pointer shape stack.
     if (screen_pointer_shape(screen) != pointer_shape_before) update_pointer_shape_for_kitty_window(screen->window_id);
     if (had_url_highlight && !screen->url_ranges.count) link_hover_cleared_by_output(screen);
-    if (pd.input_read) {
-        if (pd.write_space_created) wakeup_io_loop(self, false);
-        if (screen->paused_rendering.expires_at) set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
-    }
-    // Bytes held until input_delay has passed. The I/O thread wakes the main loop when they are ready.
-    screen->input_held = !pd.input_read && pd.has_pending_input;
-    screen->input_parsed = pd.input_read;
+    if (pd.input_read && screen->paused_rendering.expires_at) set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
+    // A pass parses a bounded amount of input, so that rendering and event handling
+    // happen during a continuous stream. Parse the rest on the next loop iteration.
+    if (pd.has_pending_input) set_maximum_wait(0);
     return pd.input_read;
-}
-
-static void
-mark_os_windows_with_held_input(void) {
-    // Painting an OS window whose only new output is held draws the old frame, and the
-    // turn that parses the held bytes paints again because it ignores repaint_delay.
-    // A window that parsed new output this turn is painted anyway.
-    for (size_t i = 0; i < global_state.num_os_windows; i++) {
-        OSWindow *w = global_state.os_windows + i;
-        bool held = false, parsed = false;
-        for (size_t t = 0; t < w->num_tabs; t++) {
-            Tab *tab = w->tabs + t;
-            for (size_t c = 0; c < tab->num_windows; c++) {
-                Screen *screen = tab->windows[c].render_data.screen;
-                if (!screen) continue;
-                held |= screen->input_held;
-                parsed |= screen->input_parsed;
-            }
-        }
-        w->input_held = held && !parsed;
-    }
 }
 
 static bool
 parse_input(ChildMonitor *self) {
     // Parse all available input that was read in the I/O thread.
     size_t count = 0, remove_count = 0;
-    bool input_read = false, reload_config_called = false, input_held = false;
+    bool input_read = false, reload_config_called = false;
     monotonic_t now = monotonic();
+    // Must happen before the input is parsed, see input_wakeup_pending
+    atomic_store(&input_wakeup_pending, false);
     children_mutex(lock);
     while (remove_queue_count) {
         remove_queue_count--;
@@ -687,15 +851,9 @@ parse_input(ChildMonitor *self) {
     }
 
     for (size_t i = 0; i < count; i++) {
-        if (!scratch[i].needs_removal) {
-            if (do_parse(self, scratch[i].screen, now, false)) input_read = true;
-            else if (scratch[i].screen->input_held) input_held = true;
-        } else scratch[i].screen->input_held = scratch[i].screen->input_parsed = false;
+        if (!scratch[i].needs_removal && do_parse(self, scratch[i].screen, now, false)) input_read = true;
         DECREF_CHILD(scratch[i]);
     }
-    if (input_held) mark_os_windows_with_held_input();
-    else
-        for (size_t i = 0; i < global_state.num_os_windows; i++) global_state.os_windows[i].input_held = false;
     if (reload_config_called) { call_boss(load_config_file, NULL); }
     return input_read;
 }
@@ -894,7 +1052,7 @@ sync_ime_position_with_cursor(OSWindow *os_window, Window *w) {
         ol->last_ime_cursor.valid = false;
         return;
     }
-    const index_type x = screen->cursor->x, y = screen->cursor->y;
+    const index_type x = screen_ime_anchor_x(screen), y = screen->cursor->y;
     if (ol->last_ime_cursor.valid && ol->last_ime_cursor.x == x && ol->last_ime_cursor.y == y) return;
     ol->last_ime_cursor.x = x;
     ol->last_ime_cursor.y = y;
@@ -941,6 +1099,7 @@ prepare_to_render_os_window(
     *all_windows_have_same_bg = true;
     *num_visible_windows = 0;
     color_type first_window_bg = 0;
+    bool progress_bar_visible = false;
     os_window->needs_layers = os_window->needs_layers || (OPT(cursor_trail) && tab->cursor_trail.needs_render);
     for (unsigned int i = 0; i < tab->num_windows; i++) {
         Window *w = tab->windows + i;
@@ -948,6 +1107,7 @@ prepare_to_render_os_window(
         if (w->visible && WD.screen) {
             screen_check_pause_rendering(WD.screen, now);
             *num_visible_windows += 1;
+            if (WD.screen->progress_state != PROGRESS_STATE_UNSET) progress_bar_visible = true;
             color_type window_bg =
                 colorprofile_to_color(
                     WD.screen->color_profile, WD.screen->color_profile->overridden.default_bg, WD.screen->color_profile->configured.default_bg)
@@ -968,7 +1128,6 @@ prepare_to_render_os_window(
                 *active_window_id = w->id;
                 if (collect_cursor_info(&WD.screen->cursor_render_info, w, now, os_window)) needs_render = true;
                 WD.screen->cursor_render_info.is_focused = os_window->is_focused;
-                if (global_state.ime_used && os_window->is_focused) sync_ime_position_with_cursor(os_window, w);
                 set_os_window_title_from_window(w, os_window);
                 *active_window_bg = window_bg;
                 {
@@ -990,28 +1149,6 @@ prepare_to_render_os_window(
                     CHECK(alternate_screen.exited_at, ALTERNATE_SCREEN_EXIT);
 #undef CHECK
                     os_window->screen_state_checked_at = MAX(since, latest);
-                }
-                if (OPT(cursor_trail)) {
-                    if (os_window->last_active_tab != os_window->active_tab && os_window->last_active_tab < os_window->num_tabs) {
-                        tab->cursor_trail = os_window->tabs[os_window->last_active_tab].cursor_trail;
-                        tab->cursor_trail.needs_render = true;
-                        tab->cursor_trail.updated_at = now;
-                        os_window->cursor_blink_zero_time = now;
-                    }
-                    bool was_rendering = tab->cursor_trail.needs_render;
-                    if (update_cursor_trail(&tab->cursor_trail, w, now, os_window)) {
-                        needs_render = true;
-                        // A max wait of zero causes key input processing to be
-                        // slow so handle the case of OPT(repaint_delay) == 0, see https://github.com/kovidgoyal/kitty/pull/8066
-                        set_maximum_wait(MAX(OPT(repaint_delay), ms_to_monotonic_t(1ll)));
-                    } else if (OPT(cursor_trail) > now - WD.screen->cursor->position_changed_by_client_at) {
-                        // If update_cursor_trail failed due to time threshold, the trail animation
-                        // should be evaluated again shortly. Schedule next update when enough time
-                        // has passed since the cursor was last moved.
-                        set_maximum_wait(OPT(cursor_trail) - now + WD.screen->cursor->position_changed_by_client_at);
-                    }
-                    if (tab->cursor_trail.target_updated) os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE);
-                    if (was_rendering && !tab->cursor_trail.needs_render) os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP);
                 }
             } else {
                 if (WD.screen->cursor_render_info.render_even_when_unfocused) {
@@ -1036,12 +1173,36 @@ prepare_to_render_os_window(
                 }
             }
             if (send_cell_data_to_gpu(WD.vao_idx, WD.screen, os_window)) needs_render = true;
+            if (is_active_window) {
+                // After the upload: the drawn cursor column depends on its bidi maps
+                if (global_state.ime_used && os_window->is_focused) sync_ime_position_with_cursor(os_window, w);
+                if (OPT(cursor_trail)) {
+                    if (os_window->last_active_tab != os_window->active_tab && os_window->last_active_tab < os_window->num_tabs) {
+                        tab->cursor_trail = os_window->tabs[os_window->last_active_tab].cursor_trail;
+                        tab->cursor_trail.needs_render = true;
+                        tab->cursor_trail.updated_at = now;
+                        os_window->cursor_blink_zero_time = now;
+                    }
+                    bool was_rendering = tab->cursor_trail.needs_render;
+                    if (update_cursor_trail(&tab->cursor_trail, w, now, os_window)) {
+                        needs_render = true;
+                        request_animation_frame(os_window);
+                    } else if (OPT(cursor_trail) > now - WD.screen->cursor->position_changed_by_client_at) {
+                        // If update_cursor_trail failed due to time threshold, the trail animation
+                        // should be evaluated again shortly. Schedule next update when enough time
+                        // has passed since the cursor was last moved.
+                        set_maximum_wait(OPT(cursor_trail) - now + WD.screen->cursor->position_changed_by_client_at);
+                    }
+                    if (tab->cursor_trail.target_updated) os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_MOVE);
+                    if (was_rendering && !tab->cursor_trail.needs_render) os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_CURSOR_TRAIL_STOP);
+                }
+            }
             // Must be after send_cell_data_to_gpu() as that updates the graphics layers, which
             // determine whether there are images that need rendering in layers. Otherwise, a newly
             // placed image is not drawn until something else causes a re-render, see #10875
             os_window->needs_layers = os_window->needs_layers || screen_needs_rendering_in_layers(os_window, w, WD.screen);
             if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) needs_render = true;
-            if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) needs_render = true;
+            if (progress_bar_is_animating(WD.screen, now)) needs_render = true;
             // Prepare window title bar screen data for GPU
             WindowRenderData *trd = &w->window_title_render_data;
             if (trd->screen && trd->geometry.bottom > trd->geometry.top && trd->geometry.right > trd->geometry.left) {
@@ -1062,6 +1223,11 @@ prepare_to_render_os_window(
             set_maximum_wait(OPT(cursor_stop_blinking_after) - time_since_last_activity);
         }
     }
+    if (progress_bar_visible != os_window->progress_bar_visible) {
+        // Changes of the active tab and of which windows are visible count too
+        os_window->progress_bar_visible = progress_bar_visible;
+        os_window->shader_anim_event_registry |= 1u << (progress_bar_visible ? SHADER_ANIM_EVENT_PROGRESS_START : SHADER_ANIM_EVENT_PROGRESS_STOP);
+    }
     {
         ShaderAnimEventMask events = os_window->shader_anim_event_registry;
         if (os_window->active_tab != os_window->last_active_tab)
@@ -1076,7 +1242,7 @@ prepare_to_render_os_window(
         // Wake up for the next animation frame and for the moment a duration
         // bounded animation expires. Static groups (animation_step 0) have
         // min_step == MONOTONIC_T_MAX and so schedule no periodic wakeup.
-        if (min_step < MONOTONIC_T_MAX) set_maximum_wait(min_step);
+        if (min_step < MONOTONIC_T_MAX) set_maximum_wait(MAX(min_step, animation_wakeup_floor()));
         if (os_window->shader_anim.next_end_at < MONOTONIC_T_MAX) set_maximum_wait(os_window->shader_anim.next_end_at - now);
     }
     return needs_render || was_previously_rendered_with_layers != os_window->needs_layers;
@@ -1151,7 +1317,7 @@ render_prepared_os_window(
             if (is_active_window) active_window = w;
             draw_cells(&WD, os_window, is_active_window, false, num_of_visible_windows == 1, w, NULL, now);
             if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
-            if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
+            if (progress_bar_is_animating(WD.screen, now)) set_maximum_wait(ANIMATION_SAMPLE_WAIT);
             WindowRenderData *trd = &w->window_title_render_data;
             if (trd->screen && trd->geometry.right > trd->geometry.left && trd->geometry.bottom > trd->geometry.top)
                 draw_cells(trd, os_window, i == tab->active_window, true, false, NULL, w, now);
@@ -1169,45 +1335,48 @@ render_prepared_os_window(
     os_window->last_active_window_id = active_window_id;
     os_window->focused_at_last_render = os_window->is_focused;
     if (os_window->redraw_count) os_window->redraw_count--;
-    if (USE_RENDER_FRAMES) request_frame_render(os_window);
+#ifndef __APPLE__
+    if (USE_RENDER_FRAMES && RENDER_FRAMES_REQUESTED_LAZILY) {
+        // Request the next frame now only if an animation is waiting for it
+        if (os_window->tick_on_render_frame) {
+            request_frame_render(os_window);
+            // Render the next frame even if the frame is never reported
+            set_maximum_wait(MAX(0, lazy_render_frame_deadline(os_window) - monotonic()));
+        } else os_window->render_state = RENDER_FRAME_NOT_REQUESTED;
+    } else
+#endif
+        if (USE_RENDER_FRAMES || global_state.is_wayland) {
+        // On Wayland, render frames are also requested when not syncing to the
+        // monitor, as the compositor withholding them is how it signals that the
+        // window is hidden, see is_render_deferred_by_frame_pacing()
+        request_frame_render(os_window);
+    }
 #undef WD
 #undef TD
 }
 
-static bool
-no_render_frame_received_recently(OSWindow *w, monotonic_t now, monotonic_t max_wait) {
-    bool ans = now - w->last_render_frame_received_at > max_wait;
-    if (ans && global_state.debug_rendering) {
-        if (global_state.is_wayland) {
-            log_error("No render frame received in %.2f seconds", monotonic_t_to_s_double(max_wait));
-        } else {
-            log_error("No render frame received in %.2f seconds, re-requesting", monotonic_t_to_s_double(max_wait));
-        }
-    }
-    return ans;
-}
-
 bool
-render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
+render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images, bool ignore_frame_pacing) {
     if (!w->num_tabs) return false;
     if (!should_os_window_be_rendered(w) && global_state.thumbnail_callback.os_window != w->id) {
         update_os_window_title(w);
         if (w->is_focused) change_menubar_title(w->window_title);
         return false;
     }
-    if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY) {
-        if (w->render_state == RENDER_FRAME_NOT_REQUESTED || no_render_frame_received_recently(w, now, ms_to_monotonic_t(250ll))) request_frame_render(w);
-        if (w->id != global_state.thumbnail_callback.os_window) {
-            // dont respect render frames soon after a resize on Wayland as they cause flicker because
-            // we want to fill the newly resized buffer ASAP, not at compositors convenience
-            if (!global_state.is_wayland || (monotonic() - w->viewport_resized_at) > s_double_to_monotonic_t(1)) { return false; }
-        }
-    }
+    if (!ignore_frame_pacing && is_render_deferred_by_frame_pacing(w, now)) return false;
     w->render_calls++;
     make_os_window_context_current(w);
     bool needs_render = w->redraw_count > 0 || w->live_resize.in_progress || global_state.thumbnail_callback.os_window == w->id;
+    // The viewport is driver state shared by all surfaces with some GPU
+    // drivers, such as Vulkan, so it must be set for this window every time,
+    // as it may have been changed while another OS Window was current, for
+    // example, by a resize of another OS Window. During a live resize the
+    // viewport size is not updated until the resize completes, but the
+    // surface already has the new size, which the overlay showing the
+    // resizing text must cover.
+    if (w->live_resize.in_progress && w->live_resize.width > 0 && w->live_resize.height > 0) set_gpu_viewport(w->live_resize.width, w->live_resize.height);
+    else set_gpu_viewport(w->viewport_width, w->viewport_height);
     if (w->viewport_size_dirty) {
-        set_gpu_viewport(w->viewport_width, w->viewport_height);
         w->viewport_size_dirty = false;
         needs_render = true;
     }
@@ -1222,25 +1391,29 @@ render_os_window(OSWindow *w, monotonic_t now, bool scan_for_animated_images) {
         needs_render = true;
     if (w->last_active_window_id != active_window_id || w->last_active_tab != w->active_tab || w->focused_at_last_render != w->is_focused) needs_render = true;
     if (w->render_calls < 3 && background_image_for_os_window(w) != NULL) needs_render = true;
+    if (w->software_rendering_banner.shown && !w->software_rendering_banner.done) {
+        // Redraw the window without the banner once it expires
+        const monotonic_t expires_at = w->software_rendering_banner.shown_at + SOFTWARE_RENDERING_BANNER_DURATION;
+        if (now >= expires_at) {
+            w->software_rendering_banner.done = true;
+            needs_render = true;
+        } else set_maximum_wait(expires_at - now);
+    }
     if (needs_render) render_prepared_os_window(w, active_window_id, active_window_bg, num_visible_windows, all_windows_have_same_bg, now);
     if (w->is_focused) change_menubar_title(w->window_title);
     return needs_render;
 }
 
-static void
-render(monotonic_t now, bool input_read) {
-    EVDBG("input_read: %d, check_for_active_animated_images: %d\n", input_read, global_state.check_for_active_animated_images);
-    static monotonic_t last_render_at = MONOTONIC_T_MIN;
-    monotonic_t time_since_last_render = last_render_at == MONOTONIC_T_MIN ? OPT(repaint_delay) : now - last_render_at;
-    if (!input_read && time_since_last_render < OPT(repaint_delay) && !global_state.thumbnail_callback.os_window) {
-        set_maximum_wait(OPT(repaint_delay) - time_since_last_render);
-        return;
-    }
+// Set while render() runs, so that Python code it calls, such as for the tab bar,
+// can share expensive data such as the process group map between renders.
+static atomic_bool render_in_progress = false;
 
+static void
+render(monotonic_t now) {
+    EVDBG("check_for_active_animated_images: %d\n", global_state.check_for_active_animated_images);
     const bool scan_for_animated_images = global_state.check_for_active_animated_images;
     global_state.check_for_active_animated_images = false;
-    call_boss(cache_process_data, "O", Py_True);
-    bool waiting_for_frame = false;
+    atomic_store(&render_in_progress, true);
 
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
         OSWindow *w = global_state.os_windows + i;
@@ -1248,29 +1421,18 @@ render(monotonic_t now, bool input_read) {
         // rendering is done in cocoa_os_window_resized()
         if (w->live_resize.in_progress) continue;
 #endif
-        // Held bytes are not on this window yet. Painting it draws the old frame, and the
-        // turn that parses them paints again because it ignores repaint_delay.
-        if (w->input_held && w->id != global_state.thumbnail_callback.os_window) {
-            if (scan_for_animated_images) global_state.check_for_active_animated_images = true;
-            continue;
-        }
-        // A window waiting for a render frame cannot paint now, so it must not delay the
-        // paint when the frame arrives, otherwise the next output paints it mid-burst
-        if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY && should_os_window_be_rendered(w))
-            waiting_for_frame = true;
-        if (!render_os_window(w, now, scan_for_animated_images)) {
+        if (!render_os_window(w, now, scan_for_animated_images, false)) {
             // since we didn't scan the window for animations, force a rescan on next wakeup/render frame
             if (scan_for_animated_images) global_state.check_for_active_animated_images = true;
         }
         if (w->keep_rendering_till_swap) {
             debug_rendering("Re-rendering window %llu on the %u attempt since swap did not happen\n", w->id, w->keep_rendering_till_swap);
-            set_maximum_wait(OPT(repaint_delay));
+            set_maximum_wait(MAX(min_render_interval(), SWAP_RETRY_INTERVAL));
             w->needs_render = true;
             w->keep_rendering_till_swap--;
         }
     }
-    if (!waiting_for_frame) last_render_at = now;
-    call_boss(cache_process_data, "O", Py_False);
+    atomic_store(&render_in_progress, false);
 #undef TD
 }
 
@@ -1677,15 +1839,11 @@ process_global_state(void *data) {
     ChildMonitor *self = data;
     maximum_wait = -1;
     bool state_check_timer_enabled = false;
-    bool input_read = false;
 
     monotonic_t now = monotonic();
-    if (global_state.has_pending_resizes) {
-        process_pending_resizes(now);
-        input_read = true;
-    }
-    if (parse_input(self)) input_read = true;
-    render(now, input_read);
+    if (global_state.has_pending_resizes) process_pending_resizes(now);
+    parse_input(self);
+    render(now);
 #ifdef __APPLE__
     if (has_cocoa_pending_actions) {
         process_cocoa_pending_actions();
@@ -1727,7 +1885,6 @@ add_children(ChildMonitor *self) {
     for (; add_queue_count > 0 && self->count < MAX_CHILDREN;) {
         add_queue_count--;
         children[self->count] = add_queue[add_queue_count];
-        child_input_wake[self->count] = (ChildInputWake){0};
         add_queue[add_queue_count] = EMPTY_CHILD;
         children_fds[EXTRA_FDS + self->count].fd = children[self->count].fd;
         children_fds[EXTRA_FDS + self->count].events = POLLIN;
@@ -1777,7 +1934,6 @@ remove_children(ChildMonitor *self) {
                 if (num_to_right > 0) {
                     memmove(children + i, children + i + 1, num_to_right * sizeof(Child));
                     memmove(children_fds + EXTRA_FDS + i, children_fds + EXTRA_FDS + i + 1, num_to_right * sizeof(struct pollfd));
-                    memmove(child_input_wake + i, child_input_wake + i + 1, num_to_right * sizeof(ChildInputWake));
                 }
             }
         }
@@ -1806,7 +1962,7 @@ remove_children(ChildMonitor *self) {
 #endif
 
 static bool
-read_bytes(int fd, Screen *screen) {
+read_bytes(int fd, Screen *screen, size_t *bytes_read) {
     size_t total = 0;
     bool child_alive = true, read_more = true;
 
@@ -1834,6 +1990,7 @@ read_bytes(int fd, Screen *screen) {
         }
         vt_parser_commit_write(screen->vt_parser, len);
     }
+    *bytes_read += total;
     return child_alive;
 }
 
@@ -1954,80 +2111,99 @@ write_to_child(int fd, Screen *screen) {
     screen_mutex(unlock, write);
 }
 
-static bool
-input_needs_wake(const ChildInputWake *c) {
-    return c->pending.chunk && c->pending.chunk != c->woken_chunk && (c->pending.small_pending || c->pending.large_ready);
-}
+// Input that arrives within INPUT_WAKEUP_MIN_INTERVAL of the last wakeup for input
+// waits for the interval to pass, unless INPUT_WAKEUP_MIN_BYTES have been read. This
+// bounds the wakeup rate when the parser consumes input faster than it arrives, such
+// as for the payload of long escape codes, where the pty hands us a KB or two per
+// wait and the main loop would otherwise be woken for every one of them.
+#define INPUT_WAKEUP_MIN_INTERVAL (250 * MONOTONIC_T_1e3)
+#define INPUT_WAKEUP_MIN_BYTES (64u * 1024u)
 
-static ParserInputWake
-pending_input_wake_info(ChildMonitor *self, monotonic_t now) {
-    ParserInputWake info = {0};
-    for (size_t i = 0; i < self->count; i++) {
-        ChildInputWake *c = child_input_wake + i;
-        // Only this thread commits bytes, so a child with nothing pending at its last
-        // query and no reads since still has nothing pending.
-        if (c->stale || c->pending.chunk) {
-            c->pending = vt_parser_input_wake(children[i].screen->vt_parser, now);
-            c->stale = false;
-        }
-        if (input_needs_wake(c)) {
-            if (c->pending.small_pending) info.small_pending = true;
-            if (c->pending.large_ready) info.large_ready = true;
-        }
-        monotonic_t held_until = c->pending.large_held_until;
-        if (held_until && (!info.large_held_until || held_until < info.large_held_until)) info.large_held_until = held_until;
+// poll() on children_fds with a timeout in nanoseconds, negative for no timeout, as
+// poll() itself has only millisecond resolution, which is too coarse for
+// INPUT_WAKEUP_MIN_INTERVAL.
+#ifdef __APPLE__
+static int io_kqueue = -1;
+
+static int
+poll_children_fds(nfds_t nfds, monotonic_t timeout) {
+    // Every call specifies the complete interest set, with unwanted filters disabled
+    // rather than deleted, so that the changes and the wait are a single syscall and
+    // no registration state needs to be tracked. Closing an fd removes its filters.
+    static struct kevent changes[2 * (MAX_CHILDREN + EXTRA_FDS)], events[2 * (MAX_CHILDREN + EXTRA_FDS)];
+    if (io_kqueue < 0 && (io_kqueue = kqueue()) < 0) return -1;
+    int nchanges = 0;
+    for (nfds_t i = 0; i < nfds; i++) {
+        struct pollfd *p = children_fds + i;
+        p->revents = 0;
+        if (p->fd < 0) continue;
+        EV_SET(changes + nchanges++, p->fd, EVFILT_READ, EV_ADD | (p->events & POLLIN ? EV_ENABLE : EV_DISABLE), 0, 0, (void *)(uintptr_t)i);
+        EV_SET(changes + nchanges++, p->fd, EVFILT_WRITE, EV_ADD | (p->events & POLLOUT ? EV_ENABLE : EV_DISABLE), 0, 0, (void *)(uintptr_t)i);
     }
-    return info;
+    struct timespec ts = {.tv_sec = timeout / MONOTONIC_T_1e9, .tv_nsec = timeout % MONOTONIC_T_1e9};
+    // The event list must have room for an error for every change, as otherwise
+    // kevent() fails outright when a change fails, such as for a closed fd
+    int n = kevent(io_kqueue, changes, nchanges, events, nchanges, timeout < 0 ? NULL : &ts);
+    if (n <= 0) return n;
+    int ans = 0;
+    for (int k = 0; k < n; k++) {
+        const struct kevent *e = events + k;
+        struct pollfd *p = children_fds + (uintptr_t)e->udata;
+        const short before = p->revents;
+        if (e->flags & EV_ERROR) p->revents |= e->data == EBADF ? POLLNVAL : POLLERR;
+        else {
+            p->revents |= e->filter == EVFILT_READ ? POLLIN : POLLOUT;
+            if (e->flags & EV_EOF) p->revents |= POLLHUP;
+        }
+        if (!before && p->revents) ans++;
+    }
+    return ans;
 }
 
 static void
-remember_woken_input(ChildMonitor *self) {
-    // Uses the state the wake was decided on, so a chunk that arrives after the
-    // main thread has parsed is not marked as woken. Must run before the main loop
-    // is woken, so that a small chunk which grows in the meantime is still accepted.
-    for (size_t i = 0; i < self->count; i++) {
-        ChildInputWake *c = child_input_wake + i;
-        if (!input_needs_wake(c)) continue;
-        if (c->pending.small_pending) vt_parser_accept_input(children[i].screen->vt_parser, c->pending.chunk);
-        c->woken_chunk = c->pending.chunk;
-    }
+cleanup_poll_children_fds(void) {
+    if (io_kqueue > -1) safe_close(io_kqueue, __FILE__, __LINE__);
+    io_kqueue = -1;
 }
+#else
+#ifdef __NetBSD__
+#define ppoll pollts
+#endif
+
+static int
+poll_children_fds(nfds_t nfds, monotonic_t timeout) {
+    struct timespec ts = {.tv_sec = timeout / MONOTONIC_T_1e9, .tv_nsec = timeout % MONOTONIC_T_1e9};
+    return ppoll(children_fds, nfds, timeout < 0 ? NULL : &ts, NULL);
+}
+
+static void
+cleanup_poll_children_fds(void) {}
+#endif
 
 static void *
 io_loop(void *data) {
     // The I/O thread loop
     size_t i;
     int ret;
-    bool has_more, child_data_received, has_pending_wakeups = false, last_wakeup_was_early = false;
-    // A signal or a removed child that needs the main loop. Latched until WAKEUP, since
-    // signalfd is drained on receipt and a removed child is no longer polled.
-    bool wake_latched = false;
-    monotonic_t last_main_loop_wakeup_at = -1, now = -1, pending_wake_at = 0;
+    bool has_more, child_data_received, wake_needed, input_wakeup_deferred = false;
+    size_t bytes_since_input_wakeup = 0;
+    monotonic_t last_input_wakeup_at = 0, now;
     Screen *screen;
     ChildMonitor *self = (ChildMonitor *)data;
     set_thread_name("KittyChildMon");
 #define WAKEUP                                                                               \
     {                                                                                        \
-        remember_woken_input(self);                                                          \
         if (self->benchmark_wakeup_fd >= 0) {                                                \
             static const char _wakeup_byte = 1;                                              \
             ssize_t _wakeup_ret UNUSED = write(self->benchmark_wakeup_fd, &_wakeup_byte, 1); \
         } else wakeup_main_loop();                                                           \
-        last_main_loop_wakeup_at = now;                                                      \
-        last_wakeup_was_early = false;                                                       \
-        wake_latched = false;                                                                \
     }
 
     while (LIKELY(!self->shutting_down)) {
         children_mutex(lock);
-        // A child that exited is no longer polled, so its held output has no deadline here.
         // The main thread flush-parses the remove queue. It does not need a wake for a
         // child it closed itself, the SIGCHLD from the hangup wakes it.
-        if (remove_children(self)) {
-            wake_latched = true;
-            has_pending_wakeups = true;
-            pending_wake_at = 0;
-        }
+        wake_needed = remove_children(self) > 0;
         add_children(self);
         children_mutex(unlock);
         child_data_received = false;
@@ -2041,19 +2217,18 @@ io_loop(void *data) {
             children_fds[EXTRA_FDS + i].events |= (screen->write_buf_used ? POLLOUT : 0);
             screen_mutex(unlock, write);
         }
-        if (has_pending_wakeups) {
-            now = monotonic();
-            monotonic_t time_delta = pending_wake_at - now;
-            if (time_delta > 0) ret = poll(children_fds, self->count + EXTRA_FDS, monotonic_t_to_ms_ceil(time_delta));
-            else ret = 0;
-        } else {
-            ret = poll(children_fds, self->count + EXTRA_FDS, -1);
+        // A removed child needs the main loop now, as it is no longer polled
+        if (wake_needed) ret = 0;
+        else {
+            monotonic_t timeout = -1;
+            if (input_wakeup_deferred) timeout = MAX(0, last_input_wakeup_at + INPUT_WAKEUP_MIN_INTERVAL - monotonic());
+            ret = poll_children_fds(self->count + EXTRA_FDS, timeout);
         }
         if (ret > 0) {
             if (children_fds[0].revents & POLLIN) drain_fd(children_fds[0].fd); // wakeup
             if (children_fds[1].revents & POLLIN) {
                 SignalSet ss = {0};
-                wake_latched = true;
+                wake_needed = true;
                 read_signals(children_fds[1].fd, handle_signal, &ss);
                 if (ss.kill_signal || ss.reload_config) {
                     children_mutex(lock);
@@ -2066,8 +2241,7 @@ io_loop(void *data) {
             for (i = 0; i < self->count; i++) {
                 if (children_fds[EXTRA_FDS + i].revents & (POLLIN | POLLHUP)) {
                     child_data_received = true;
-                    child_input_wake[i].stale = true;
-                    has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen);
+                    has_more = read_bytes(children_fds[EXTRA_FDS + i].fd, children[i].screen, &bytes_since_input_wakeup);
                     if (!has_more) {
                         // child is dead. The next iteration queues it and wakes the main thread.
                         children_mutex(lock);
@@ -2100,53 +2274,31 @@ io_loop(void *data) {
         } else if (ret < 0) {
             if (errno != EAGAIN && errno != EINTR) { perror("Call to poll() failed"); }
         }
-        // we only wakeup the main loop after input_delay as wakeup is an expensive operation
-        // on some platforms, such as cocoa. Small pending input, typically the echo of typed
-        // characters, wakes immediately, but at most once per input_delay so that continuous
-        // streams of small writes are still coalesced.
-        if (child_data_received || wake_latched || has_pending_wakeups) {
-            now = monotonic();
-            ParserInputWake pending = pending_input_wake_info(self, now);
-            // rate_open is the gap since the previous wakeup. A large chunk the
-            // parser will accept now (large_ready) wakes inside that gap, once per chunk.
-            // A large chunk still inside input_delay waits until new_input_at + input_delay,
-            // stored in wait_until, rather than until the next rate-limit slot.
-            bool rate_open = now - last_main_loop_wakeup_at > OPT(input_delay);
-            bool wake_now = pending.large_ready;
-            bool early_small = false;
-            bool need_rate_slot = false;
-            // The main thread does not arm a timer for a held chunk, this deadline is the only one
-            monotonic_t wait_until = pending.large_held_until;
-            if (pending.small_pending) {
-                if (rate_open) wake_now = true;
-                else if (!last_wakeup_was_early) {
-                    wake_now = true;
-                    // This wake is the one early small wake unless a large chunk
-                    // was ready anyway. Marking that would swallow the next echo.
-                    early_small = !pending.large_ready;
-                } else need_rate_slot = true;
+        // Waking the main loop is expensive on some platforms, such as cocoa, so it is
+        // woken only if it is not already due to parse, which coalesces the wakeups of a
+        // continuous stream of output into one per parse, and at most once per
+        // INPUT_WAKEUP_MIN_INTERVAL unless enough input has accumulated.
+        if (child_data_received || input_wakeup_deferred) {
+            input_wakeup_deferred = false;
+            // The parse the main loop was already woken for consumes this input
+            if (atomic_load(&input_wakeup_pending)) bytes_since_input_wakeup = 0;
+            else {
+                now = monotonic();
+                if (bytes_since_input_wakeup >= INPUT_WAKEUP_MIN_BYTES || now - last_input_wakeup_at >= INPUT_WAKEUP_MIN_INTERVAL) {
+                    if (!atomic_exchange(&input_wakeup_pending, true)) wake_needed = true;
+                    last_input_wakeup_at = now;
+                    bytes_since_input_wakeup = 0;
+                } else input_wakeup_deferred = true;
             }
-            // A latched wake uses the same rate limit as a small write that already woke early.
-            if (wake_latched) {
-                if (rate_open) wake_now = true;
-                else need_rate_slot = true;
-            }
-            if (wake_now) {
-                WAKEUP;
-                if (early_small) last_wakeup_was_early = true;
-            } else if (need_rate_slot) {
-                monotonic_t rate_at = last_main_loop_wakeup_at + OPT(input_delay);
-                if (!wait_until || rate_at < wait_until) wait_until = rate_at;
-            }
-            has_pending_wakeups = wait_until != 0;
-            pending_wake_at = wait_until;
         }
+        if (wake_needed) WAKEUP;
     }
 #undef WAKEUP
     children_mutex(lock);
     for (i = 0; i < self->count; i++) children[i].needs_removal = true;
     remove_children(self);
     children_mutex(unlock);
+    cleanup_poll_children_fds();
     return 0;
 }
 // }}}
@@ -2635,8 +2787,15 @@ send_data_to_peer(PyObject *self UNUSED, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *
+is_render_in_progress(PyObject *self UNUSED, PyObject *args UNUSED) {
+    if (atomic_load(&render_in_progress)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
 static PyMethodDef module_methods[] = {
     METHODB(safe_pipe, METH_VARARGS),
+    METHODB(is_render_in_progress, METH_NOARGS),
     {"add_timer", (PyCFunction)add_python_timer, METH_VARARGS, ""},
     {"remove_timer", (PyCFunction)remove_python_timer, METH_VARARGS, ""},
     METHODB(monitor_pid, METH_VARARGS),

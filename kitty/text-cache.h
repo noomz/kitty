@@ -57,11 +57,25 @@ typedef struct {
 #endif
 
 TextCache *tc_alloc(void);
+// The style table of the screen the text cache belongs to
+struct CellStyleTable *tc_style_table(const TextCache *self);
+// The registered vector glyphs of the screen the text cache belongs to
+struct GlyphRegistry *tc_glyph_registry(const TextCache *self);
 TextCache *tc_incref(TextCache *self);
 TextCache *tc_decref(TextCache *self);
 void tc_chars_at_index(const TextCache *self, char_type idx, ListOfChars *ans);
 unsigned tc_chars_at_index_ansi(const TextCache *self, char_type idx, ANSIBuf *output);
 char_type tc_get_or_insert_chars(TextCache *self, const ListOfChars *chars);
+// Glyph protocol print time binding: cells whose text was printed when a
+// glyph was registered for its first codepoint store the glyph in their entry,
+// which holds a reference to it.
+struct VGGlyph;
+char_type tc_get_or_insert_chars_with_glyph(TextCache *self, const ListOfChars *chars, struct VGGlyph *glyph);
+struct VGGlyph *tc_glyph_at_index(const TextCache *self, char_type idx);
+// The number of entries bound to glyphs and the memory used by their glyphs,
+// which includes entries no longer used by cells until the next garbage collection
+void tc_bound_glyph_usage(const TextCache *self, size_t *count, size_t *memory);
+bool tc_has_adds_since_last_gc(const TextCache *self);
 char_type tc_num_entries(const TextCache *self);
 
 // Garbage collection: TextCache interns unique cell texts forever, so a

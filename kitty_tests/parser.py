@@ -193,9 +193,79 @@ class TestParser(BaseTest):
         pb('😀'.encode()[:-1])
         pb('\x1b\x1b%a', '\ufffd', ('Unknown char after ESC: 0x1b',), ('draw', '%a'))
 
+    def test_utf8_simd_decode_long_inputs(self):
+        # Long inputs exercise the decoding of 64 byte blocks of valid UTF-8,
+        # compare with the scalar decoder, including when the blocks contain
+        # invalid UTF-8 or ESC, at all positions and split at all boundaries
+        import random
+
+        def unsupported(which):
+            return (which == 2 and not has_sse4_2) or (which == 3 and not has_avx2)
+
+        def decode(parts, which):
+            test_utf8_decode_to_sentinel(b'', -1)
+            ans = []
+            for part in parts:
+                ans.append(test_utf8_decode_to_sentinel(part, which))
+            return ans
+
+        valid = ('a', ' ', '\n', 'é', 'ß', 'Ω', 'ж', '日', '本', '語', '€', '…', '😀', '𝄞', '\U0010ffff', 'ࠀ', '￿', '\x7f', '\x80', '߿')
+        runs = ('日本語の文字列' * 3, 'абвгдежзий' * 2, 'abcdefghijklmnop' * 2, '😀😛😇😈')
+        invalid = (
+            b'\x80',
+            b'\xbf',
+            b'\xc0\x80',
+            b'\xc1\xbf',
+            b'\xc2',
+            b'\xe0\x80\x80',
+            b'\xe0\x9f\xbf',
+            b'\xed\xa0\x80',
+            b'\xed\xbf\xbf',
+            b'\xf0\x80\x80\x80',
+            b'\xf0\x8f\xbf\xbf',
+            b'\xf4\x90\x80\x80',
+            b'\xf5\x80\x80\x80',
+            b'\xff',
+            b'\xfe',
+            b'\xe2\x89',
+            b'\xf0\x9f\x98',
+            b'\xe1\x28\xa1',
+            b'\xc2\xc2',
+            b'\xe0\xa0\xc0',
+        )
+
+        def data_for(seed):
+            rng = random.Random(seed)
+            out = bytearray()
+            target = rng.randint(70, 700)
+            bad_rate = rng.choice((0, 0, 0.01, 0.05))
+            esc_rate = rng.choice((0, 0, 0.01))
+            while len(out) < target:
+                r = rng.random()
+                if r < bad_rate:
+                    out += rng.choice(invalid)
+                elif r < bad_rate + esc_rate:
+                    out += b'\x1b'
+                elif r < 0.3:
+                    out += rng.choice(runs).encode()
+                else:
+                    out += rng.choice(valid).encode()
+            return bytes(out)
+
+        for seed in range(2000):
+            data = data_for(seed)
+            rng = random.Random(seed)
+            cuts = sorted(rng.sample(range(1, len(data)), min(len(data) - 1, rng.choice((0, 0, 1, 3)))))
+            parts = [data[a:b] for a, b in zip([0] + cuts, cuts + [len(data)])]
+            expected = decode(parts, 1)
+            for which in (2, 3):
+                if not unsupported(which):
+                    self.ae(expected, decode(parts, which), f'seed={seed} {which=} {parts=}')
+        test_utf8_decode_to_sentinel(b'', -1)
+
     def test_utf8_simd_decode(self):
         def unsupported(which):
-            return (which == 2 and not has_sse4_2) or (which == 3 and not has_avx2) or (which == 4 and not has_avx512)
+            return (which == 2 and not has_sse4_2) or (which == 3 and not has_avx2)
 
         def reset_state():
             test_utf8_decode_to_sentinel(b'', -1)
@@ -229,10 +299,10 @@ class TestParser(BaseTest):
             return actual
 
         def double_test(x):
-            for which in (2, 3, 4):
+            for which in (2, 3):
                 t(x, which=which)
             t(x * 2, which=3)
-            t(x * 4, which=4)
+            t(x * 4, which=3)
             reset_state()
 
         # incomplete trailer at end of vector
@@ -246,7 +316,7 @@ class TestParser(BaseTest):
         x('abc\x1bd1234efgh5678')
         x('abcd1234efgh5678ijklABCDmnopEFGH')
 
-        for which in (2, 3, 4):
+        for which in (2, 3):
             x = partial(t, which=which)
             x('abcdef', 'ghijk')
             x('2:α3', ':≤4:😸|')
@@ -268,7 +338,7 @@ class TestParser(BaseTest):
             expected = 'filler' + expected
             self.ae(expected, actual, f'Failed for: {src!r} with {which=}')
 
-        for which in (1, 2, 3, 4):
+        for which in (1, 2, 3):
             pb = partial(test_expected, which=which)
             pb('ニチ', 'ニチ')
             pb('\x84\x85', '\x84\x85')
@@ -1029,6 +1099,67 @@ class TestParser(BaseTest):
         pb('\033[' + '1;' * 255 + '1:2m\033[31m', too_many, ('select_graphic_rendition', '31'))
         pb('\033[' + '1;' * 256 + 'm\033[31m', ('select_graphic_rendition', ';'.join('1' * 256)), ('select_graphic_rendition', '31'))
 
+    def test_csi_parse_simple(self):
+        # The fast path for simple CSI codes must give the same results as the
+        # generic CSI parser, including for codes it does not handle
+        import random
+
+        from kitty.fast_data_types import test_set_csi_parse_simple
+
+        def param(rng):
+            r = rng.random()
+            if r < 0.7:
+                return str(rng.randint(0, 300))
+            if r < 0.8:
+                return ''
+            if r < 0.85:
+                return '9' * rng.randint(15, 20)
+            if r < 0.9:
+                return '-' + str(rng.randint(0, 9))
+            return rng.choice(('\n', '\x08', '\r', ' ', '$', '\x07')) + str(rng.randint(0, 9))
+
+        def csi(rng):
+            ans = '\x1b['
+            if rng.random() < 0.3:
+                ans += rng.choice('?><=')
+            n = rng.choice((0, 1, 1, 2, 3, 5, 8)) if rng.random() < 0.99 else rng.randint(250, 260)
+            for i in range(n):
+                if i:
+                    ans += rng.choice(';;;:')
+                ans += param(rng)
+            if rng.random() < 0.05:
+                ans += rng.choice(' $"!')
+            return ans + rng.choice('mmmHJKABCDEGbrhlsun@`dXPLMSTx~q')
+
+        def data_for(seed):
+            rng = random.Random(seed)
+            return ''.join(csi(rng) if rng.random() < 0.7 else 'ab日' * rng.randint(0, 3) for _ in range(rng.randint(1, 60))).encode()
+
+        def run(data, chunk_sizes, dump):
+            s = self.create_screen(cols=20, lines=10, scrollback=10)
+            cd = CmdDump() if dump else None
+            pos = 0
+            for sz in chunk_sizes:
+                parse_bytes(s, data[pos : pos + sz], cd)
+                pos += sz
+            parse_bytes(s, data[pos:], cd)
+            lines = tuple(s.linebuf.line(i).as_ansi() for i in range(s.lines))
+            return (cd.get_result() if dump else None), lines, (s.cursor.x, s.cursor.y), s.cursor.fg, s.cursor.bg
+
+        try:
+            for seed in range(500):
+                data = data_for(seed)
+                rng = random.Random(seed)
+                chunk_sizes = [rng.randint(1, 16) for _ in range(rng.randint(0, 8))]
+                for dump in (True, False):
+                    test_set_csi_parse_simple(True)
+                    a = run(data, chunk_sizes, dump)
+                    test_set_csi_parse_simple(False)
+                    b = run(data, chunk_sizes, dump)
+                    self.ae(a, b, f'seed={seed} dump={dump} data={data!r}')
+        finally:
+            test_set_csi_parse_simple(True)
+
     def test_csi_code_rep(self):
         s = self.create_screen(8)
         pb = partial(self.parse_bytes_dump, s)
@@ -1195,6 +1326,39 @@ class TestParser(BaseTest):
         e('s==', 'Malformed GraphicsCommand control block, expecting an integer value for key: s')
         e('s=1=', 'Malformed GraphicsCommand control block, expecting a , or semi-colon after a value, found: 0x3d')
 
+    def test_smooth_scroll_command(self):
+        from kitty.fast_data_types import SMOOTH_SCROLL_CODE
+
+        def c(**k):
+            for f in ('action', 'query_action', 'orientation'):
+                k[f] = k.get(f, '\0').encode('ascii')
+            for f in 'id x y width height capacity private_overflow delta'.split():
+                k.setdefault(f, 0)
+            return ('smooth_scroll_command', k)
+
+        def t(cmd, **kw):
+            pb(f'\033]{SMOOTH_SCROLL_CODE};{cmd}\033\\', c(**kw))
+
+        def e(cmd, err):
+            pb(f'\033]{SMOOTH_SCROLL_CODE};{cmd}\033\\', (err,))
+
+        s = self.create_screen()
+        pb = partial(self.parse_bytes_dump, s)
+        t('a=d:i=1:x=2:y=3:w=4:h=5:o=h:k=2:p=1', action='d', id=1, x=2, y=3, width=4, height=5, orientation='h', capacity=2, private_overflow=1)
+        t('a=s:i=1:d=-17', action='s', id=1, delta=-17)
+        t('a=s:i=1:d=17', action='s', id=1, delta=17)
+        t('a=r', action='r')
+        t('a=q:e=Z', action='q', query_action='Z')
+        t('a=s:d=-2147483648', action='s', delta=-(2**31))
+        t('a=s:d=2147483647', action='s', delta=2**31 - 1)
+        e('a=s:d=2147483648', 'Malformed SmoothScrollCommand control block, number is too large')
+        e('a=s:d=-2147483649', 'Malformed SmoothScrollCommand control block, number is too large')
+        e('a=x', 'Malformed SmoothScrollCommand control block, unknown flag value for action: 0x78')
+        e('a=d:o=x', 'Malformed SmoothScrollCommand control block, unknown flag value for orientation: 0x78')
+        e('a=d:Z=1', 'Malformed SmoothScrollCommand control block, invalid key character: 0x5a')
+        e('a=d,i=1', 'Malformed SmoothScrollCommand control block, expecting a : or semi-colon after a value, found: 0x2c')
+        e('a=s:i=1;payload', 'Malformed SmoothScrollCommand control block, expecting a : or semi-colon after a value, found: 0x3b')
+
     def test_deccara(self):
         s = self.create_screen()
         pb = partial(self.parse_bytes_dump, s)
@@ -1246,3 +1410,20 @@ class TestParser(BaseTest):
         self.ae(s.cursor.x, 24)
         parse_bytes(s, b'\033[2147483647I')
         self.ae(s.cursor.x, s.columns - 1)
+
+    def test_bidi_controls(self):
+        s = self.create_screen()
+        c = s.callbacks
+        pb = partial(self.parse_bytes_dump, s)
+        pb('\033[2 k\033[ k', ('screen_set_bidi_direction', 2, 0), ('screen_set_bidi_direction', 0, 0))
+        pb('\033[2;5 k\033[;1 k', ('screen_set_bidi_direction', 2, 5), ('screen_set_bidi_direction', 0, 1))
+        pb('\033[1;2;3 k', ('CSI code k has 3 > 2 parameters',))
+        pb('\033[?1 k', ("Unknown CSI k sequence with start and end modifiers: '?' ' '",))
+        pb('\033[4;8h\033[?2501l', ('screen_set_mode', 4, 0), ('screen_set_mode', 8, 0), ('screen_reset_mode', 2501, 1))
+        for setup, bdsm, auto in (('', 1, 2), ('\033[?2501h', 1, 1), ('\033[8l', 2, 1), ('\033[?2501l', 2, 2)):
+            c.clear()
+            parse_bytes(s, f'{setup}\033[8$p\033[?2501$p'.encode())
+            self.ae(c.wtcbuf, f'\033[8;{bdsm}$y\033[?2501;{auto}$y'.encode(), setup)
+        s = self.create_screen(options={'force_ltr': True})
+        parse_bytes(s, b'\033[8h\033[?2501h\033[8$p\033[?2501$p')
+        self.ae(s.callbacks.wtcbuf, b'\033[8;4$y\033[?2501;4$y')

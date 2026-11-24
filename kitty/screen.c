@@ -22,6 +22,7 @@
 #include "data-types.h"
 #include "control-codes.h"
 #include "screen.h"
+#include "vector-glyph.h"
 #include "dnd.h"
 #include "state.h"
 #include "iqsort.h"
@@ -29,6 +30,7 @@
 #include "charsets.h"
 #include "lineops.h"
 #include "hyperlink.h"
+#include "gpu.h"
 #include <structmember.h>
 #include <limits.h>
 #include <sys/types.h>
@@ -44,6 +46,7 @@
 #include "keys.h"
 #include "vt-parser.h"
 #include "resize.h"
+#include "bidi.h"
 
 static const ScreenModes empty_modes = {0, .mDECAWM = true, .mDECTCEM = true, .mDECARM = true};
 
@@ -80,15 +83,15 @@ init_tabstops(bool *tabstops, index_type count) {
 static bool
 init_overlay_line(Screen *self, index_type columns, bool keep_active) {
     PyMem_Free(self->overlay_line.cpu_cells);
-    PyMem_Free(self->overlay_line.gpu_cells);
+    PyMem_Free(self->overlay_line.render_cells);
     PyMem_Free(self->overlay_line.original_line.cpu_cells);
-    PyMem_Free(self->overlay_line.original_line.gpu_cells);
+    PyMem_Free(self->overlay_line.original_line.render_cells);
     self->overlay_line.cpu_cells = PyMem_Calloc(columns, sizeof(CPUCell));
-    self->overlay_line.gpu_cells = PyMem_Calloc(columns, sizeof(GPUCell));
+    self->overlay_line.render_cells = PyMem_Calloc(columns, sizeof(RenderCell));
     self->overlay_line.original_line.cpu_cells = PyMem_Calloc(columns, sizeof(CPUCell));
-    self->overlay_line.original_line.gpu_cells = PyMem_Calloc(columns, sizeof(GPUCell));
-    if (!self->overlay_line.cpu_cells || !self->overlay_line.gpu_cells || !self->overlay_line.original_line.cpu_cells ||
-        !self->overlay_line.original_line.gpu_cells) {
+    self->overlay_line.original_line.render_cells = PyMem_Calloc(columns, sizeof(RenderCell));
+    if (!self->overlay_line.cpu_cells || !self->overlay_line.render_cells || !self->overlay_line.original_line.cpu_cells ||
+        !self->overlay_line.original_line.render_cells) {
         PyErr_NoMemory();
         return false;
     }
@@ -146,6 +149,7 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
             Py_CLEAR(self);
             return PyErr_NoMemory();
         }
+        self->style_table = tc_style_table(self->text_cache);
         self->reload_all_gpu_data = true;
         self->cell_size.width = cell_width;
         self->cell_size.height = cell_height;
@@ -212,6 +216,8 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
 
 static Line *range_line_(Screen *self, int y);
 
+static void reset_style_table_if_unused(Screen *self);
+
 static void
 clamp_scroll_position(Screen *self) {
     // Ensure the scroll position is valid after the scrollback has shrunk
@@ -224,6 +230,7 @@ clamp_scroll_position(Screen *self) {
 static void
 do_screen_reset(Screen *self, bool is_hard_reset) {
     screen_pause_rendering(self, false, 0);
+    screen_smooth_scroll_remove_all(self);
     self->dnd_chunking.active = false;
     self->extra_cursors.count = 0;
     zero_at_ptr(&self->extra_cursors.color);
@@ -241,6 +248,11 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
     memset(self->main_key_encoding_flags, 0, sizeof(self->main_key_encoding_flags));
     memset(self->alt_key_encoding_flags, 0, sizeof(self->alt_key_encoding_flags));
     self->display_window_char = 0;
+    if (self->progress_state != PROGRESS_STATE_UNSET || self->progress_percent) {
+        self->progress_previous_percent = self->progress_percent;
+        self->progress_previous_state = self->progress_state;
+        self->progress_changed_at = monotonic();
+    }
     self->progress_state = PROGRESS_STATE_UNSET;
     self->progress_percent = 0;
     self->progress_indeterminate_anim_at = 0;
@@ -252,6 +264,10 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
         linebuf_clear(self->linebuf, BLANK_CHAR);
         historybuf_clear(self->historybuf);
         linebuf_clear(self->alt_linebuf, BLANK_CHAR);
+        self->main_linebuf->bidi_stamped = self->alt_linebuf->bidi_stamped = false;
+        bidi_maps_free(self->bidi_maps);
+        self->bidi_maps = NULL;
+        bidi_layout_moved(self);
         // all buffers are now empty
         self->multiline_chars_used = false;
         zero_at_ptr(&self->multiline_chars_cut_off_at_bottom);
@@ -260,11 +276,14 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
         self->pixel_scroll_offset_y = 0;
         self->scroll_changed = true;
         clear_hyperlink_pool(self->hyperlink_pool);
+        glyph_registry_clear_all(tc_glyph_registry(self->text_cache));
         grman_clear(self->main_grman, false, self->cell_size); // dont delete images in scrollback
         grman_clear(self->alt_grman, true, self->cell_size);
     }
     self->modes = empty_modes;
     self->saved_modes = empty_modes;
+    zero_at_ptr(&self->bidi);
+    screen_bidi_records_writes_changed(self);
     self->active_hyperlink_id = 0;
     zero_at_ptr(&self->color_profile->overridden);
     reset_vt_parser(self->vt_parser);
@@ -280,6 +299,12 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
     screen_cursor_position(self, 1, 1);
     set_dynamic_color(self, 111, NULL); // does default_bg_changed processing
     colorprofile_reset(self->color_profile);
+    if (is_hard_reset) {
+        reset_style_table_if_unused(self);
+        // Release glyphs registered with the glyph protocol that were bound
+        // to cells that no longer exist
+        if (vg_live_glyph_memory()) screen_garbage_collect_text_cache(self);
+    }
     CALLBACK("on_reset", "O", is_hard_reset ? Py_True : Py_False);
 }
 
@@ -304,6 +329,10 @@ screen_dirty_sprite_positions(Screen *self) {
         linebuf_mark_line_dirty(self->alt_linebuf, i);
     }
     for (index_type i = 0; i < self->historybuf->count; i++) historybuf_mark_line_dirty(self->historybuf, i);
+    for (unsigned r = 0; r < self->smooth_scroll.count; r++) {
+        LineBuf *lb = self->smooth_scroll.regions[r].overflow;
+        for (index_type i = 0; i < lb->ynum; i++) linebuf_mark_line_dirty(lb, i);
+    }
 }
 
 typedef struct CursorTrack {
@@ -319,6 +348,60 @@ typedef struct CursorTrack {
         index_type x, y;
     } temp;
 } CursorTrack;
+
+// A line only becomes empty by an erase, a shift or a scroll, which is when prepare looks for a buffer left without a record
+static inline void
+bidi_note_maybe_unstamp(LineBuf *lb) {
+    if (UNLIKELY(lb->bidi_stamped)) lb->bidi_maybe_unstamp = true;
+}
+
+static inline void
+bidi_line_may_reorder_from_cells(Screen *self, LineBuf *lb, index_type y) {
+    lb->line_attrs[y].bidi_may_reorder = bidi_cells_may_reorder(linebuf_cpu_cells_for_line(lb, y), lb->xnum, self->text_cache);
+}
+
+// Writes to a buffer without a stamp do not keep bidi_may_reorder, so it is recomputed for every row, and for the main buffer
+// also for the history rows its row 0 continues, which its first paragraph takes in however far a view scrolled back reaches
+void
+screen_bidi_recompute_history_may_reorder(Screen *self) {
+    self->bidi_history_bits_stale = false;
+    HistoryBuf *hb = self->historybuf;
+    for (index_type l = 0; l < hb->count && (l ? historybuf_is_line_continued(hb, l - 1) : history_buf_endswith_wrap(hb)); l++)
+        historybuf_attrs(hb, l)->bidi_may_reorder = bidi_cells_may_reorder(historybuf_cpu_cells(hb, l), hb->xnum, self->text_cache);
+}
+
+static void
+bidi_recompute_may_reorder(Screen *self, LineBuf *lb) {
+    for (index_type y = 0; y < lb->ynum; y++) bidi_line_may_reorder_from_cells(self, lb, y);
+    if (lb == self->main_linebuf) screen_bidi_recompute_history_may_reorder(self);
+}
+
+static void
+bidi_buffer_gets_stamp(Screen *self, LineBuf *lb) {
+    bidi_layout_moved(self);
+    lb->bidi_maybe_unstamp = true;
+    bidi_recompute_may_reorder(self, lb);
+    lb->bidi_stamped = true;
+    screen_bidi_records_writes_changed(self);
+}
+
+static inline void
+bidi_buffer_stamped(Screen *self, LineBuf *lb) {
+    if (LIKELY(lb->bidi_stamped)) return;
+    bidi_buffer_gets_stamp(self, lb);
+}
+
+// A rewrap can pull rows holding a record, or a bit gone stale while the history kept them, from the history into a buffer
+static void
+bidi_buffer_rewrapped(Screen *self, LineBuf *lb) {
+    if (lb->bidi_stamped) {
+        bidi_recompute_may_reorder(self, lb);
+        return;
+    }
+    bool stamped = lb == self->main_linebuf && bidi_main_continues_recorded_history(self);
+    for (index_type y = 0; y < lb->ynum && !stamped; y++) stamped = line_has_bidi_bits(lb->line_attrs[y]);
+    if (stamped) bidi_buffer_stamped(self, lb);
+}
 
 static bool history_reuse_disabled_for_tests = false;
 
@@ -382,6 +465,11 @@ rewrap(
     screen->historybuf = mr.hb;
     screen->alt_linebuf = ar.lb;
     screen->linebuf = main_is_active ? screen->main_linebuf : screen->alt_linebuf;
+    screen_bidi_records_writes_changed(screen);
+    bidi_buffer_rewrapped(screen, screen->main_linebuf);
+    bidi_buffer_rewrapped(screen, screen->alt_linebuf);
+    bidi_note_maybe_unstamp(screen->main_linebuf);
+    bidi_note_maybe_unstamp(screen->alt_linebuf);
     if (main_is_active) {
         *nclb = mr.num_content_lines_before;
         *ncla = mr.num_content_lines_after;
@@ -416,49 +504,52 @@ selection_intersects_screen_lines(const Selections *selections, int a, int b) {
 
 
 static void
-index_selection(const Screen *self, Selections *selections, bool up, index_type top, index_type bottom) {
-    const bool needs_special_handling = self->linebuf == self->alt_linebuf && (top > 0 || bottom < self->lines - 1);
+move_selection_by_one_row(const Screen *self, Selection *s, bool up) {
+    // Move the selection with its text when the lines it is on move up or down by one row
+    if (up) {
+        if (s->start.y == 0) s->start_scrolled_by += 1;
+        else {
+            s->start.y--;
+            if (s->input_start.y) s->input_start.y--;
+            if (s->input_current.y) s->input_current.y--;
+            if (s->initial_extent.start.y) s->initial_extent.start.y--;
+            if (s->initial_extent.end.y) s->initial_extent.end.y--;
+        }
+        if (s->end.y == 0) s->end_scrolled_by += 1;
+        else s->end.y--;
+    } else {
+        if (s->start.y >= self->lines - 1) s->start_scrolled_by -= 1;
+        else {
+            s->start.y++;
+            if (s->input_start.y < self->lines - 1) s->input_start.y++;
+            if (s->input_current.y < self->lines - 1) s->input_current.y++;
+        }
+        if (s->end.y >= self->lines - 1) s->end_scrolled_by -= 1;
+        else s->end.y++;
+    }
+}
+
+static void
+index_selection(const Screen *self, Selections *selections, bool up, index_type top, index_type bottom, bool via_history) {
+    // Keep selections on the same text when the lines in [top, bottom] are
+    // scrolled by one. via_history means the line scrolled off the top goes
+    // into the scrollback (up) or the line scrolled in at the top comes from
+    // it (down), so the scrollback rows move as well. Selections on the rows
+    // that stay in place, including those in the scrollback when it does not
+    // move, are left alone and selections that span moving and stationary rows
+    // or are on the line that is discarded are cleared.
+    const int first_moving = via_history ? INT_MIN : (int)top, last_moving = bottom;
     for (size_t i = 0; i < selections->count; i++) {
         Selection *s = selections->items + i;
-        if (needs_special_handling) {
-            if (is_selection_empty(s)) continue;
-            int start = (int)s->start.y - s->start_scrolled_by;
-            int end = (int)s->end.y - s->end_scrolled_by;
-            int stop = MIN(start, end);
-            int sbottom = MAX(start, end);
-            if (stop < (int)top) {
-                if (sbottom < (int)top) continue;
-                clear_selection(selections);
-                return;
-            } else {
-                if (stop > (int)bottom) continue;
-                if (sbottom > (int)bottom) {
-                    clear_selection(selections);
-                    return;
-                }
-            }
+        const int start = (int)s->start.y - (int)s->start_scrolled_by, end = (int)s->end.y - (int)s->end_scrolled_by;
+        const int stop = MIN(start, end), sbottom = MAX(start, end);
+        if (sbottom < first_moving || stop > last_moving) continue;
+        const bool discarded = up ? (!via_history && stop == (int)top) : sbottom == last_moving;
+        if (stop < first_moving || sbottom > last_moving || discarded) {
+            clear_selection(selections);
+            return;
         }
-        if (up) {
-            if (s->start.y == 0) s->start_scrolled_by += 1;
-            else {
-                s->start.y--;
-                if (s->input_start.y) s->input_start.y--;
-                if (s->input_current.y) s->input_current.y--;
-                if (s->initial_extent.start.y) s->initial_extent.start.y--;
-                if (s->initial_extent.end.y) s->initial_extent.end.y--;
-            }
-            if (s->end.y == 0) s->end_scrolled_by += 1;
-            else s->end.y--;
-        } else {
-            if (s->start.y >= self->lines - 1) s->start_scrolled_by -= 1;
-            else {
-                s->start.y++;
-                if (s->input_start.y < self->lines - 1) s->input_start.y++;
-                if (s->input_current.y < self->lines - 1) s->input_current.y++;
-            }
-            if (s->end.y >= self->lines - 1) s->end_scrolled_by -= 1;
-            else s->end.y++;
-        }
+        move_selection_by_one_row(self, s, up);
     }
 }
 
@@ -532,22 +623,108 @@ last_visited_prompt_viewport(const Screen *self, index_type *y, unsigned int *sc
     }
 
 
-#define INDEX_DOWN(scroll_history)                                                                      \
-    linebuf_reverse_index(self->linebuf, top, bottom);                                                  \
-    linebuf_clear_line(self->linebuf, top, true);                                                       \
-    last_visited_prompt_index(self, top, bottom, false, scroll_history);                                \
-    INDEX_GRAPHICS(1, scroll_history)                                                                   \
-    self->is_dirty = true;                                                                              \
-    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, false, top, bottom); \
+// Rows moved without being dirtied change the paragraphs on both sides of where they now meet, and the upload trusts the
+// stored levels of clean rows
+static void
+bidi_mark_seam(Screen *self, index_type y) {
+    LineBuf *lb = self->linebuf;
+    if (LIKELY(!lb->bidi_stamped)) return;
+    if (y && y <= lb->ynum) linebuf_mark_line_dirty(lb, y - 1);
+    if (y < lb->ynum) linebuf_mark_line_dirty(lb, y);
+}
+
+// The columns a row keeps and the edges of its spans depend on the regions covering its screen row, so the stored levels of a
+// row that moves between screen rows are only valid while no region is horizontal or narrower than the screen. Otherwise every
+// row in [top, bottom] is marked to be laid out again.
+static void
+bidi_mark_rows_moved_near_regions(Screen *self, index_type top, index_type bottom) {
+    if (LIKELY(!self->smooth_scroll.count)) return;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (r->horizontal || r->left || r->right != self->columns) {
+            LineBuf *lb = self->linebuf;
+            for (index_type y = top; y <= bottom && y < lb->ynum; y++) linebuf_mark_line_dirty(lb, y);
+            return;
+        }
+    }
+}
+
+// Before the rows [top, bottom] scroll up by one. An edit to a row going into the history is no longer seen, as the upload
+// does not check rows above the view, so the row below it is marked instead. Only a stamped buffer has rows holding a record,
+// so the history learns here that it gets one.
+static inline void
+bidi_index_up_seams(Screen *self, index_type top, index_type bottom, bool to_history) {
+    LineBuf *lb = self->linebuf;
+    if (LIKELY(!lb->bidi_stamped)) return;
+    lb->bidi_maybe_unstamp = true;
+    bidi_layout_moved(self);
+    bidi_mark_rows_moved_near_regions(self, top, bottom);
+    if (to_history) {
+        // A record left on a line erased of its text is not pushed, so that it does not keep the history stamped
+        LineAttrs *a = lb->line_attrs + top;
+        if (a->bidi_stamp != BIDI_STAMP_NONE) {
+            linebuf_init_line(lb, top);
+            line_has_bidi_record(a, lb->line);
+        }
+        historybuf_note_bidi(self->historybuf, *a);
+    }
+    if (!to_history && top) linebuf_mark_line_dirty(lb, top - 1);
+    if (top < bottom && (!to_history || lb->line_attrs[top].has_dirty_text)) linebuf_mark_line_dirty(lb, top + 1);
+    linebuf_mark_line_dirty(lb, bottom);
+    if (bottom + 1 < lb->ynum) linebuf_mark_line_dirty(lb, bottom + 1);
+}
+
+// A line back from the history in main buffer row y can hold a record, or continue a history line that holds one, while the main
+// buffer holds none. Its bit is stale if it was written to the buffer without a stamp, and so are those of the history lines it
+// continues, which the next upload recomputes once for any number of pops.
+static void
+bidi_note_line_from_history(Screen *self, index_type y) {
+    LineBuf *lb = self->main_linebuf;
+    if (lb->bidi_stamped) {
+        bidi_line_may_reorder_from_cells(self, lb, y);
+        if (history_buf_endswith_wrap(self->historybuf)) self->bidi_history_bits_stale = true;
+    } else if (line_has_bidi_bits(lb->line_attrs[y]) || bidi_main_continues_recorded_history(self)) bidi_buffer_gets_stamp(self, lb);
+}
+
+static void
+bidi_index_down_seams(Screen *self, index_type top, index_type bottom) {
+    if (LIKELY(!self->linebuf->bidi_stamped)) return;
+    self->linebuf->bidi_maybe_unstamp = true;
+    bidi_layout_moved(self);
+    bidi_mark_rows_moved_near_regions(self, top, bottom);
+    bidi_mark_seam(self, top);
+    bidi_mark_seam(self, top + 1);
+    bidi_mark_seam(self, bottom + 1);
+}
+
+static void
+clear_scrolled_in_line(Screen *self, index_type y) {
+    // Marks are render data that is used without rendering, so the render
+    // data can be left to be recomputed by rendering only without a marker
+    if (LIKELY(self->marker == NULL)) linebuf_clear_line_text(self->linebuf, y);
+    else linebuf_clear_line(self->linebuf, y, true);
+}
+
+static void ssr_lines_moved(Screen *self, index_type top, index_type bottom, bool up, bool via_history);
+
+#define INDEX_DOWN(scroll_history)                                                                                      \
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_lines_moved(self, top, bottom, false, scroll_history);                 \
+    linebuf_reverse_index(self->linebuf, top, bottom);                                                                  \
+    clear_scrolled_in_line(self, top);                                                                                  \
+    bidi_index_down_seams(self, top, bottom);                                                                           \
+    last_visited_prompt_index(self, top, bottom, false, scroll_history);                                                \
+    INDEX_GRAPHICS(1, scroll_history)                                                                                   \
+    self->is_dirty = true;                                                                                              \
+    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, false, top, bottom, scroll_history); \
     if (UNLIKELY(self->url_ranges.count || self->url_ranges.in_progress)) clear_selection(&self->url_ranges);
 
 
 static void
-nuke_in_line(CPUCell *cp, GPUCell *gp, index_type start, index_type x_limit, char_type ch) {
+nuke_in_line(CPUCell *cp, index_type start, index_type x_limit, char_type ch) {
+    // The line must be marked dirty after this
     for (index_type x = start; x < x_limit; x++) {
         cell_set_char(cp + x, ch);
         cell_clear_multicell(cp + x);
-        clear_sprite_position(gp[x]);
     }
 }
 
@@ -584,18 +761,23 @@ mark_range_line_dirty(Screen *self, int y) {
     else historybuf_mark_line_dirty(self->historybuf, -(y + 1));
 }
 
+static void ssr_nuke_overflow_parts(Screen *self, index_type x_start, index_type x_limit, MulticellRows rows, char_type ch);
+static inline void reset_pixel_scroll(Screen *self, unsigned val);
+
 static void
 nuke_multicell_char_at(Screen *self, index_type x_, index_type y_, bool replace_with_spaces) {
     const MulticellRows rows = multicell_char_rows(self, x_, y_);
-    const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, y_);
-    while (cp[x_].x && x_ > 0) x_--;
-    const index_type x_limit = MIN(self->columns, x_ + mcd_x_limit(&cp[x_]));
+    const MulticellColumns cols = multicell_char_columns(linebuf_cpu_cells_for_line(self->linebuf, y_), self->columns, x_);
+    x_ = cols.start;
+    const index_type x_limit = cols.limit;
     const char_type ch = replace_with_spaces ? ' ' : 0;
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_nuke_overflow_parts(self, x_, x_limit, rows, ch);
     for (int y = rows.start; y < rows.limit; y++) {
         Line *line = range_line_(self, y);
-        nuke_in_line(line->cpu_cells, line->gpu_cells, x_, x_limit, ch);
+        nuke_in_line(line->cpu_cells, x_, x_limit, ch);
         mark_range_line_dirty(self, y);
     }
+    bidi_note_maybe_unstamp(self->linebuf);
     self->is_dirty = true;
 }
 
@@ -603,8 +785,7 @@ static void
 nuke_multiline_char_intersecting_with(Screen *self, index_type x_start, index_type x_limit, index_type y_start, index_type y_limit, bool replace_with_spaces) {
     for (index_type y = y_start; y < y_limit; y++) {
         CPUCell *cp;
-        GPUCell *gp;
-        linebuf_init_cells(self->linebuf, y, &cp, &gp);
+        linebuf_init_cells(self->linebuf, y, &cp, NULL);
         for (index_type x = x_start; x < x_limit; x++) {
             if (cp[x].is_multicell && cp[x].scale > 1) nuke_multicell_char_at(self, x, y, replace_with_spaces);
         }
@@ -674,17 +855,1308 @@ nuke_multiline_chars_torn_by_scroll(Screen *self, index_type top, index_type bot
 #undef has_multiline
 }
 
+static bool
+has_multicell_in_range(const CPUCell *cells, index_type x_start, index_type x_limit) {
+    // Lines rarely contain multicell chars, so check for them before looking for them
+    // cell by cell. This reads only the 32 bit word of each cell that contains the
+    // is_multicell flag, via memcpy() to avoid aliasing issues, into independent
+    // accumulators so that there is no dependency between consecutive cells.
+    static_assert(sizeof(CPUCell) == 3 * sizeof(uint32_t), "has_multicell_in_range() needs updating");
+    const CPUCell probe = {.is_multicell = true};
+    uint32_t mask[3];
+    memcpy(mask, &probe, sizeof(mask));
+    const unsigned word = mask[0] ? 0 : (mask[1] ? 1 : 2);
+    const uint8_t *p = (const uint8_t *)(cells + x_start) + word * sizeof(uint32_t);
+    const uint8_t *limit = (const uint8_t *)(cells + x_limit) + word * sizeof(uint32_t);
+    uint32_t a = 0, b = 0, c = 0, d = 0, v;
+#define W(acc, i)                                     \
+    memcpy(&v, p + (i) * sizeof(CPUCell), sizeof(v)); \
+    acc |= v;
+    for (; p + 4 * sizeof(CPUCell) <= limit; p += 4 * sizeof(CPUCell)) {
+        W(a, 0);
+        W(b, 1);
+        W(c, 2);
+        W(d, 3);
+    }
+    for (; p < limit; p += sizeof(CPUCell)) { W(a, 0); }
+#undef W
+    return ((a | b | c | d) & mask[word]) != 0;
+}
+
 static void
 nuke_multicell_char_intersecting_with(Screen *self, index_type x_start, index_type x_limit, index_type y_start, index_type y_limit, bool replace_with_spaces) {
     for (index_type y = y_start; y < y_limit; y++) {
         CPUCell *cp;
-        GPUCell *gp;
-        linebuf_init_cells(self->linebuf, y, &cp, &gp);
+        linebuf_init_cells(self->linebuf, y, &cp, NULL);
+        if (!has_multicell_in_range(cp, x_start, x_limit)) continue;
         for (index_type x = x_start; x < x_limit; x++) {
             if (cp[x].is_multicell) nuke_multicell_char_at(self, x, y, replace_with_spaces);
         }
     }
 }
+
+// Smooth scroll regions {{{
+// An application designates up to MAX_SMOOTH_SCROLL_REGIONS rectangles of the
+// screen for smooth scrolling and then scrolls them by amounts in pixels,
+// vertically or horizontally. The terminal moves the cells in a rectangle by
+// whole rows (columns) and the rectangle is rendered shifted by the remaining
+// fraction of a row (column), see SmoothScrollRegion. The row (column) that
+// enters the rectangle in the direction of the scroll is always in the
+// rectangle, so that the application can draw it before it becomes visible.
+// The partially visible row (column) at the other edge comes from the overflow
+// buffers. Rows (columns) that move out of the rectangle are pushed onto the
+// overflow buffer on that side and rows (columns) that move into it are
+// popped from the overflow buffer on their side, or are blank for the
+// application to draw, if it is empty. When a vertically scrolled rectangle
+// spans the full width of the main screen and starts at its top, the
+// scrollback is the overflow buffer above it, just as when scrolling with SU,
+// unless the application opts out. Below, before means above or to the left
+// of a rectangle and after means below it or to its right.
+
+static bool
+ssr_is_full_width(const Screen *self, const SmoothScrollRegion *r) {
+    return r->left == 0 && r->right == self->columns;
+}
+
+static bool
+ssr_uses_history(const Screen *self, const SmoothScrollRegion *r) {
+    return !r->horizontal && !r->private_overflow && r->top == 0 && ssr_is_full_width(self, r) && self->linebuf == self->main_linebuf &&
+           self->historybuf->ynum > 0;
+}
+
+static index_type
+ssr_width(const SmoothScrollRegion *r) {
+    return r->right - r->left;
+}
+
+static index_type
+ssr_height(const SmoothScrollRegion *r) {
+    return r->bottom - r->top;
+}
+
+static index_type
+ssr_slot(const SmoothScrollRegion *r, bool before, index_type i) {
+    // The row of the overflow buffer of a vertically scrolled region holding
+    // the i-th nearest row above or below the rectangle
+    return before ? i : r->capacity + i;
+}
+
+static void
+ssr_overflow_row_cells(SmoothScrollRegion *r, bool before, index_type i, CPUCell **c, RenderCell **rc) {
+    // The cells of the overflow buffer of a horizontally scrolled region for
+    // row i of the rectangle, to the left of it, with the nearest last, or to
+    // its right, with the nearest first
+    linebuf_init_cells(r->overflow, before ? i : ssr_height(r) + i, c, rc);
+}
+
+static index_type
+ssr_nearest_column(const SmoothScrollRegion *r, bool before) {
+    // The cell of an overflow row of a horizontally scrolled region with the column nearest to the rectangle
+    return before ? r->capacity - 1 : 0;
+}
+
+static SmoothScrollRegion *
+ssr_for_id(Screen *self, uint32_t id) {
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++)
+        if (self->smooth_scroll.regions[i].id == id) return self->smooth_scroll.regions + i;
+    return NULL;
+}
+
+static bool
+ssr_rows_intersect(const SmoothScrollRegion *r, index_type top, index_type bottom) {
+    // Whether the rows [top, bottom] intersect the rectangle
+    return r->top <= bottom && top < r->bottom;
+}
+
+static CPUCell *
+ssr_overflow_cells(SmoothScrollRegion *r, index_type slot) {
+    return linebuf_cpu_cells_for_line(r->overflow, slot);
+}
+
+static void
+ssr_mark_row_dirty(Screen *self, index_type y) {
+    linebuf_mark_line_dirty(self->linebuf, y);
+    self->is_dirty = true;
+}
+
+// Vertical scrolling {{{
+static inline void
+ssr_copy_row_to_slot(Screen *self, SmoothScrollRegion *r, index_type y, index_type slot) {
+    CPUCell *sc, *dc;
+    RenderCell *sr, *dr;
+    linebuf_init_cells(self->linebuf, y, &sc, &sr);
+    linebuf_init_cells(r->overflow, slot, &dc, &dr);
+    const index_type w = ssr_width(r);
+    memcpy(dc, sc + r->left, w * sizeof(dc[0]));
+    memcpy(dr, sr + r->left, w * sizeof(dr[0]));
+    const LineAttrs src = self->linebuf->line_attrs[y];
+    LineAttrs *dest = r->overflow->line_attrs + slot;
+    if (ssr_is_full_width(self, r)) *dest = src;
+    else {
+        dest->val = 0;
+        dest->has_image_placeholders = src.has_image_placeholders;
+    }
+    dest->has_dirty_text = true;
+    if (LIKELY(!self->linebuf->bidi_stamped)) return;
+    // The strip draws the kept row at the levels in its render cells, which a row of a paragraph changed since it was rendered
+    // has for other text, and no walk reaches it. Its paragraph is read where it is, before the rows move.
+    bidi_store_kept_row_levels(self, y, r->left, w, dr);
+    // The kept row carries the line's settings, as that layout left them, and the frames keep their bidi maps while it is drawn
+    const LineAttrs laid_out = self->linebuf->line_attrs[y];
+    line_attrs_set_bidi(dest, laid_out);
+    if (line_has_bidi_bits(laid_out)) r->overflow->bidi_stamped = true;
+}
+
+// A row of a region narrower than the screen that holds no text outside it takes the settings of the text moved onto it: the
+// record of the row it came from, none when that has none. Blank cells moved in drop its record and keep the direction a leading
+// mark set for the row's first text. A row with text outside keeps its own, so that the text the scroll did not move is laid out
+// as before.
+static void
+ssr_carry_bidi_record(Screen *self, const SmoothScrollRegion *r, index_type y, const CPUCell *moved, LineAttrs src) {
+    self->linebuf->line_attrs[y].bidi_may_reorder |= src.bidi_may_reorder;
+    self->linebuf->bidi_maybe_unstamp = true;
+    const CPUCell *c = linebuf_cpu_cells_for_line(self->linebuf, y);
+    for (index_type x = 0; x < r->left; x++)
+        if (c[x].ch_and_idx) return;
+    for (index_type x = r->right; x < self->columns; x++)
+        if (c[x].ch_and_idx) return;
+    bool has_text = false;
+    for (index_type x = 0; moved && x < ssr_width(r) && !has_text; x++) has_text = moved[x].ch_and_idx != 0;
+    LineAttrs *a = self->linebuf->line_attrs + y;
+    if (has_text && src.bidi_stamp != BIDI_STAMP_NONE) {
+        line_attrs_set_bidi(a, src);
+        bidi_buffer_stamped(self, self->linebuf);
+    } else if (has_text || a->bidi_stamp != BIDI_STAMP_NONE) line_attrs_set_bidi(a, (LineAttrs){0});
+}
+
+static inline void
+ssr_copy_slot_to_row(Screen *self, SmoothScrollRegion *r, index_type slot, index_type y) {
+    CPUCell *sc, *dc;
+    RenderCell *sr, *dr;
+    linebuf_init_cells(r->overflow, slot, &sc, &sr);
+    linebuf_init_cells(self->linebuf, y, &dc, &dr);
+    const index_type w = ssr_width(r);
+    memcpy(dc + r->left, sc, w * sizeof(dc[0]));
+    memcpy(dr + r->left, sr, w * sizeof(dr[0]));
+    const LineAttrs src = r->overflow->line_attrs[slot];
+    LineAttrs *dest = self->linebuf->line_attrs + y;
+    if (ssr_is_full_width(self, r)) *dest = src;
+    else {
+        dest->has_image_placeholders |= src.has_image_placeholders;
+        if (UNLIKELY(self->linebuf->bidi_stamped || line_has_bidi_bits(src))) ssr_carry_bidi_record(self, r, y, sc, src);
+    }
+    // The slot's bit is stale when the row was kept while the buffer held no stamp
+    if (UNLIKELY(self->linebuf->bidi_stamped) && !dest->bidi_may_reorder) dest->bidi_may_reorder = bidi_cells_may_reorder(sc, w, self->text_cache);
+    ssr_mark_row_dirty(self, y);
+}
+
+static inline void
+ssr_copy_row_to_row(Screen *self, SmoothScrollRegion *r, index_type src_y, index_type dest_y) {
+    // Only used for rectangles narrower than the screen, full width rows are
+    // moved by rotating the line map. The row is rendered again, as the
+    // shaping of its cells can depend on the cells outside the rectangle.
+    CPUCell *sc, *dc;
+    RenderCell *sr, *dr;
+    linebuf_init_cells(self->linebuf, src_y, &sc, &sr);
+    linebuf_init_cells(self->linebuf, dest_y, &dc, &dr);
+    const index_type w = ssr_width(r);
+    memcpy(dc + r->left, sc + r->left, w * sizeof(dc[0]));
+    memcpy(dr + r->left, sr + r->left, w * sizeof(dr[0]));
+    self->linebuf->line_attrs[dest_y].has_image_placeholders |= self->linebuf->line_attrs[src_y].has_image_placeholders;
+    if (UNLIKELY(self->linebuf->bidi_stamped)) ssr_carry_bidi_record(self, r, dest_y, sc + r->left, self->linebuf->line_attrs[src_y]);
+    ssr_mark_row_dirty(self, dest_y);
+}
+
+static inline void
+ssr_blank_row(Screen *self, SmoothScrollRegion *r, index_type y) {
+    if (ssr_is_full_width(self, r)) clear_scrolled_in_line(self, y);
+    else {
+#if BLANK_CHAR != 0
+#error This implementation is incorrect for BLANK_CHAR != 0
+#endif
+        CPUCell *c;
+        RenderCell *rc;
+        linebuf_init_cells(self->linebuf, y, &c, &rc);
+        zero_at_ptr_count(c + r->left, ssr_width(r));
+        zero_at_ptr_count(rc + r->left, ssr_width(r));
+        if (UNLIKELY(self->linebuf->bidi_stamped)) ssr_carry_bidi_record(self, r, y, NULL, (LineAttrs){0});
+    }
+    ssr_mark_row_dirty(self, y);
+}
+
+static index_type
+ssr_push_slot(SmoothScrollRegion *r, bool before) {
+    // Make room for a new nearest row in an overflow buffer, discarding its
+    // farthest row if it is full, and return the slot for the new row
+    const index_type base = ssr_slot(r, before, 0);
+    linebuf_reverse_index(r->overflow, base, base + r->capacity - 1);
+    index_type *n = before ? &r->num_before : &r->num_after;
+    if (*n < r->capacity) (*n)++;
+    return base;
+}
+
+static void
+ssr_pop_slot(SmoothScrollRegion *r, bool before) {
+    // Remove the nearest row of an overflow buffer, after it has been copied out
+    const index_type base = ssr_slot(r, before, 0);
+    // Cleared so that it does not keep text cache entries and styles alive
+    linebuf_clear_line(r->overflow, base, true);
+    linebuf_index(r->overflow, base, base + r->capacity - 1);
+    index_type *n = before ? &r->num_before : &r->num_after;
+    if (*n) (*n)--;
+    if (!r->num_before && !r->num_after) r->overflow->bidi_stamped = false;
+}
+// }}}
+
+static void
+ssr_clear_overflow(SmoothScrollRegion *r, bool before) {
+    index_type *n = before ? &r->num_before : &r->num_after;
+    if (r->horizontal) {
+#if BLANK_CHAR != 0
+#error This implementation is incorrect for BLANK_CHAR != 0
+#endif
+        const index_type start = before ? r->capacity - *n : 0;
+        for (index_type i = 0; i < ssr_height(r) && *n; i++) {
+            CPUCell *c;
+            RenderCell *rc;
+            ssr_overflow_row_cells(r, before, i, &c, &rc);
+            zero_at_ptr_count(c + start, *n);
+            zero_at_ptr_count(rc + start, *n);
+        }
+    } else
+        for (index_type i = 0; i < *n; i++) linebuf_clear_line(r->overflow, ssr_slot(r, before, i), true);
+    *n = 0;
+    if (!r->num_before && !r->num_after) r->overflow->bidi_stamped = false;
+}
+
+// Multicell chars {{{
+static void
+ssr_nuke_overflow_parts(Screen *self, index_type x_start, index_type x_limit, MulticellRows rows, char_type ch) {
+    // Remove the parts of a multicell char, whose cells on screen are in the
+    // columns [x_start, x_limit) of rows, that are in the overflow buffers of
+    // a smooth scroll region. Must be called before the cells of the char on
+    // screen are removed.
+    if (rows.start < 0) return; // the char extends into the scrollback, which is never the overflow buffer of a region it is in
+    // The cells are in a screen buffer temporarily made current, which the regions are not on
+    if (self->linebuf != self->smooth_scroll.linebuf) return;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (x_start < r->left || x_limit > r->right) continue;
+        if (r->horizontal) {
+            const index_type y_start = MAX((index_type)rows.start, r->top), y_limit = MIN((index_type)rows.limit, r->bottom);
+            for (index_type y = y_start; y < y_limit; y++) {
+                const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, y);
+                CPUCell *oc;
+                RenderCell *orc;
+                if (x_start == r->left && r->num_before && cp[x_start].is_multicell) {
+                    const CPUCell edge = cp[x_start];
+                    ssr_overflow_row_cells(r, true, y - r->top, &oc, &orc);
+                    for (index_type n = 0, cx = edge.x; n < r->num_before && cx > 0; n++, cx--) {
+                        const index_type col = r->capacity - 1 - n;
+                        if (!continues_multicell_char_horizontally(oc + col, &edge, cx - 1)) break;
+                        nuke_in_line(oc, col, col + 1, ch);
+                    }
+                    linebuf_mark_line_dirty(r->overflow, y - r->top);
+                }
+                if (x_limit == r->right && r->num_after && cp[x_limit - 1].is_multicell) {
+                    const CPUCell edge = cp[x_limit - 1];
+                    ssr_overflow_row_cells(r, false, y - r->top, &oc, &orc);
+                    for (index_type n = 0, cx = edge.x + 1u; n < r->num_after && cx < mcd_x_limit(&edge); n++, cx++) {
+                        if (!continues_multicell_char_horizontally(oc + n, &edge, cx)) break;
+                        nuke_in_line(oc, n, n + 1, ch);
+                    }
+                    linebuf_mark_line_dirty(r->overflow, ssr_height(r) + y - r->top);
+                }
+            }
+            continue;
+        }
+        const index_type cx = x_start - r->left, cx_limit = x_limit - r->left;
+        if ((index_type)rows.start == r->top && r->num_before) {
+            const CPUCell edge = linebuf_cpu_cells_for_line(self->linebuf, r->top)[x_start];
+            for (index_type n = 0, ry = edge.y; n < r->num_before && ry > 0; n++, ry--) {
+                const index_type slot = ssr_slot(r, true, n);
+                CPUCell *cells = ssr_overflow_cells(r, slot);
+                if (!continues_multicell_char(cells + cx, &edge, ry - 1)) break;
+                nuke_in_line(cells, cx, cx_limit, ch);
+                linebuf_mark_line_dirty(r->overflow, slot);
+            }
+        }
+        if ((index_type)rows.limit == r->bottom && r->num_after) {
+            const CPUCell edge = linebuf_cpu_cells_for_line(self->linebuf, r->bottom - 1)[x_start];
+            for (index_type n = 0, ry = edge.y + 1u; n < r->num_after && ry < edge.scale; n++, ry++) {
+                const index_type slot = ssr_slot(r, false, n);
+                CPUCell *cells = ssr_overflow_cells(r, slot);
+                if (!continues_multicell_char(cells + cx, &edge, ry)) break;
+                nuke_in_line(cells, cx, cx_limit, ch);
+                linebuf_mark_line_dirty(r->overflow, slot);
+            }
+        }
+    }
+}
+
+static bool
+ssr_char_continues_into_overflow_below(Screen *self, const CPUCell *ref, index_type x, MulticellRows rows) {
+    // Whether the multicell char, whose top row is the first of rows on screen
+    // and whose cell in column x of it is ref, continues into the overflow
+    // buffer below a vertically scrolled smooth scroll region
+    if (!self->smooth_scroll.count || self->linebuf != self->smooth_scroll.linebuf || rows.start < 0) return false;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (r->horizontal || !r->num_after || rows.limit != (int)r->bottom || x < r->left || x >= r->right) continue;
+        const CPUCell *nearest = ssr_overflow_cells(r, ssr_slot(r, false, 0));
+        if (continues_multicell_char(nearest + x - r->left, ref, ref->y + (index_type)(rows.limit - rows.start))) return true;
+    }
+    return false;
+}
+
+static void
+ssr_nuke_straddling_chars(Screen *self, SmoothScrollRegion *r) {
+    // Remove multicell chars that cross the edges of the rectangle into cells
+    // outside it, as moving the cells of the rectangle would tear them. Chars
+    // that continue into the overflow buffers or, at the top of the main
+    // screen, into the scrollback when it is the overflow buffer, are kept.
+    for (index_type y = r->top; y < r->bottom; y++) {
+        const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, y);
+        if (r->left > 0 && cp[r->left].is_multicell && cp[r->left].x > 0 &&
+            continues_multicell_char_horizontally(cp + r->left - 1, cp + r->left, cp[r->left].x - 1))
+            nuke_multicell_char_at(self, r->left, y, false);
+        cp = linebuf_cpu_cells_for_line(self->linebuf, y);
+        const CPUCell *c = cp + r->right - 1;
+        if (r->right < self->columns && c->is_multicell && c->x + 1u < mcd_x_limit(c) && continues_multicell_char_horizontally(c + 1, c, c->x + 1))
+            nuke_multicell_char_at(self, r->right - 1, y, false);
+    }
+    if (!self->multiline_chars_used) return;
+    // The row above the rectangle is on screen or, at the top of the main screen, in the scrollback
+    const int above = (int)r->top - 1;
+    const bool has_row_above = !ssr_uses_history(self, r) && (above >= 0 || (self->linebuf == self->main_linebuf && -above <= (int)self->historybuf->count));
+    if (has_row_above) {
+        for (index_type x = r->left; x < r->right; x++) {
+            const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, r->top)[x];
+            if (c.is_multicell && c.y > 0 && continues_multicell_char(range_line_(self, above)->cpu_cells + x, &c, c.y - 1))
+                nuke_multicell_char_at(self, x, r->top, false);
+        }
+    }
+    if (r->bottom < self->lines) {
+        for (index_type x = r->left; x < r->right; x++) {
+            const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, r->bottom - 1)[x];
+            if (c.is_multicell && c.y + 1u < c.scale && continues_multicell_char(linebuf_cpu_cells_for_line(self->linebuf, r->bottom) + x, &c, c.y + 1))
+                nuke_multicell_char_at(self, x, r->bottom - 1, false);
+        }
+    }
+}
+
+static void
+ssr_nuke_chars_next_to_blank_row(Screen *self, SmoothScrollRegion *r, index_type y, bool blank_row_is_below) {
+    // A blank row has come in next to row y of the rectangle, tearing the multiline chars that extend into it
+    if (!self->multiline_chars_used || y < r->top || y >= r->bottom) return;
+    for (index_type x = r->left; x < r->right; x++) {
+        const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
+        if (c.is_multicell && (blank_row_is_below ? c.y + 1u < c.scale : c.y > 0)) nuke_multicell_char_at(self, x, y, false);
+    }
+}
+
+static void
+ssr_nuke_chars_next_to_blank_column(Screen *self, SmoothScrollRegion *r, index_type x, bool blank_column_is_right) {
+    // A blank column has come in next to column x of the rectangle, tearing the multicell chars that extend into it
+    if (x < r->left || x >= r->right) return;
+    for (index_type y = r->top; y < r->bottom; y++) {
+        const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
+        if (c.is_multicell && (blank_column_is_right ? c.x + 1u < mcd_x_limit(&c) : c.x > 0)) nuke_multicell_char_at(self, x, y, false);
+    }
+}
+
+static void
+ssr_nuke_chars_continuing_into_overflow(Screen *self, SmoothScrollRegion *r, bool before) {
+    // The overflow buffer is about to be discarded, tearing the multicell chars at the edge of the rectangle that continue into it
+    if (!(before ? r->num_before : r->num_after)) return;
+    if (r->horizontal) {
+        const index_type x = before ? r->left : r->right - 1, col = ssr_nearest_column(r, before);
+        for (index_type y = r->top; y < r->bottom; y++) {
+            const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
+            if (!c.is_multicell) continue;
+            CPUCell *oc;
+            RenderCell *orc;
+            ssr_overflow_row_cells(r, before, y - r->top, &oc, &orc);
+            if (before ? (c.x > 0 && continues_multicell_char_horizontally(oc + col, &c, c.x - 1))
+                       : (c.x + 1u < mcd_x_limit(&c) && continues_multicell_char_horizontally(oc + col, &c, c.x + 1)))
+                nuke_multicell_char_at(self, x, y, false);
+        }
+        return;
+    }
+    if (!self->multiline_chars_used) return;
+    const index_type y = before ? r->top : r->bottom - 1;
+    const CPUCell *nearest = ssr_overflow_cells(r, ssr_slot(r, before, 0));
+    for (index_type x = r->left; x < r->right; x++) {
+        const CPUCell c = linebuf_cpu_cells_for_line(self->linebuf, y)[x];
+        if (!c.is_multicell) continue;
+        if (before ? (c.y > 0 && continues_multicell_char(nearest + x - r->left, &c, c.y - 1))
+                   : (c.y + 1u < c.scale && continues_multicell_char(nearest + x - r->left, &c, c.y + 1)))
+            nuke_multicell_char_at(self, x, y, false);
+    }
+}
+// }}}
+
+static void
+move_selection_by_one_column(Selection *s, bool left) {
+    // Move the selection with its text when its cells move left or right by one column
+#define M(x)        \
+    if (left) {     \
+        if (x) x--; \
+    } else x++;
+    M(s->start.x);
+    M(s->end.x);
+    M(s->input_start.x);
+    M(s->input_current.x);
+    M(s->initial_extent.start.x);
+    M(s->initial_extent.end.x);
+#undef M
+}
+
+static void
+ssr_move_selections(Screen *self, Selections *selections, const SmoothScrollRegion *r, bool forward, bool via_history) {
+    // Selections inside the rectangle move with its cells, selections that
+    // cross its edges or move out of it into an overflow buffer are cleared.
+    // When the scrollback moves with the rows of the rectangle, via_history,
+    // it is treated as part of the rectangle, as for scrolling with SU.
+    const int top = via_history ? INT_MIN : (int)r->top;
+    for (size_t i = 0; i < selections->count; i++) {
+        Selection *s = selections->items + i;
+        if (is_selection_empty(s)) continue;
+        const int start = (int)s->start.y - (int)s->start_scrolled_by, end = (int)s->end.y - (int)s->end_scrolled_by;
+        const int stop = MIN(start, end), sbottom = MAX(start, end);
+        index_type xmin = 0, xmax = self->columns - 1;
+        if (start == end || s->rectangle_select) {
+            xmin = MIN(s->start.x, s->end.x);
+            xmax = MAX(s->start.x, s->end.x);
+        }
+        if (sbottom < top || stop >= (int)r->bottom || xmax < r->left || xmin >= r->right) continue;
+        const bool inside = stop >= top && sbottom < (int)r->bottom && xmin >= r->left && xmax < r->right;
+        bool moves_out;
+        if (r->horizontal) moves_out = forward ? xmin == r->left : xmax == r->right - 1;
+        else moves_out = forward ? (stop == (int)r->top && !via_history) : sbottom == (int)r->bottom - 1;
+        if (!inside || moves_out) {
+            clear_selection(selections);
+            return;
+        }
+        if (r->horizontal) move_selection_by_one_column(s, forward);
+        else move_selection_by_one_row(self, s, forward);
+    }
+}
+
+static void
+ssr_move_images(Screen *self, SmoothScrollRegion *r, bool forward, bool via_history) {
+    // via_history is true when the scrollback moves with the rows of the rectangle
+    if (LIKELY(!grman_has_any_images(self->grman))) return;
+    const index_type before_edge = r->horizontal ? r->left : r->top, after_edge = r->horizontal ? r->right : r->bottom;
+    const SmoothScrollImageData d = {
+        .region_id = r->id,
+        .amt = forward ? -1 : 1,
+        .horizontal = r->horizontal,
+        .left = r->left,
+        .right = r->right,
+        .top = r->top,
+        .bottom = r->bottom,
+        // When the scrollback is the overflow buffer images in its last line are drawn with the region
+        .before_limit = via_history ? (int32_t)r->top - 1 : (int32_t)before_edge - (int32_t)r->capacity,
+        .after_limit = (int32_t)(after_edge + r->capacity),
+        .history_limit = -(int32_t)self->historybuf->ynum,
+        .uses_history = via_history,
+    };
+    grman_smooth_scroll_images(self->grman, &d, self->cell_size);
+}
+
+static void
+ssr_shift_by_one_row(Screen *self, SmoothScrollRegion *r, bool up) {
+    // Move the cells of the rectangle by one row, up when up is true
+    const bool full_width = ssr_is_full_width(self, r), uses_history = ssr_uses_history(self, r);
+    // Whether the scrollback moves with the rows of the rectangle, with a row
+    // moving into it or being taken back from it. Only rows that moved into it
+    // from the rectangle are taken back, so that scrolling back never takes
+    // lines that were in the scrollback before, for example, the output of
+    // commands run before the program.
+    const bool via_history = uses_history && (up || (r->pushed_to_history && self->historybuf->count));
+    const index_type top = r->top, last = r->bottom - 1;
+    ssr_nuke_straddling_chars(self, r);
+    if (UNLIKELY(self->selections.count)) ssr_move_selections(self, &self->selections, r, up, via_history);
+    if (UNLIKELY(self->url_ranges.count || self->url_ranges.in_progress)) clear_selection(&self->url_ranges);
+    if (full_width) last_visited_prompt_index(self, top, last, up, via_history);
+    bool entered_blank;
+    if (up) {
+        // The top row leaves, a row enters at the bottom
+        if (full_width) {
+            if (!via_history) ssr_copy_row_to_slot(self, r, top, ssr_push_slot(r, true));
+            bidi_index_up_seams(self, top, last, via_history);
+            linebuf_index(self->linebuf, top, last);
+            // The row that left is now at the bottom
+            if (via_history) {
+                linebuf_init_line(self->linebuf, last);
+                historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf);
+                // The scrollback drops its oldest line when full
+                r->pushed_to_history = MIN(r->pushed_to_history + 1, self->historybuf->ynum);
+                // Keep a scrolled back viewport anchored on the same content
+                if (self->scrolled_by) {
+                    if (self->scrolled_by < self->historybuf->count) self->scrolled_by++;
+                    if (self->scrolled_by >= self->historybuf->count && self->pixel_scroll_offset_y) {
+                        reset_pixel_scroll(self, 0);
+                        self->scroll_changed = true;
+                    }
+                }
+            }
+            // The rows moved intact, with their render data, as when scrolling
+            // with SU, so they do not need to be rendered again
+        } else {
+            ssr_copy_row_to_slot(self, r, top, ssr_push_slot(r, true));
+            for (index_type y = top; y < last; y++) ssr_copy_row_to_row(self, r, y + 1, y);
+        }
+        entered_blank = !r->num_after;
+        if (entered_blank) ssr_blank_row(self, r, last);
+        else {
+            ssr_copy_slot_to_row(self, r, ssr_slot(r, false, 0), last);
+            ssr_pop_slot(r, false);
+        }
+        if (entered_blank && last > top) ssr_nuke_chars_next_to_blank_row(self, r, last - 1, true);
+    } else {
+        // The bottom row leaves, a row enters at the top
+        ssr_copy_row_to_slot(self, r, last, ssr_push_slot(r, false));
+        if (full_width) {
+            linebuf_reverse_index(self->linebuf, top, last);
+            bidi_index_down_seams(self, top, last);
+        } else {
+            for (index_type y = last; y > top; y--) ssr_copy_row_to_row(self, r, y - 1, y);
+        }
+        entered_blank = true;
+        if (via_history) {
+            if (historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) {
+                r->pushed_to_history--;
+                linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, top);
+                bidi_note_line_from_history(self, top);
+                ssr_mark_row_dirty(self, top);
+                // Keep a scrolled back viewport anchored on the same content
+                if (self->scrolled_by) self->scrolled_by--;
+                entered_blank = false;
+            }
+        } else if (r->num_before) {
+            ssr_copy_slot_to_row(self, r, ssr_slot(r, true, 0), top);
+            ssr_pop_slot(r, true);
+            entered_blank = false;
+        }
+        if (entered_blank) ssr_blank_row(self, r, top);
+        if (entered_blank && last > top) ssr_nuke_chars_next_to_blank_row(self, r, top + 1, false);
+    }
+    ssr_move_images(self, r, up, via_history);
+    if (UNLIKELY(self->linebuf->bidi_stamped)) {
+        self->linebuf->bidi_maybe_unstamp = true;
+        bidi_layout_moved(self);
+    }
+    self->is_dirty = true;
+}
+
+static void bidi_line_gets_text(Screen *self, index_type y);
+
+// The walk recomputes the bit of a dirty row from the cells it holds, which left out those shifted onto the overflow
+static void
+ssr_bidi_cell_entered(Screen *self, index_type y, const CPUCell *c) {
+    LineAttrs *a = self->linebuf->line_attrs + y;
+    if (!a->bidi_may_reorder) a->bidi_may_reorder = bidi_cells_may_reorder(c, 1, self->text_cache);
+}
+
+static void
+ssr_shift_by_one_column(Screen *self, SmoothScrollRegion *r, bool left) {
+    // Move the cells of the rectangle by one column, left when left is true
+#if BLANK_CHAR != 0
+#error This implementation is incorrect for BLANK_CHAR != 0
+#endif
+    ssr_nuke_straddling_chars(self, r);
+    if (UNLIKELY(self->selections.count)) ssr_move_selections(self, &self->selections, r, left, false);
+    if (UNLIKELY(self->url_ranges.count || self->url_ranges.in_progress)) clear_selection(&self->url_ranges);
+    const index_type w = ssr_width(r), k = r->capacity, first = r->left, last = r->right - 1;
+    const bool entered_blank = left ? !r->num_after : !r->num_before;
+    const bool stamped = self->linebuf->bidi_stamped;
+    for (index_type i = 0; i < ssr_height(r); i++) {
+        const index_type y = r->top + i;
+        CPUCell *c, *cb, *ca;
+        RenderCell *rc, *rcb, *rca;
+        linebuf_init_cells(self->linebuf, y, &c, &rc);
+        ssr_overflow_row_cells(r, true, i, &cb, &rcb);
+        ssr_overflow_row_cells(r, false, i, &ca, &rca);
+        if (left) {
+            // The leftmost column leaves, onto the overflow buffer on the left, whose nearest column is its last
+            if (k > 1) {
+                memmove(cb, cb + 1, (k - 1) * sizeof(cb[0]));
+                memmove(rcb, rcb + 1, (k - 1) * sizeof(rcb[0]));
+            }
+            cb[k - 1] = c[first], rcb[k - 1] = rc[first];
+            memmove(c + first, c + first + 1, (w - 1) * sizeof(c[0]));
+            memmove(rc + first, rc + first + 1, (w - 1) * sizeof(rc[0]));
+            // A column enters on the right, from the overflow buffer on the right, whose nearest column is its first
+            if (entered_blank) {
+                zero_at_ptr(c + last);
+                zero_at_ptr(rc + last);
+            } else {
+                if (UNLIKELY(stamped) && ca[0].ch_and_idx) bidi_line_gets_text(self, y);
+                c[last] = ca[0], rc[last] = rca[0];
+                if (UNLIKELY(stamped)) ssr_bidi_cell_entered(self, y, c + last);
+                if (k > 1) {
+                    memmove(ca, ca + 1, (k - 1) * sizeof(ca[0]));
+                    memmove(rca, rca + 1, (k - 1) * sizeof(rca[0]));
+                }
+                zero_at_ptr(ca + k - 1);
+                zero_at_ptr(rca + k - 1);
+            }
+        } else {
+            // The rightmost column leaves, onto the overflow buffer on the right
+            if (k > 1) {
+                memmove(ca + 1, ca, (k - 1) * sizeof(ca[0]));
+                memmove(rca + 1, rca, (k - 1) * sizeof(rca[0]));
+            }
+            ca[0] = c[last], rca[0] = rc[last];
+            memmove(c + first + 1, c + first, (w - 1) * sizeof(c[0]));
+            memmove(rc + first + 1, rc + first, (w - 1) * sizeof(rc[0]));
+            // A column enters on the left, from the overflow buffer on the left
+            if (entered_blank) {
+                zero_at_ptr(c + first);
+                zero_at_ptr(rc + first);
+            } else {
+                if (UNLIKELY(stamped) && cb[k - 1].ch_and_idx) bidi_line_gets_text(self, y);
+                c[first] = cb[k - 1], rc[first] = rcb[k - 1];
+                if (UNLIKELY(stamped)) ssr_bidi_cell_entered(self, y, c + first);
+                if (k > 1) {
+                    memmove(cb + 1, cb, (k - 1) * sizeof(cb[0]));
+                    memmove(rcb + 1, rcb, (k - 1) * sizeof(rcb[0]));
+                }
+                zero_at_ptr(cb);
+                zero_at_ptr(rcb);
+            }
+        }
+        const bool has_image_placeholders = self->linebuf->line_attrs[y].has_image_placeholders;
+        LineAttrs *ab = r->overflow->line_attrs + i, *aa = r->overflow->line_attrs + ssr_height(r) + i;
+        ab->has_image_placeholders |= has_image_placeholders;
+        aa->has_image_placeholders |= has_image_placeholders;
+        ab->has_dirty_text = true;
+        aa->has_dirty_text = true;
+        ssr_mark_row_dirty(self, y);
+    }
+    index_type *pushed = left ? &r->num_before : &r->num_after, *popped = left ? &r->num_after : &r->num_before;
+    if (*pushed < k) (*pushed)++;
+    if (*popped) (*popped)--;
+    if (entered_blank && w > 1) ssr_nuke_chars_next_to_blank_column(self, r, left ? last - 1 : first + 1, left);
+    ssr_move_images(self, r, left, false);
+    if (UNLIKELY(stamped)) bidi_layout_moved(self);
+    self->is_dirty = true;
+}
+
+static void
+ssr_release_images(Screen *self, SmoothScrollRegion *r, bool clip_before) {
+    if (UNLIKELY(grman_has_any_images(self->grman)))
+        grman_smooth_scroll_release_images(self->grman, r->id, r->left, r->top, r->right, r->bottom, r->horizontal, clip_before, self->cell_size);
+}
+
+static void
+ssr_free(SmoothScrollRegion *r) {
+    Py_CLEAR(r->overflow);
+    zero_at_ptr(r);
+}
+
+static void
+ssr_discard_overflow(Screen *self, SmoothScrollRegion *r) {
+    // The rows (columns) in the rectangle no longer adjoin the rows (columns)
+    // in the overflow buffers, so discard them and render the rectangle unshifted
+    ssr_nuke_chars_continuing_into_overflow(self, r, true);
+    ssr_nuke_chars_continuing_into_overflow(self, r, false);
+    ssr_clear_overflow(r, true);
+    ssr_clear_overflow(r, false);
+    ssr_release_images(self, r, !ssr_uses_history(self, r));
+    if (r->offset) {
+        r->offset = 0;
+        self->smooth_scroll.offsets_changed = true;
+    }
+}
+
+static void
+ssr_dirty_line_graphics(Screen *self, const SmoothScrollRegion *r) {
+    // Images displayed using Unicode placeholders are split at the edges of
+    // regions, see screen_render_line_graphics(), so render the lines with
+    // placeholders again. Their cell images are replaced when they are
+    // rendered, until then they move with the cells of the region.
+    for (index_type y = r->top; y < r->bottom; y++) {
+        if (self->linebuf->line_attrs[y].has_image_placeholders) {
+            linebuf_mark_line_dirty(self->linebuf, y);
+            self->is_dirty = true;
+        }
+    }
+}
+
+static void
+ssr_dirty_bidi_rows(Screen *self, const SmoothScrollRegion *r) {
+    // The cells of a horizontally scrolled region are not laid out by bidi,
+    // and a wide char across the edge of a narrower region is fixed in its
+    // columns, so the rows it covers are laid out again when it comes or goes
+    if (!r->horizontal && ssr_is_full_width(self, r)) return;
+    for (index_type y = r->top; y < r->bottom; y++) linebuf_mark_line_dirty(self->linebuf, y);
+    self->is_dirty = true;
+}
+
+static void
+ssr_remove_at(Screen *self, unsigned idx) {
+    SmoothScrollRegion *r = self->smooth_scroll.regions + idx;
+    self->smooth_scroll.offsets_changed = true;
+    ssr_discard_overflow(self, r);
+    ssr_dirty_line_graphics(self, r);
+    if (self->bidi_maps && !ssr_is_full_width(self, r)) bidi_maps_edges_changed(self->bidi_maps);
+    bidi_layout_moved(self);
+    if (UNLIKELY(self->linebuf->bidi_stamped)) {
+        self->linebuf->bidi_maybe_unstamp = true;
+        ssr_dirty_bidi_rows(self, r);
+    }
+    ssr_free(r);
+    SmoothScroll *ss = &self->smooth_scroll;
+    ss->count--;
+    if (idx < ss->count) {
+        memmove(ss->regions + idx, ss->regions + idx + 1, (ss->count - idx) * sizeof(ss->regions[0]));
+        zero_at_ptr(ss->regions + ss->count);
+    }
+}
+
+void
+screen_smooth_scroll_remove_all(Screen *self) {
+    while (self->smooth_scroll.count) ssr_remove_at(self, self->smooth_scroll.count - 1);
+}
+
+bool
+screen_smooth_scroll_remove(Screen *self, uint32_t id) {
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        if (self->smooth_scroll.regions[i].id == id) {
+            ssr_remove_at(self, i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+screen_smooth_scroll_define(
+    Screen *self,
+    uint32_t id,
+    index_type left,
+    index_type top,
+    index_type right,
+    index_type bottom,
+    index_type capacity,
+    bool private_overflow,
+    bool horizontal) {
+    if (!id || left >= right || top >= bottom || right > self->columns || bottom > self->lines) return false;
+    if (!capacity || capacity > (horizontal ? right - left : bottom - top)) return false;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *q = self->smooth_scroll.regions + i;
+        if (q->id != id && left < q->right && q->left < right && top < q->bottom && q->top < bottom) return false;
+    }
+    screen_smooth_scroll_remove(self, id);
+    if (self->smooth_scroll.count >= MAX_SMOOTH_SCROLL_REGIONS) return false;
+    LineBuf *overflow =
+        horizontal ? alloc_linebuf(2 * (bottom - top), capacity, self->text_cache) : alloc_linebuf(2 * capacity, right - left, self->text_cache);
+    if (!overflow) {
+        PyErr_Clear();
+        return false;
+    }
+    self->smooth_scroll.linebuf = self->linebuf;
+    SmoothScrollRegion *r = self->smooth_scroll.regions + self->smooth_scroll.count++;
+    *r = (SmoothScrollRegion){
+        .id = id,
+        .left = left,
+        .top = top,
+        .right = right,
+        .bottom = bottom,
+        .capacity = capacity,
+        .horizontal = horizontal,
+        .private_overflow = private_overflow,
+        .overflow = overflow};
+    ssr_dirty_line_graphics(self, r);
+    if (self->bidi_maps && !ssr_is_full_width(self, r)) bidi_maps_edges_changed(self->bidi_maps);
+    bidi_layout_moved(self);
+    if (UNLIKELY(self->linebuf->bidi_stamped)) {
+        self->linebuf->bidi_maybe_unstamp = true;
+        ssr_dirty_bidi_rows(self, r);
+    }
+    return true;
+}
+
+bool
+screen_smooth_scroll(Screen *self, uint32_t id, int delta_pixels, int *cells_shifted) {
+    // Scroll the region by delta_pixels, positive values move the content up
+    // (left), that is, towards the end of the content, as for scroll wheel
+    // events. On return cells_shifted is the number of rows (columns) by which
+    // the cells were moved, positive for up (left). The rows (columns) that
+    // entered the rectangle at the edge in the direction of the scroll are the
+    // ones the application must draw.
+    *cells_shifted = 0;
+    SmoothScrollRegion *r = ssr_for_id(self, id);
+    if (!r) return false;
+    const int h = (int)MAX(1u, r->horizontal ? self->cell_size.width : self->cell_size.height);
+    if (!delta_pixels) return true;
+    // offset is the position of the first row (column) of the rectangle
+    // relative to its top (left) edge. Moving the content by delta moves it
+    // to offset - delta. The row (column) entering in the direction of the
+    // scroll must be in the rectangle, so for scrolls forward the offset must
+    // be in [0, h) and for scrolls backward in (-h, 0].
+    const int64_t moved = (int64_t)r->offset - delta_pixels;
+    int64_t shift;
+    if (delta_pixels > 0) shift = moved < 0 ? (-moved + h - 1) / h : 0;
+    else shift = moved > 0 ? -((moved + h - 1) / h) : 0;
+    const int new_offset = (int)(moved + shift * h);
+    if (new_offset != r->offset) {
+        r->offset = new_offset;
+        self->smooth_scroll.offsets_changed = true;
+        // Images moving with the region are drawn shifted by the offset
+        if (grman_has_any_images(self->grman)) grman_mark_layers_dirty(self->grman);
+    }
+    *cells_shifted = (int)MAX((int64_t)INT_MIN, MIN((int64_t)INT_MAX, shift));
+    // Shifting by more than the rows (columns) in the rectangle and the
+    // overflow buffer only moves blank ones. When the scrollback is the
+    // overflow buffer it would fill it with blank rows, so stop when every row
+    // of the rectangle has moved into it.
+    const bool forward = shift > 0;
+    const int64_t length = r->horizontal ? ssr_width(r) : ssr_height(r);
+    const int64_t limit = (forward && ssr_uses_history(self, r)) ? length : length + r->capacity;
+    for (int64_t n = MIN(forward ? shift : -shift, limit); n > 0; n--) {
+        if (r->horizontal) ssr_shift_by_one_column(self, r, forward);
+        else ssr_shift_by_one_row(self, r, forward);
+    }
+    self->is_dirty = true;
+    return true;
+}
+
+static void
+ssr_lines_moved(Screen *self, index_type top, index_type bottom, bool up, bool via_history) {
+    // The lines [top, bottom] of the screen were scrolled by one line, or
+    // lines were inserted or deleted in them. Regions whose rows were moved no
+    // longer adjoin their overflow buffers, except when the lines are moved
+    // up into the scrollback and it is the overflow buffer above the region,
+    // in which case only the rows below the region are discarded.
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (!ssr_rows_intersect(r, top, bottom)) continue;
+        if (up && via_history && top == 0 && bottom + 1 >= r->bottom && ssr_uses_history(self, r)) {
+            // The top row of the rectangle moves into the scrollback
+            r->pushed_to_history = MIN(r->pushed_to_history + 1, self->historybuf->ynum);
+            ssr_nuke_chars_continuing_into_overflow(self, r, false);
+            ssr_clear_overflow(r, false);
+            ssr_release_images(self, r, false);
+            if (r->offset < 0) {
+                r->offset = 0;
+                self->smooth_scroll.offsets_changed = true;
+            }
+        } else ssr_discard_overflow(self, r);
+    }
+}
+
+static void
+ssr_row_cells_moved(Screen *self, index_type x, index_type y) {
+    // The cells of row y from column x to the end of the row were moved
+    // sideways, by inserting or deleting chars, so horizontally scrolled
+    // regions containing them no longer adjoin the columns in their overflow buffers
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (r->horizontal && r->top <= y && y < r->bottom && x < r->right) ssr_discard_overflow(self, r);
+    }
+}
+
+static void
+ssr_screen_erased(Screen *self) {
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) ssr_discard_overflow(self, self->smooth_scroll.regions + i);
+}
+
+unsigned
+screen_bidi_span_edges(const Screen *self, index_type y, index_type *edges) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (y < r->top || y >= r->bottom || ssr_is_full_width(self, r)) continue;
+        const index_type cut[2] = {r->left, r->right};
+        for (unsigned c = 0; c < 2; c++) {
+            if (!cut[c] || cut[c] >= self->columns) continue;
+            unsigned at = n;
+            for (; at && edges[at - 1] > cut[c]; at--) edges[at] = edges[at - 1];
+            edges[at] = cut[c];
+            n++;
+        }
+    }
+    return n;
+}
+
+void
+screen_bidi_fixed_columns(const Screen *self, index_type y, BidiFixedColumns *ans) {
+    ans->count = 0;
+    ans->num_edges = screen_bidi_span_edges(self, y, ans->edges);
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (!r->horizontal || y < r->top || y >= r->bottom) continue;
+        // Regions do not overlap
+        unsigned at = ans->count++;
+        for (; at && ans->at[2 * at - 2] > r->left; at--) {
+            ans->at[2 * at] = ans->at[2 * at - 2];
+            ans->at[2 * at + 1] = ans->at[2 * at - 1];
+        }
+        ans->at[2 * at] = r->left;
+        ans->at[2 * at + 1] = r->right;
+    }
+}
+
+bool
+screen_bidi_strip_shows_recorded_history(const Screen *self) {
+    if (!self->historybuf->bidi_stamped || !self->historybuf->count || historybuf_attrs(self->historybuf, 0)->bidi_stamp == BIDI_STAMP_NONE) return false;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if (r->offset && ssr_uses_history(self, r)) return true;
+    }
+    return false;
+}
+
+// Rendering {{{
+static unsigned
+ssr_live_render_regions(Screen *self, SmoothScrollRenderRegion *ans) {
+    // The regions as they should be rendered now. Regions are shifted only
+    // when the screen is not scrolled back, as their rectangles are in screen
+    // coordinates. When it is scrolled back, they are only used to clip the
+    // images moving with them to their rectangles.
+    const int y_offset = (int)(self->scrolled_by * self->cell_size.height) + (live_pixel_scroll_enabled(self) ? (int)self->pixel_scroll_offset_y : 0);
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        ans[i] = (SmoothScrollRenderRegion){
+            .id = r->id,
+            .left = r->left,
+            .top = r->top,
+            .width = ssr_width(r),
+            .height = ssr_height(r),
+            .offset = y_offset ? 0 : r->offset,
+            .y_offset = y_offset,
+            .horizontal = r->horizontal,
+            .uses_history = ssr_uses_history(self, r)};
+    }
+    return self->smooth_scroll.count;
+}
+
+static bool screen_has_marker(Screen *self);
+static int paused_snapshot_row_offset(const Screen *self);
+
+static bool
+ssr_render_regions_equal(const SmoothScrollRenderRegion *a, const SmoothScrollRenderRegion *b) {
+    return a->id == b->id && a->left == b->left && a->top == b->top && a->width == b->width && a->height == b->height && a->offset == b->offset &&
+           a->y_offset == b->y_offset && a->base_cell == b->base_cell && a->horizontal == b->horizontal && a->uses_history == b->uses_history;
+}
+
+bool
+screen_prepare_smooth_scroll_render(Screen *self) {
+    // Compute how the smooth scroll regions are rendered in this frame,
+    // returns true if that is different from the previous frame
+    SmoothScrollRender *sr = &self->smooth_scroll_render;
+    if (!sr->count && !self->smooth_scroll.count && !self->paused_rendering.smooth_scroll.count) return false;
+    const SmoothScrollRender prev = *sr;
+    if (self->paused_rendering.expires_at) {
+        sr->count = self->paused_rendering.smooth_scroll.count;
+        memcpy(sr->regions, self->paused_rendering.smooth_scroll.regions, sr->count * sizeof(sr->regions[0]));
+    } else sr->count = ssr_live_render_regions(self, sr->regions);
+    sr->num_strip_cells = 0;
+    const unsigned base = render_lines_for_screen(self) * self->columns;
+    for (unsigned i = 0; i < sr->count; i++) {
+        SmoothScrollRenderRegion *rr = sr->regions + i;
+        rr->base_cell = 0;
+        if (smooth_scroll_render_region_is_shifted(rr)) {
+            rr->base_cell = base + sr->num_strip_cells;
+            sr->num_strip_cells += smooth_scroll_render_region_strip_height(rr) * smooth_scroll_render_region_strip_width(rr);
+        }
+    }
+    bool changed = self->smooth_scroll.offsets_changed || prev.count != sr->count || prev.num_strip_cells != sr->num_strip_cells;
+    for (unsigned i = 0; i < sr->count && !changed; i++) changed = !ssr_render_regions_equal(prev.regions + i, sr->regions + i);
+    self->smooth_scroll.offsets_changed = false;
+    return changed;
+}
+
+static void
+ssr_render_line_if_dirty(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data, const Cursor *cursor, BidiMaps *b, bool fixed) {
+    // Render a line that is drawn only in the strip of a region. It is never the cursor row. In a frame with bidi maps it is
+    // rendered at the levels bidi_strip_line_levels() gives, which are stored for the order of its strip row.
+    if (!line->attrs.has_dirty_text) return;
+    const uint8_t *levels = UNLIKELY(b) ? bidi_strip_line_levels(b, line, fixed) : NULL;
+    render_line(fonts_data, line, self->lines, (Cursor *)cursor, self->disable_ligatures, self->lc, levels);
+    if (UNLIKELY(self->bidi_maps)) bidi_store_line_levels(line, levels);
+    if (screen_has_marker(self)) mark_text_in_line(self->marker, line, &self->as_ansi_buf);
+}
+
+static void
+ssr_render_overflow_line(Screen *self, SmoothScrollRegion *r, index_type y, Line *line, FONTS_DATA_HANDLE fonts_data, const Cursor *cursor, BidiMaps *b) {
+    linebuf_init_line_at(r->overflow, y, line);
+    ssr_render_line_if_dirty(self, line, fonts_data, cursor, b, false);
+    linebuf_mark_line_clean(r->overflow, y);
+}
+
+static void
+ssr_write_strip_cells_in_order(BidiMaps *b, const Line *line, index_type x, index_type width, CellGPUData *dest) {
+    // The cells in the order the screen shows them, see bidi_row_order()
+    const uint16_t *v2l = bidi_span_order(b, line->render_cells + x, width);
+    if (v2l) cells_for_gpu_permuted(line->cpu_cells + x, line->render_cells + x, v2l, width, dest);
+    else cells_for_gpu(line->cpu_cells + x, line->render_cells + x, width, dest);
+}
+
+static void
+ssr_write_strip_cells(BidiMaps *b, const Line *line, index_type x, index_type width, CellGPUData *dest) {
+    if (!line) memset(dest, 0, width * sizeof(dest[0]));
+    else if (UNLIKELY(b)) ssr_write_strip_cells_in_order(b, line, x, width, dest);
+    else cells_for_gpu(line->cpu_cells + x, line->render_cells + x, width, dest);
+}
+
+static void
+ssr_update_strip_cell_data(Screen *self, uint8_t *address, FONTS_DATA_HANDLE fonts_data, BidiMaps *b) {
+    // Write the cells of the strips of the shifted regions, see SmoothScrollRenderRegion
+    const SmoothScrollRender *sr = &self->smooth_scroll_render;
+    const bool paused = self->paused_rendering.expires_at != 0;
+    const Cursor *cursor = paused ? &self->paused_rendering.cursor : self->cursor;
+    LineBuf *lb = paused ? self->paused_rendering.linebuf : self->linebuf;
+    const index_type row_offset = paused ? (index_type)paused_snapshot_row_offset(self) : 0;
+    Line line = {.text_cache = self->text_cache};
+    for (unsigned i = 0; i < sr->count; i++) {
+        const SmoothScrollRenderRegion *rr = sr->regions + i;
+        if (!smooth_scroll_render_region_is_shifted(rr)) continue;
+        SmoothScrollRegion *r = paused ? self->paused_rendering.smooth_scroll.copies + i : ssr_for_id(self, rr->id);
+        if (!r || !r->overflow) continue;
+        CellGPUData *dest = (CellGPUData *)address + rr->base_cell;
+        const index_type w = rr->width, sw = smooth_scroll_render_region_strip_width(rr);
+        if (rr->horizontal) {
+            for (index_type y = 0; y < rr->height; y++) {
+                CellGPUData *row = dest + (size_t)y * sw;
+                for (int edge = 0; edge < 2; edge++) {
+                    const bool before = edge == 0;
+                    const index_type n = before ? r->num_before : r->num_after;
+                    ssr_render_overflow_line(self, r, before ? y : rr->height + y, &line, fonts_data, cursor, NULL);
+                    ssr_write_strip_cells(b, n ? &line : NULL, ssr_nearest_column(r, before), 1, row + (before ? 0 : w + 1));
+                }
+                linebuf_init_line_at(lb, rr->top + y + row_offset, &line);
+                ssr_write_strip_cells(b, &line, rr->left, w, row + 1);
+            }
+            continue;
+        }
+        for (int edge = 0; edge < 2; edge++) {
+            const bool before = edge == 0;
+            CellGPUData *row = dest + (before ? 0 : (size_t)(rr->height + 1) * w);
+            const Line *lp = NULL;
+            index_type x = 0;
+            if (before && (paused ? self->paused_rendering.smooth_scroll.history_row_region == i + 1 : ssr_uses_history(self, r))) {
+                if (paused) {
+                    LineBuf *hr = self->paused_rendering.smooth_scroll.history_row;
+                    linebuf_init_line_at(hr, 0, &line);
+                    ssr_render_line_if_dirty(self, &line, fonts_data, cursor, b, !self->paused_rendering.pixel_scroll);
+                    linebuf_mark_line_clean(hr, 0);
+                    lp = &line;
+                } else if (self->historybuf->count) {
+                    if (historybuf_init_line_for_render(self->historybuf, 0, &line, render_lines_for_screen(self))) line.attrs.has_dirty_text = true;
+                    line.xnum = self->columns;
+                    // With pixel scrolling the line is on view, rendered at its levels. Without, it is drawn as with bidi mode
+                    // off and stays dirty, so that a frame showing it on view does not take those levels as its own.
+                    const bool fixed = !pixel_scroll_enabled(self);
+                    ssr_render_line_if_dirty(self, &line, fonts_data, cursor, b, fixed);
+                    if (UNLIKELY(b) && fixed) historybuf_mark_line_dirty(self->historybuf, 0);
+                    else historybuf_mark_line_clean(self->historybuf, 0);
+                    lp = &line;
+                }
+                x = rr->left;
+            } else if (before ? r->num_before : r->num_after) {
+                ssr_render_overflow_line(self, r, ssr_slot(r, before, 0), &line, fonts_data, cursor, b);
+                lp = &line;
+            }
+            ssr_write_strip_cells(b, lp, x, w, row);
+        }
+        for (index_type y = 0; y < rr->height; y++) {
+            linebuf_init_line_at(lb, rr->top + y + row_offset, &line);
+            ssr_write_strip_cells(b, &line, rr->left, w, dest + (size_t)(y + 1) * w);
+        }
+    }
+}
+
+static void
+ssr_copy_strip_row_selection(
+    const Screen *self, const BidiMaps *b, const uint8_t *screen_data, const SmoothScrollRenderRegion *rr, index_type r, uint8_t *dest, size_t stride) {
+    const uint8_t *src = screen_data + (size_t)r * self->columns * stride;
+    if (b && b->active[r]) bidi_copy_row_bytes(b->v2l + (size_t)r * b->cols + rr->left, rr->width, src, dest, stride);
+    else memcpy(dest, src + (size_t)rr->left * stride, (size_t)rr->width * stride);
+}
+
+static void
+ssr_write_strip_selection_data(Screen *self, const BidiMaps *b, const uint8_t *screen_data, uint8_t *address, size_t stride) {
+    // The selection data of the strips of the shifted regions, copied from
+    // the data of the cells of the screen, which is in logical order. The rows
+    // (columns) outside the rectangles are never selected. With maps b, the
+    // cells of a reordered row are in the order the screen shows them, as the
+    // strip's cells are: a region narrower than the screen is a span of its
+    // own and the columns of a horizontal one keep their places.
+    const SmoothScrollRender *sr = &self->smooth_scroll_render;
+    const index_type row_offset = pixel_scroll_enabled(self);
+    const size_t first_strip_cell = (size_t)render_lines_for_screen(self) * self->columns;
+    for (unsigned i = 0; i < sr->count; i++) {
+        const SmoothScrollRenderRegion *rr = sr->regions + i;
+        if (!smooth_scroll_render_region_is_shifted(rr)) continue;
+        uint8_t *dest = address + (rr->base_cell - first_strip_cell) * stride;
+        const size_t row_sz = (size_t)rr->width * stride;
+#define COPY_ROW(y, d) ssr_copy_strip_row_selection(self, b, screen_data, rr, rr->top + (y) + row_offset, d, stride)
+        if (rr->horizontal) {
+            for (index_type y = 0; y < rr->height; y++) {
+                memset(dest, 0, stride);
+                COPY_ROW(y, dest + stride);
+                memset(dest + stride + row_sz, 0, stride);
+                dest += row_sz + 2 * stride;
+            }
+            continue;
+        }
+        memset(dest, 0, row_sz);
+        dest += row_sz;
+        for (index_type y = 0; y < rr->height; y++, dest += row_sz) COPY_ROW(y, dest);
+        memset(dest, 0, row_sz);
+#undef COPY_ROW
+    }
+}
+
+static LineBuf *
+ssr_copy_linebuf(LineBuf *src, LineBuf *dest, TextCache *tc) {
+    // Copy src into dest, which is reallocated if its size is different, returns NULL on failure
+    if (!dest || dest->xnum != src->xnum || dest->ynum != src->ynum) {
+        Py_CLEAR(dest);
+        dest = alloc_linebuf(src->ynum, src->xnum, tc);
+        if (!dest) {
+            PyErr_Clear();
+            return NULL;
+        }
+    }
+    const size_t n = (size_t)src->xnum * src->ynum;
+    memcpy(dest->cpu_cell_buf, src->cpu_cell_buf, n * sizeof(src->cpu_cell_buf[0]));
+    memcpy(dest->render_cell_buf, src->render_cell_buf, n * sizeof(src->render_cell_buf[0]));
+    memcpy(dest->line_map, src->line_map, src->ynum * sizeof(src->line_map[0]));
+    memcpy(dest->line_attrs, src->line_attrs, src->ynum * sizeof(src->line_attrs[0]));
+    return dest;
+}
+
+static void
+ssr_capture_for_pause(Screen *self) {
+    // Rendering is being paused, capture how the regions are rendered
+    __typeof__(self->paused_rendering.smooth_scroll) *p = &self->paused_rendering.smooth_scroll;
+    p->count = 0;
+    p->history_row_region = 0;
+    if (!self->smooth_scroll.count) return;
+    const unsigned count = ssr_live_render_regions(self, p->regions);
+    for (unsigned i = 0; i < count; i++) {
+        SmoothScrollRegion *r = ssr_for_id(self, p->regions[i].id), *c = p->copies + i;
+        LineBuf *overflow = ssr_copy_linebuf(r->overflow, c->overflow, self->text_cache);
+        c->overflow = NULL;
+        if (!overflow) return;
+        *c = *r;
+        c->overflow = overflow;
+        if (ssr_uses_history(self, r) && self->historybuf->count && smooth_scroll_render_region_is_shifted(p->regions + i)) {
+            if (!p->history_row || p->history_row->xnum != self->columns) {
+                Py_CLEAR(p->history_row);
+                p->history_row = alloc_linebuf(1, self->columns, self->text_cache);
+                if (!p->history_row) {
+                    PyErr_Clear();
+                    return;
+                }
+            }
+            // History lines have no render data of their own, the row is rendered as it is dirty
+            Line l = {.text_cache = self->text_cache};
+            historybuf_init_line(self->historybuf, 0, &l);
+            linebuf_clear_line(p->history_row, 0, true);
+            memcpy(p->history_row->cpu_cell_buf, l.cpu_cells, self->columns * sizeof(l.cpu_cells[0]));
+            // Drawn as in the live frame: with its settings, and with pixel scrolling at the levels of the leading render row
+            line_attrs_set_bidi(p->history_row->line_attrs, l.attrs);
+            if (UNLIKELY(self->paused_rendering.linebuf->bidi_stamped) && self->paused_rendering.pixel_scroll) {
+                linebuf_init_line(p->history_row, 0);
+                bidi_store_levels(self->bidi_maps, 0, p->history_row->line);
+            }
+            linebuf_mark_line_dirty(p->history_row, 0);
+            p->history_row_region = i + 1;
+        }
+    }
+    p->count = count;
+}
+
+static void
+ssr_release_pause_capture(Screen *self) {
+    __typeof__(self->paused_rendering.smooth_scroll) *p = &self->paused_rendering.smooth_scroll;
+    // The copies must not keep text cache entries alive
+    for (unsigned i = 0; i < MAX_SMOOTH_SCROLL_REGIONS; i++)
+        if (p->copies[i].overflow) linebuf_clear(p->copies[i].overflow, BLANK_CHAR);
+    if (p->history_row) linebuf_clear(p->history_row, BLANK_CHAR);
+    p->count = 0;
+    p->history_row_region = 0;
+}
+// }}}
+
+static void
+ssr_reply_to_query(Screen *self, const SmoothScrollCommand *cmd) {
+    // A query, a=q, replies with the maximum number of regions. A feature
+    // query, a=q with e=<action>, replies with e and every key of the query
+    // that has a non-default value, which is supported with that action. The
+    // other keys and e itself are omitted from the reply when not supported.
+    char buf[256];
+    size_t pos = 0;
+#define print(fmt, ...) \
+    if (sizeof(buf) - 1 > pos) pos += snprintf(buf + pos, sizeof(buf) - pos, fmt, __VA_ARGS__)
+    print("%d;a=q", SMOOTH_SCROLL_CODE);
+    const char action = cmd->query_action;
+    if (!action) {
+        print(":n=%u", MAX_SMOOTH_SCROLL_REGIONS);
+    } else if (strchr("dsrq", action)) {
+        print(":e=%c", action);
+        // Keys with default values are not echoed, zero means the default for all keys
+#define ECHO_UINT(key, attr, default_value) \
+    if (cmd->attr && cmd->attr != default_value) print(":%c=%u", key, cmd->attr)
+        switch (action) {
+            case 'd':
+                ECHO_UINT('x', x, 1u);
+                ECHO_UINT('y', y, 1u);
+                ECHO_UINT('w', width, 0u);
+                ECHO_UINT('h', height, 0u);
+                ECHO_UINT('k', capacity, 1u);
+                if (cmd->orientation == 'h') print(":o=%c", cmd->orientation);
+                if (cmd->private_overflow == 1) print(":p=%u", 1u);
+                break;
+            case 's':
+                if (cmd->delta) print(":d=%d", cmd->delta);
+                break;
+            default: break;
+        }
+#undef ECHO_UINT
+    }
+#undef print
+    write_escape_code_to_child(self, ESC_OSC, buf);
+}
+
+void
+screen_handle_smooth_scroll_command(Screen *self, const SmoothScrollCommand *cmd) {
+    // See docs/smooth-scrolling-protocol.rst. Only queries reply, invalid commands are ignored.
+    switch (cmd->action) {
+        case 'd': {
+            if (!cmd->id || cmd->private_overflow > 1) return;
+            // Coordinates are one based, zero for the defaults
+            const uint64_t left = cmd->x ? cmd->x - 1u : 0, top = cmd->y ? cmd->y - 1u : 0;
+            if (left >= self->columns || top >= self->lines) return;
+            const uint64_t right = cmd->width ? left + cmd->width : self->columns, bottom = cmd->height ? top + cmd->height : self->lines;
+            if (right > self->columns || bottom > self->lines) return;
+            const bool horizontal = cmd->orientation == 'h';
+            const uint64_t length = horizontal ? right - left : bottom - top;
+            const index_type capacity = (index_type)MAX(1u, MIN((uint64_t)cmd->capacity, length));
+            screen_smooth_scroll_define(
+                self, cmd->id, (index_type)left, (index_type)top, (index_type)right, (index_type)bottom, capacity, cmd->private_overflow == 1, horizontal);
+        } break;
+        case 's': {
+            if (!cmd->id) return;
+            int cells_shifted;
+            screen_smooth_scroll(self, cmd->id, cmd->delta, &cells_shifted);
+        } break;
+        case 'r':
+            if (cmd->id) screen_smooth_scroll_remove(self, cmd->id);
+            else screen_smooth_scroll_remove_all(self);
+            break;
+        case 'q': ssr_reply_to_query(self, cmd); break;
+        default: break;
+    }
+}
+// }}}
 
 
 static void
@@ -709,15 +2181,17 @@ nuke_split_multicell_char_at_right_boundary(Screen *self, index_type x, index_ty
 static void
 nuke_incomplete_single_line_multicell_chars_in_range(Screen *self, index_type start, index_type limit, index_type y, bool replace_with_spaces) {
     CPUCell *cpu_cells;
-    GPUCell *gpu_cells;
-    linebuf_init_cells(self->linebuf, y, &cpu_cells, &gpu_cells);
+    linebuf_init_cells(self->linebuf, y, &cpu_cells, NULL);
     for (index_type x = start; x < limit; x++) {
         if (cpu_cells[x].is_multicell) {
             // The end of the char, at least x + 1, so that the loop always makes
             // progress, even for fragments of chars whose first cell is missing
             const index_type w = mcd_x_limit(cpu_cells + x);
             const index_type char_limit = x + (w > cpu_cells[x].x ? w - cpu_cells[x].x : 1);
-            if (cpu_cells[x].x || char_limit > limit) nuke_in_line(cpu_cells, gpu_cells, x, MIN(char_limit, limit), replace_with_spaces ? ' ' : 0);
+            if (cpu_cells[x].x || char_limit > limit) {
+                nuke_in_line(cpu_cells, x, MIN(char_limit, limit), replace_with_spaces ? ' ' : 0);
+                linebuf_mark_line_dirty(self->linebuf, y);
+            }
             x = char_limit - 1;
         }
     }
@@ -809,6 +2283,8 @@ remove_blank_output_line_reservation_marker(Cursor *cursor, LineBuf *linebuf) {
 static bool
 screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
     screen_pause_rendering(self, false, 0);
+    screen_smooth_scroll_remove_all(self);
+    bidi_layout_moved(self);
     lines = MAX(1u, lines);
     columns = MAX(1u, columns);
 
@@ -908,6 +2384,7 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
             if (!historybuf_pop_line(self->historybuf, self->alt_linebuf->line)) break;
             INDEX_DOWN(true);
             linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
+            bidi_note_line_from_history(self, 0);
             self->cursor->y++;
             sp->cursor.y = MIN(sp->cursor.y + 1, self->lines - 1);
         }
@@ -928,6 +2405,10 @@ screen_resize(Screen *self, unsigned int lines, unsigned int columns) {
              y++, src_line++) {
             linebuf_init_line(src, src_line);
             linebuf_copy_line_to(self->main_linebuf, src->line, y);
+            // The copy takes the prompt line's attrs, whose bidi_may_reorder is not that of the cells the row now holds
+            LineBuf *lb = self->main_linebuf;
+            if (UNLIKELY(lb->bidi_stamped)) bidi_line_may_reorder_from_cells(self, lb, y);
+            else if (UNLIKELY(line_has_bidi_bits(lb->line_attrs[y]))) bidi_buffer_stamped(self, lb);
         }
     }
     return true;
@@ -969,13 +2450,18 @@ dealloc(Screen *self) {
     Py_CLEAR(self->color_profile);
     Py_CLEAR(self->marker);
     PyMem_Free(self->overlay_line.cpu_cells);
-    PyMem_Free(self->overlay_line.gpu_cells);
+    PyMem_Free(self->overlay_line.render_cells);
     PyMem_Free(self->overlay_line.original_line.cpu_cells);
-    PyMem_Free(self->overlay_line.original_line.gpu_cells);
+    PyMem_Free(self->overlay_line.original_line.render_cells);
     Py_CLEAR(self->overlay_line.overlay_text);
     PyMem_Free(self->main_tabstops);
     Py_CLEAR(self->paused_rendering.linebuf);
     Py_CLEAR(self->paused_rendering.grman);
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) Py_CLEAR(self->smooth_scroll.regions[i].overflow);
+    for (unsigned i = 0; i < MAX_SMOOTH_SCROLL_REGIONS; i++) Py_CLEAR(self->paused_rendering.smooth_scroll.copies[i].overflow);
+    Py_CLEAR(self->paused_rendering.smooth_scroll.history_row);
+    free(self->selection_scratch);
+    if (self->style_texture.texture) free_texture(&self->style_texture.texture);
     free(self->selections.items);
     free(self->url_ranges.items);
     free(self->paused_rendering.url_ranges.items);
@@ -990,6 +2476,7 @@ dealloc(Screen *self) {
         free(self->lc);
         self->lc = NULL;
     }
+    bidi_maps_free(self->bidi_maps);
     Py_TYPE(self)->tp_free((PyObject *)self);
 } // }}}
 
@@ -997,14 +2484,18 @@ dealloc(Screen *self) {
 typedef struct text_loop_state {
     bool image_placeholder_marked;
     const CPUCell cc;
-    const GPUCell g;
     CPUCell *cp;
-    GPUCell *gp;
     GraphemeSegmentationResult seg;
     struct {
         index_type x, y;
         CPUCell *cc;
     } prev;
+    // True when the line being drawn into is known to contain no multicell
+    // cells, which lets the ASCII fast path skip checking for them. This is
+    // the case for a line that was just cleared by scrolling, until something
+    // other than the ASCII fast path, CR or HT, which never create multicell
+    // cells, happens.
+    bool line_has_no_multicell;
 } text_loop_state;
 
 static void
@@ -1038,6 +2529,8 @@ clear_intersecting_selections(Screen *self, index_type y) {
 static void
 init_prev_cell(Screen *self, text_loop_state *s) {
     zero_at_ptr(&s->prev);
+    // The pre-edit text does not combine with the cells before it, which can be on the row above
+    if (UNLIKELY(self->overlay_line.drawing) && self->cursor->x <= self->overlay_line.draw_left) return;
     if (self->cursor->x) {
         s->prev.y = self->cursor->y;
         s->prev.x = self->cursor->x - 1;
@@ -1078,12 +2571,102 @@ init_segmentation_state(Screen *self, text_loop_state *s) {
     }
 }
 
+static LineAttrs
+current_bidi_record(const Screen *self) {
+    LineAttrs ans = {0};
+    if (!self->modes.mBDSM || OPT(force_ltr)) return ans;
+    ans.bidi_stamp = BIDI_STAMP_IMPLICIT;
+    ans.bidi_rtl = self->bidi.rtl;
+    ans.bidi_auto = self->modes.mBIDI_AUTODETECT;
+    return ans;
+}
+
+// A line without a record takes the record of the text written to it. With bidi mode off that record is empty, and the text drops
+// the direction a leading mark set.
+static void
+stamp_line_for_bidi(Screen *self, index_type y, uint8_t record) {
+    LineAttrs *a = self->linebuf->line_attrs + y;
+    if (!record) {
+        a->bidi_rtl = a->bidi_auto = false;
+        return;
+    }
+    if (a->bidi_auto) {
+        // the direction a leading mark set
+        a->bidi_stamp = BIDI_STAMP_IMPLICIT;
+        a->bidi_auto = false;
+    } else a->val |= record;
+    bidi_buffer_stamped(self, self->linebuf);
+}
+
+static inline void
+record_written_line(Screen *self, index_type y, uint8_t record) {
+    if (!self->linebuf->line_attrs[y].bidi_stamp) stamp_line_for_bidi(self, y, record);
+}
+
+static inline void
+bidi_note_may_reorder(Screen *self, index_type y, bool may_reorder) {
+    if (may_reorder) self->linebuf->line_attrs[y].bidi_may_reorder = true;
+}
+
+// After a batched run drawn on row y. Its chars are not looked at: the bit may be set for a row that cannot reorder, which the
+// walk resolving the dirty row clears.
+static inline void
+bidi_note_run(Screen *self, index_type y) {
+    LineAttrs *a = self->linebuf->line_attrs + y;
+    if (!a->bidi_may_reorder) a->bidi_may_reorder = true;
+}
+
+// Called before text is stored on line y: a record the line kept while it held no text is not the record of that text
+static void
+bidi_line_gets_text(Screen *self, index_type y) {
+    LineBuf *lb = self->linebuf;
+    if (lb->line_attrs[y].bidi_stamp == BIDI_STAMP_NONE) return;
+    linebuf_init_line(lb, y);
+    line_has_bidi_record(lb->line_attrs + y, lb->line);
+}
+
+static inline void
+draw_loop_line_gets_text(Screen *self, index_type y) {
+    if (self->linebuf->line_attrs[y].bidi_stamp != BIDI_STAMP_NONE) bidi_line_gets_text(self, y);
+}
+
+static void
+set_record_at_leading_mark(Screen *self, char_type ch, uint8_t record) {
+    // A leading mark fixes the direction of a line that would otherwise take it from its text. A line without a record gets
+    // none: its first text written in bidi mode takes the direction.
+    if (!((LineAttrs){.val = record}).bidi_auto) return;
+    // Main buffer row 0 continuing a history line starts no paragraph, as no other continuation row does, though the draw loop
+    // has no previous cell for it
+    if (!self->cursor->y && self->linebuf == self->main_linebuf && history_buf_endswith_wrap(self->historybuf)) return;
+    LineAttrs *a = self->linebuf->line_attrs + self->cursor->y;
+    a->bidi_auto = a->bidi_stamp == BIDI_STAMP_NONE;
+    a->bidi_rtl = ch == 0x200f; // RLM
+    bidi_buffer_stamped(self, self->linebuf);
+}
+
+// After a combining char was drawn, before is the text its cell held: the cell is the loop's previous cell now, which a widening
+// can have moved to another row
+static inline void
+record_combining_write(Screen *self, const text_loop_state *s, char_type before, uint8_t record, bool may_reorder) {
+    if (!s->prev.cc || s->prev.cc->ch_and_idx == before) return;
+    record_written_line(self, s->prev.y, record);
+    bidi_note_may_reorder(self, s->prev.y, may_reorder);
+    // A zero width char at the start of a continuation row goes to the last cell of the row above
+    if (s->prev.y != self->cursor->y) linebuf_mark_line_dirty(self->linebuf, s->prev.y);
+}
+
 static void
 init_text_loop_line(Screen *self, text_loop_state *s) {
-    linebuf_init_cells(self->linebuf, self->cursor->y, &s->cp, &s->gp);
+    // Also collect garbage in the text cache when starting a new line, not just
+    // when starting to draw text, as a single draw can add a great many entries,
+    // for example, when drawing a long stream of unique multi-codepoint cells,
+    // making the cache slower to use the larger it grows.
+    if (tc_should_gc(self->text_cache)) screen_garbage_collect_text_cache(self);
+    linebuf_init_cells(self->linebuf, self->cursor->y, &s->cp, NULL);
     clear_intersecting_selections(self, self->cursor->y);
     linebuf_mark_line_dirty(self->linebuf, self->cursor->y);
     s->image_placeholder_marked = false;
+    s->line_has_no_multicell = false;
     init_segmentation_state(self, s);
 }
 
@@ -1094,12 +2677,6 @@ reinit_text_loop_line(Screen *self, text_loop_state *s) {
     const GraphemeSegmentationResult seg = s->seg;
     init_text_loop_line(self, s);
     s->seg = seg;
-}
-
-static void
-zero_cells(text_loop_state *s, CPUCell *c, GPUCell *g) {
-    *c = s->cc;
-    *g = s->g;
 }
 
 typedef Line *(linefunc_t)(Screen *, int);
@@ -1174,7 +2751,7 @@ checked_range_line(Screen *self, int y) {
     return NULL;
 }
 
-static bool
+bool
 range_line_is_continued(Screen *self, int y) {
     if (!(-(int)self->historybuf->count <= y && y < (int)self->lines)) return false;
     if (y < 0) return historybuf_is_line_continued(self->historybuf, -(y + 1));
@@ -1182,43 +2759,71 @@ range_line_is_continued(Screen *self, int y) {
     return self->linebuf == self->main_linebuf ? history_buf_endswith_wrap(self->historybuf) : false;
 }
 
+// The bidi record the text of range line y continues: that of the first line of its paragraph above it holding one, the
+// scrollback pager history included, 0 for none. Serializing lines from y writes the paragraph under it, see
+// ansi_bidi_continue().
+static uint8_t
+screen_bidi_record_above(Screen *self, int y) {
+    HistoryBuf *hb = self->historybuf;
+    const bool continues_history = self->linebuf == self->main_linebuf && hb->count;
+    if (y <= 0 && !continues_history) return 0;
+    // Only the rows of the active buffer and the history can be read, and a record can be on them only when their flags say so
+    if (!self->linebuf->bidi_stamped && !(continues_history && (hb->bidi_stamped || historybuf_pagerhist_bidi_open(hb)))) return 0;
+    uint8_t ans = 0;
+    Line line = {.xnum = self->columns, .text_cache = self->text_cache};
+    for (; range_line_is_continued(self, y); y--) {
+        if (y == -(int)hb->count) {
+            // the oldest history line continues the pager history, whose paragraph comes first
+            const uint8_t p = historybuf_pagerhist_bidi_open(hb);
+            if (p) ans = p;
+            break;
+        }
+        if (y == 0 && !continues_history) break;
+        const LineAttrs *a = y - 1 < 0 ? historybuf_attrs(hb, -y) : self->linebuf->line_attrs + y - 1;
+        if (a->bidi_stamp == BIDI_STAMP_NONE) continue;
+        range_line(self, y - 1, &line);
+        const uint8_t rec = line_bidi_record_for_ansi(&line);
+        if (rec) ans = rec;
+    }
+    return ans;
+}
+
 static void
 insert_characters(Screen *self, index_type at, index_type num, index_type y, bool replace_with_spaces) {
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_row_cells_moved(self, at, y);
     // insert num chars at x=at setting them to the value of the num chars at [at, at + num)
     // multiline chars at x >= at are deleted and multicell chars split at x=at
     // and x=at + num - 1 are deleted
     nuke_multiline_char_intersecting_with(self, at, self->columns, y, y + 1, replace_with_spaces);
     nuke_split_multicell_char_at_left_boundary(self, at, y, replace_with_spaces);
     CPUCell *cp;
-    GPUCell *gp;
-    linebuf_init_cells(self->linebuf, y, &cp, &gp);
+    linebuf_init_cells(self->linebuf, y, &cp, NULL);
+    bidi_note_maybe_unstamp(self->linebuf);
     // right shift
-    for (index_type i = self->columns - 1; i >= at + num; i--) {
-        cp[i] = cp[i - num];
-        gp[i] = gp[i - num];
-    }
+    for (index_type i = self->columns - 1; i >= at + num; i--) cp[i] = cp[i - num];
+    linebuf_mark_line_dirty(self->linebuf, y);
     nuke_incomplete_single_line_multicell_chars_in_range(self, at, at + num, y, replace_with_spaces);
     nuke_split_multicell_char_at_right_boundary(self, self->columns - 1, y, replace_with_spaces);
 }
 
 static void
-halve_multicell_width(Screen *self, index_type x_, index_type y_) {
-    const MulticellRows rows = multicell_char_rows(self, x_, y_);
+halve_multicell_width(Screen *self, MulticellColumns cols, MulticellRows rows, index_type y_) {
+    // Halve the width of the multicell char in the columns cols of rows,
+    // whose top row is y_. Only called for complete chars, as found by
+    // add_combining_chars(), which also provides cols and rows.
     const CPUCell *cp = linebuf_cpu_cells_for_line(self->linebuf, y_);
+    const index_type x_ = cols.start;
     const unsigned new_width = cp[x_].width / 2;
-    while (cp[x_].x && x_ > 0) x_--;
     const index_type ws = mcd_x_limit(&cp[x_]);
-    const index_type x_limit = MIN(self->columns, x_ + ws);
-    const index_type half_x_limit = MIN(self->columns, x_ + ws / 2);
+    const index_type x_limit = cols.limit;
+    const index_type half_x_limit = MIN(x_limit, x_ + ws / 2);
     for (int y = rows.start; y < rows.limit; y++) {
         Line *line = range_line_(self, y);
         CPUCell *c = line->cpu_cells;
-        GPUCell *g = line->gpu_cells;
         for (index_type x = x_; x < half_x_limit; x++) c[x].width = new_width;
         for (index_type x = half_x_limit; x < x_limit; x++) {
             // preserve the soft wrap marker, which lives in the last cell of the line
-            c[x] = (CPUCell){.next_char_was_wrapped = c[x].next_char_was_wrapped};
-            clear_sprite_position(g[x]);
+            c[x] = (CPUCell){.style_idx = c[x].style_idx, .next_char_was_wrapped = c[x].next_char_was_wrapped};
         }
         mark_range_line_dirty(self, y);
     }
@@ -1268,16 +2873,158 @@ screen_garbage_collect_text_cache(Screen *self) {
     text_cache_gc_process_linebuf(self->text_cache, gc, self->main_linebuf);
     text_cache_gc_process_linebuf(self->text_cache, gc, self->alt_linebuf);
     text_cache_gc_process_linebuf(self->text_cache, gc, self->paused_rendering.linebuf);
-    if (self->overlay_line.cpu_cells) text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.cpu_cells, self->overlay_line.xnum);
+    for (unsigned i = 0; i < MAX_SMOOTH_SCROLL_REGIONS; i++)
+        text_cache_gc_process_linebuf(self->text_cache, gc, self->paused_rendering.smooth_scroll.copies[i].overflow);
+    text_cache_gc_process_linebuf(self->text_cache, gc, self->paused_rendering.smooth_scroll.history_row);
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) text_cache_gc_process_linebuf(self->text_cache, gc, self->smooth_scroll.regions[i].overflow);
+    // The overlay buffers have columns cells, overlay_line.xnum is the length of the overlay text, which can be larger
+    if (self->overlay_line.cpu_cells) text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.cpu_cells, self->columns);
     if (self->overlay_line.original_line.cpu_cells)
-        text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.original_line.cpu_cells, self->overlay_line.xnum);
+        text_cache_gc_process_cells(self->text_cache, gc, self->overlay_line.original_line.cpu_cells, self->columns);
     tc_gc_end(self->text_cache, gc);
-    // the GC remaps all cache indices so the memoized tab indices are stale
+    // the GC remaps all cache indices so the memoized tab indices and the hashes of cells are stale
+    bidi_maps_invalidate_row_hashes(self);
     memset(&self->tab_cache, 0, sizeof(self->tab_cache));
+    GlyphRegistry *gr = tc_glyph_registry(self->text_cache);
+    memset(gr->bound_idx_plus_1, 0, sizeof(gr->bound_idx_plus_1));
+}
+
+static void
+style_gc_process_cells(CellStyleTable *t, StyleTableGC *gc, CPUCell *cells, size_t count, bool quantize) {
+    for (size_t i = 0; i < count; i++) cells[i].style_idx = style_table_gc_map(t, gc, cells[i].style_idx, quantize);
+}
+
+static void
+style_gc_process_linebuf(CellStyleTable *t, StyleTableGC *gc, LineBuf *lb) {
+    if (lb) style_gc_process_cells(t, gc, lb->cpu_cell_buf, (size_t)lb->ynum * lb->xnum, false);
+}
+
+static LineBuf *
+paused_linebuf_in_use(const Screen *self) {
+    // The snapshot of the screen taken when rendering was paused, NULL when
+    // rendering is not paused. The snapshot is kept after rendering resumes,
+    // but is unused then and entirely overwritten when rendering is next
+    // paused, so its cells must not keep styles alive.
+    return self->paused_rendering.expires_at ? self->paused_rendering.linebuf : NULL;
 }
 
 static bool
-add_combining_char(Screen *self, char_type ch, index_type x, index_type y) {
+garbage_collect_style_table(Screen *self, unsigned quantize_bits, bool degraded_if_full) {
+    // Remap the style index of every live cell onto a fresh table, so styles
+    // that are no longer used are freed. With quantize_bits, styles of cells
+    // in the scrollback get colors of reduced precision. Must only be called
+    // when no style indices are held outside of cells.
+    CellStyleTable *t = self->style_table;
+    StyleTableGC *gc = style_table_gc_begin(t, quantize_bits);
+    if (!gc) return false; // allocation failure, table left unchanged
+    // Screen cells first, so they get exact styles even if the table overflows
+    style_gc_process_linebuf(t, gc, self->main_linebuf);
+    style_gc_process_linebuf(t, gc, self->alt_linebuf);
+    style_gc_process_linebuf(t, gc, paused_linebuf_in_use(self));
+    if (self->paused_rendering.expires_at) {
+        for (unsigned i = 0; i < MAX_SMOOTH_SCROLL_REGIONS; i++) style_gc_process_linebuf(t, gc, self->paused_rendering.smooth_scroll.copies[i].overflow);
+        style_gc_process_linebuf(t, gc, self->paused_rendering.smooth_scroll.history_row);
+    }
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) style_gc_process_linebuf(t, gc, self->smooth_scroll.regions[i].overflow);
+    // The overlay buffers have columns cells, overlay_line.xnum is the length of the overlay text
+    if (self->overlay_line.cpu_cells) style_gc_process_cells(t, gc, self->overlay_line.cpu_cells, self->columns, false);
+    if (self->overlay_line.original_line.cpu_cells) style_gc_process_cells(t, gc, self->overlay_line.original_line.cpu_cells, self->columns, false);
+    for (index_type y = self->historybuf->count; y-- > 0;) {
+        style_gc_process_cells(t, gc, historybuf_cpu_cells(self->historybuf, y), self->historybuf->xnum, true);
+    }
+    const bool still_full = t->count > style_table_max_count(t) - style_table_max_count(t) / 8;
+    style_table_gc_end(t, gc, degraded_if_full && still_full);
+    return true;
+}
+
+static bool
+cells_use_styles(const CPUCell *cells, size_t count) {
+    for (size_t i = 0; i < count; i++)
+        if (cells[i].style_idx) return true;
+    return false;
+}
+
+static void
+reset_style_table_if_unused(Screen *self) {
+    // When the scrollback is empty and no cell has a style, empty the style
+    // table, which frees the memory used by styles from, for example, a burst
+    // of output with many colors. Done only on hard resets and clearing of the
+    // scrollback, not on erasing the screen, as full screen programs erase the
+    // screen on every redraw, and resetting would then force all their styles
+    // to be interned again and the style texture to be uploaded again every
+    // frame. Small tables are not worth emptying for the same reason.
+    if (self->historybuf->count || !style_table_is_worth_resetting(self->style_table)) return;
+    LineBuf *bufs[3] = {self->main_linebuf, self->alt_linebuf, paused_linebuf_in_use(self)};
+    for (unsigned i = 0; i < arraysz(bufs); i++) {
+        if (bufs[i] && cells_use_styles(bufs[i]->cpu_cell_buf, (size_t)bufs[i]->xnum * bufs[i]->ynum)) return;
+    }
+    if (self->overlay_line.cpu_cells && cells_use_styles(self->overlay_line.cpu_cells, self->columns)) return;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const LineBuf *lb = self->smooth_scroll.regions[i].overflow;
+        if (cells_use_styles(lb->cpu_cell_buf, (size_t)lb->xnum * lb->ynum)) return;
+    }
+    if (self->paused_rendering.expires_at) {
+        const LineBuf *paused[MAX_SMOOTH_SCROLL_REGIONS + 1] = {self->paused_rendering.smooth_scroll.history_row};
+        for (unsigned i = 0; i < MAX_SMOOTH_SCROLL_REGIONS; i++) paused[i + 1] = self->paused_rendering.smooth_scroll.copies[i].overflow;
+        for (unsigned i = 0; i < arraysz(paused); i++) {
+            if (paused[i] && cells_use_styles(paused[i]->cpu_cell_buf, (size_t)paused[i]->xnum * paused[i]->ynum)) return;
+        }
+    }
+    if (self->overlay_line.original_line.cpu_cells && cells_use_styles(self->overlay_line.original_line.cpu_cells, self->columns)) return;
+    style_table_reset(self->style_table);
+}
+
+void
+screen_garbage_collect_style_table(Screen *self) {
+    // Called when the style table is full. Tries collecting without loss of
+    // precision first and if that does not free at least an eighth of the
+    // table, reduces the color precision of cells in the scrollback. Cells on
+    // screen always keep their exact styles.
+    CellStyleTable *t = self->style_table;
+    const uint32_t threshold = style_table_max_count(t) - style_table_max_count(t) / 8;
+    // If the last collection had to reduce precision, start there, as the
+    // scrollback is likely still full of distinct styles
+    unsigned bits = style_table_last_gc_quantize_bits(t);
+    static const unsigned ladder[] = {0, 4, 3, 2};
+    unsigned start = 0;
+    for (unsigned i = 0; i < arraysz(ladder); i++)
+        if (ladder[i] == bits) start = i;
+    for (unsigned i = start; i < arraysz(ladder); i++) {
+        const bool last = i + 1 == arraysz(ladder);
+        if (!garbage_collect_style_table(self, ladder[i], last)) return;
+        if (t->count <= threshold) break;
+    }
+}
+
+// Glyph protocol print time binding: a cell with a codepoint from the
+// registration block that has a registered glyph stores the glyph in its text
+// cache entry, so that later changes to the registration do not affect it
+static void
+bind_registered_glyph(Screen *self, CPUCell *c, char_type first_char) {
+    GlyphRegistry *r = tc_glyph_registry(self->text_cache);
+    VGGlyph *g = glyph_registry_get(r, first_char);
+    if (!g) return;
+    const unsigned slot = first_char - GLYPH_BLOCK_FIRST;
+    if (!c->ch_is_idx && r->bound_idx_plus_1[slot]) {
+        // The common case of a cell with just the codepoint
+        c->ch_or_idx = r->bound_idx_plus_1[slot] - 1;
+        c->ch_is_idx = true;
+        return;
+    }
+    RAII_ListOfChars(lc);
+    text_in_cell(c, self->text_cache, &lc);
+    c->ch_or_idx = tc_get_or_insert_chars_with_glyph(self->text_cache, &lc, g);
+    c->ch_is_idx = true;
+    if (lc.count == 1) r->bound_idx_plus_1[slot] = c->ch_or_idx + 1;
+}
+
+static bool
+add_combining_chars(Screen *self, const char_type *chars, size_t num_chars, MulticellColumns cols, index_type y, MulticellRows *rows_of_char) {
+    // Adds num_chars combining chars to the char whose cells in row y are in
+    // the columns cols, as found by multicell_char_columns(), with a single
+    // lookup in the text cache. When the char is a multicell char, its rows
+    // are stored in rows_of_char, if not NULL.
+    const index_type x = cols.start;
     CPUCell *cpu_cells = linebuf_cpu_cells_for_line(self->linebuf, y);
     CPUCell *cell = cpu_cells + x;
     if (!cell_has_text(cell) || (cell->is_multicell && cell->y)) return false; // don't allow adding combining chars to a null cell
@@ -1285,20 +3032,36 @@ add_combining_char(Screen *self, char_type ch, index_type x, index_type y) {
     if (self->lc->count >= MAX_NUM_CODEPOINTS_PER_CELL) return false; // don't allow too many combining chars to prevent DoS attacks
     // must be computed before the char is changed
     const MulticellRows rows = cell->is_multicell ? multicell_char_rows(self, x, y) : (MulticellRows){0};
-    ensure_space_for_chars(self->lc, self->lc->count + 1);
-    self->lc->chars[self->lc->count++] = ch;
-    cell->ch_or_idx = tc_get_or_insert_chars(self->text_cache, self->lc);
+    // The text of a multicell char is in all its cells, so it can only be
+    // changed if they are all present, rather than some of them being in the
+    // overflow buffers of a smooth scroll region, which would leave cells
+    // that no longer continue the char. A char cut off at the bottom of the
+    // screen is fine, its rows below the screen are gone. Its top row is on
+    // screen as cell->y is zero.
+    if (cell->is_multicell && (!multicell_char_columns_are_complete(cpu_cells, cols) ||
+                               (rows.limit - rows.start < (int)cell->scale && ssr_char_continues_into_overflow_below(self, cell, x, rows))))
+        return false;
+    num_chars = MIN(num_chars, MAX_NUM_CODEPOINTS_PER_CELL - self->lc->count);
+    ensure_space_for_chars(self->lc, self->lc->count + num_chars);
+    memcpy(self->lc->chars + self->lc->count, chars, num_chars * sizeof(chars[0]));
+    self->lc->count += num_chars;
+    // A glyph bound to the cell when it was printed stays bound
+    cell->ch_or_idx = tc_get_or_insert_chars_with_glyph(self->text_cache, self->lc, cell_registered_glyph(cell, self->text_cache));
     cell->ch_is_idx = true;
     if (cell->is_multicell) {
         char_type ch_and_idx = cell->ch_and_idx;
-        while (cell->x && x) cell = cpu_cells + --x;
-        index_type x_limit = MIN(x + mcd_x_limit(cell), self->columns);
         // the cell has y == 0 so rows.start == y, the lower rows can be cut off at the bottom of the screen
         for (int v = rows.start; v < rows.limit; v++) {
             cpu_cells = linebuf_cpu_cells_for_line(self->linebuf, v);
-            for (index_type h = x; h < x_limit; h++) cpu_cells[h].ch_and_idx = ch_and_idx;
+            for (index_type h = cols.start; h < cols.limit; h++) cpu_cells[h].ch_and_idx = ch_and_idx;
             linebuf_mark_line_dirty(self->linebuf, v);
         }
+        if (rows_of_char) *rows_of_char = rows;
+    } else {
+        // The char can be on the row above the cursor, when the cursor is at
+        // the start of a line that the char soft wrapped onto, and the text
+        // loop only marks the cursor row dirty.
+        linebuf_mark_line_dirty(self->linebuf, y);
     }
     return true;
 }
@@ -1357,38 +3120,39 @@ move_cursor_past_multicell(Screen *self, index_type required_width) {
 }
 
 static void
-move_widened_char_past_multiline_chars(Screen *self, text_loop_state *s, CPUCell *cpu_cell, GPUCell *gpu_cell, index_type xpos, index_type ypos) {
+move_widened_char_past_multiline_chars(Screen *self, text_loop_state *s, CPUCell *cpu_cell, index_type xpos, index_type ypos) {
     index_type before = self->cursor->y;
     // Remove the char from its current cell before moving it, so that it is
     // not removed as a multicell char in the way and the cells it is moved to
     // can include its current cell
     const CPUCell c = *cpu_cell;
-    GPUCell g = *gpu_cell;
     *cpu_cell = (CPUCell){0};
-    *gpu_cell = (GPUCell){0};
+    // Taken before the move, which can scroll the char's row up
+    const bool may_reorder = self->linebuf->line_attrs[ypos].bidi_may_reorder;
     self->cursor->x = xpos;
     self->cursor->y = ypos;
     if (move_cursor_past_multicell(self, 2)) {
         CPUCell *cp;
-        GPUCell *gp;
-        clear_sprite_position(g);
-        linebuf_init_cells(self->linebuf, self->cursor->y, &cp, &gp);
+        linebuf_init_cells(self->linebuf, self->cursor->y, &cp, NULL);
+        linebuf_mark_line_dirty(self->linebuf, self->cursor->y);
+        if (UNLIKELY(self->linebuf->bidi_stamped)) {
+            bidi_line_gets_text(self, self->cursor->y);
+            self->linebuf->line_attrs[self->cursor->y].bidi_may_reorder |= may_reorder;
+        }
         cp[self->cursor->x] = c;
-        gp[self->cursor->x] = g;
         self->cursor->x++;
         cp[self->cursor->x] = c;
-        gp[self->cursor->x] = g;
         cp[self->cursor->x].x = 1;
         self->cursor->x++;
     }
-    if (self->cursor->y == before) init_segmentation_state(self, s);
+    // A move from the bottom row scrolls, leaving the cursor on the same row number with s->cp pointing at the row above it
+    if (self->cursor->y == before && linebuf_cpu_cells_for_line(self->linebuf, before) == s->cp) init_segmentation_state(self, s);
     else init_text_loop_line(self, s);
 }
 
 static void
-widen_cell_to_two(Screen *self, text_loop_state *s, CPUCell *cp, GPUCell *gp, index_type xpos) {
+widen_cell_to_two(Screen *self, text_loop_state *s, CPUCell *cp, index_type xpos) {
     CPUCell *cpu_cell = cp + xpos;
-    GPUCell *gpu_cell = gp + xpos;
     cpu_cell->is_multicell = true;
     cpu_cell->width = 2;
     cpu_cell->natural_width = true;
@@ -1397,17 +3161,17 @@ widen_cell_to_two(Screen *self, text_loop_state *s, CPUCell *cp, GPUCell *gp, in
         CPUCell *second = cp + xpos + 1;
         if (second->is_multicell) {
             if (second->y) {
-                move_widened_char_past_multiline_chars(self, s, cpu_cell, gpu_cell, xpos, s->prev.y);
+                move_widened_char_past_multiline_chars(self, s, cpu_cell, xpos, s->prev.y);
                 return;
             }
             nuke_multicell_char_at(self, xpos + 1, s->prev.y, false);
         }
-        zero_cells(s, second, gp + xpos + 1);
+        // both halves of the widened char have the style of the original cell
         self->cursor->x++;
         *second = *cpu_cell;
         second->x = 1;
     } else {
-        move_widened_char_past_multiline_chars(self, s, cpu_cell, gpu_cell, xpos, s->prev.y);
+        move_widened_char_past_multiline_chars(self, s, cpu_cell, xpos, s->prev.y);
     }
 }
 
@@ -1419,15 +3183,16 @@ is_emoji_presentation_base(char_type ch) {
 static void
 draw_combining_char(Screen *self, text_loop_state *s, char_type ch) {
     CPUCell *cp;
-    GPUCell *gp;
-    linebuf_init_cells(self->linebuf, s->prev.y, &cp, &gp);
-    index_type xpos = s->prev.x;
-    while (xpos && cp[xpos].is_multicell && cp[xpos].x) xpos--;
-    if (!add_combining_char(self, ch, xpos, s->prev.y) || self->lc->count < 2) return;
+    linebuf_init_cells(self->linebuf, s->prev.y, &cp, NULL);
+    // the extent of the char is found once, and used for both adding the char and halving its width
+    const MulticellColumns cols = multicell_char_columns(cp, self->columns, s->prev.x);
+    const index_type xpos = cols.start;
+    MulticellRows rows = {0};
+    if (!add_combining_chars(self, &ch, 1, cols, s->prev.y, &rows) || self->lc->count < 2) return;
     unsigned base_pos = self->lc->count - 2;
     if (ch == VS16) { // emoji presentation variation marker makes default text presentation emoji (narrow emoji) into wide emoji
         if (self->lc->chars[base_pos + 1] == VS16 && !cp[xpos].is_multicell && is_emoji_presentation_base(self->lc->chars[base_pos])) {
-            widen_cell_to_two(self, s, cp, gp, xpos);
+            widen_cell_to_two(self, s, cp, xpos);
         }
     } else if (ch == VS15) {
         const CPUCell *cpu_cell = cp + xpos;
@@ -1438,7 +3203,7 @@ draw_combining_char(Screen *self, text_loop_state *s, char_type ch) {
             is_emoji_presentation_base(self->lc->chars[base_pos])) {
             const index_type old_limit = xpos + cpu_cell->scale * cpu_cell->width;
             const index_type new_limit = old_limit - (cpu_cell->scale * cpu_cell->width) / 2;
-            halve_multicell_width(self, xpos, s->prev.y);
+            halve_multicell_width(self, cols, rows, s->prev.y);
             // The cursor only needs to move if it is on the same line as the
             // narrowed char, the char can also be on the previous line when the
             // cursor is at the start of a line that the char soft wrapped onto.
@@ -1453,7 +3218,7 @@ draw_combining_char(Screen *self, text_loop_state *s, char_type ch) {
         // s->seg was just stepped with ch, and grapheme_segmentation_step() copies the
         // grapheme break property of ch into it, so no extra char_props_for() lookup is
         // needed to reject the overwhelmingly common case of a zero width combining char.
-        widen_cell_to_two(self, s, cp, gp, xpos);
+        widen_cell_to_two(self, s, cp, xpos);
     }
 }
 
@@ -1508,6 +3273,63 @@ map_char(Screen *self, const uint32_t ch) {
     return UNLIKELY(self->charset.current && ch < 256) ? self->charset.current[ch] : ch;
 }
 
+static bool batched_non_ascii_draw_disabled_for_tests = false;
+
+static bool
+is_plain_combining_char(char_type ch, GraphemeSegmentationResult seg, CharProps props) {
+    // A combining char that only adds to the text of a cell, see draw_combining_char()
+    return ch != VS15 && ch != VS16 && !(seg.grapheme_break == GBP_SpacingMark && wcwidth_std(props) > 0);
+}
+
+static inline __attribute__((always_inline)) size_t
+draw_combining_char_run_(Screen *self, text_loop_state *s, char_type ch, CharProps props, const uint32_t *rest, size_t num_rest) {
+    // ch has been through grapheme segmentation, which added it to the previous
+    // cell. Plain combining chars directly following it are added along with it,
+    // with a single lookup in the text cache, rather than one for each char.
+    // Returns the number of chars from rest that were drawn.
+#define MAX_RUN 32u
+    char_type run[MAX_RUN];
+    size_t n = 0;
+    GraphemeSegmentationResult seg = s->seg;
+    if (!batched_non_ascii_draw_disabled_for_tests && is_plain_combining_char(ch, seg, props)) {
+        run[n++] = ch;
+        for (size_t k = 0; k < num_rest && n < MAX_RUN; k++) {
+            const char_type c = map_char(self, rest[k]);
+            const CharProps p = char_props_for(c);
+            if (p.is_invalid) break;
+            const GraphemeSegmentationResult next = grapheme_segmentation_step(seg, p);
+            if (!next.add_to_current_cell || !is_plain_combining_char(c, next, p)) break;
+            seg = next;
+            run[n++] = c;
+        }
+    }
+#undef MAX_RUN
+    if (n < 2) {
+        draw_combining_char(self, s, ch);
+        return 0;
+    }
+    CPUCell *cp;
+    linebuf_init_cells(self->linebuf, s->prev.y, &cp, NULL);
+    add_combining_chars(self, run, n, multicell_char_columns(cp, self->columns, s->prev.x), s->prev.y, NULL);
+    s->seg = seg;
+    return n - 1;
+}
+
+static size_t
+draw_combining_char_run(Screen *self, text_loop_state *s, char_type ch, CharProps props, const uint32_t *rest, size_t num_rest) {
+    return draw_combining_char_run_(self, s, ch, props, rest, num_rest);
+}
+
+static size_t
+draw_combining_char_run_implicit(Screen *self, text_loop_state *s, char_type ch, CharProps props, const uint32_t *rest, size_t num_rest, uint8_t record) {
+    const char_type before = s->prev.cc->ch_and_idx;
+    const size_t n = draw_combining_char_run_(self, s, ch, props, rest, num_rest);
+    bool may_reorder = bidi_char_sets_may_reorder(ch);
+    for (size_t i = 0; i < n && !may_reorder; i++) may_reorder = bidi_char_sets_may_reorder(map_char(self, rest[i]));
+    record_combining_write(self, s, before, record, may_reorder);
+    return n;
+}
+
 static void
 draw_control_char(Screen *self, text_loop_state *s, uint32_t ch) {
     switch (ch) {
@@ -1527,8 +3349,11 @@ draw_control_char(Screen *self, text_loop_state *s, uint32_t ch) {
                 } else if (self->columns > 0) {
                     self->cursor->x = self->columns - 1;
                     if (s->cp[self->cursor->x].is_multicell) {
-                        if (s->cp[self->cursor->x].y) move_cursor_past_multicell(self, 1);
-                        else replace_multicell_char_under_cursor_with_spaces(self);
+                        if (s->cp[self->cursor->x].y) {
+                            // The move can go to another row or scroll
+                            move_cursor_past_multicell(self, 1);
+                            init_text_loop_line(self, s);
+                        } else replace_multicell_char_under_cursor_with_spaces(self);
                     }
                     screen_tab(self);
                 }
@@ -1539,31 +3364,163 @@ draw_control_char(Screen *self, text_loop_state *s, uint32_t ch) {
         case SO: screen_change_charset(self, 1); break;
         case LF:
         case VT:
-        case FF:
+        case FF: {
+            // When the cursor is on the bottom margin, the line feed scrolls
+            // and the cursor ends up on the bottom line, which is cleared
+            const bool scrolls = self->cursor->y == self->margin_bottom;
             screen_linefeed(self);
             init_text_loop_line(self, s);
-            break;
+            s->line_has_no_multicell = scrolls && self->cursor->y == self->margin_bottom;
+        } break;
         case CR:
             screen_carriage_return(self);
             init_segmentation_state(self, s);
             break;
         default: break;
     }
+    if (ch != LF && ch != VT && ch != FF && ch != CR && ch != HT) s->line_has_no_multicell = false;
 }
 
-static void
-draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_state *s) {
+static_assert(sizeof(CPUCell) == 3 * sizeof(uint32_t), "draw_non_ascii_run() needs updating");
+
+static inline uint32_t
+cell_word(const CPUCell *c, unsigned which) {
+    uint32_t ans;
+    memcpy(&ans, (const uint8_t *)c + which * sizeof(ans), sizeof(ans));
+    return ans;
+}
+
+static inline uint64_t
+pack_cell_words(uint32_t first, uint32_t second) {
+    // Two consecutive 32 bit words of cell memory as one 64 bit value
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return first | ((uint64_t)second << 32);
+#else
+    return ((uint64_t)first << 32) | second;
+#endif
+}
+
+// The words of the two cells of a wide char except their first words, which are the char
+typedef struct WideCellWords {
+    uint32_t first1, first2;
+    uint64_t second12;
+} WideCellWords;
+
+static inline WideCellWords
+wide_cell_words(const CPUCell *cc) {
+    // Built from constants, as building cells with bitfield assignments makes
+    // compilers do partial stores to the stack and reload them with wider loads,
+    // which stall on store forwarding. Only the hyperlink and style are taken from cc.
+    static const CPUCell first = {.is_multicell = true, .width = 2, .scale = 1, .natural_width = true};
+    static const CPUCell second = {.is_multicell = true, .width = 2, .scale = 1, .natural_width = true, .x = 1};
+    static const CPUCell hyperlink = {.hyperlink_id = (hyperlink_id_type)~0u, .style_idx = MAX_NUM_OF_STYLES - 1};
+#define W(cell, which) cell_word(cell, which)
+#define HL(which) (W(cc, which) & W(&hyperlink, which))
+    return (WideCellWords){
+        .first1 = W(&first, 1) | HL(1),
+        .first2 = W(&first, 2) | HL(2),
+        .second12 = pack_cell_words(W(&second, 1) | HL(1), W(&second, 2) | HL(2)),
+    };
+#undef HL
+#undef W
+}
+
+static inline void
+write_wide_cells(CPUCell *dest, char_type ch, const WideCellWords *w) {
+    // Writes the two cells of a wide char as 64 bit values built in registers
+    const uint32_t ch_word = ch & 0x7fffffff;
+    const uint64_t first = pack_cell_words(ch_word, w->first1), second = pack_cell_words(w->first2, ch_word);
+    uint8_t *d = (uint8_t *)dest;
+    memcpy(d, &first, sizeof(first));
+    memcpy(d + sizeof(first), &second, sizeof(second));
+    memcpy(d + 2 * sizeof(first), &w->second12, sizeof(w->second12));
+}
+
+// Not inlined, so that it gets its own register allocation rather than competing
+// with the rest of draw_text_loop_() for registers. It is called once per run.
+__attribute__((noinline)) static size_t
+draw_non_ascii_run(Screen *self, text_loop_state *s, const uint32_t *chars, size_t num_chars) {
+    // Batched fast path: draw a run of non-ASCII chars each of which starts a new cell
+    // of width one or two in the current line, keeping all state in locals so it is
+    // not reloaded for every char. Stops at the first char needing the scalar path:
+    // ASCII, invalid, zero width, a char that combines with the previous cell, the
+    // image placeholder, a glyph protocol codepoint, a char that does not fit in the
+    // line or an existing multicell cell. The caller must ensure there is no charset translation or insert mode and
+    // that the cursor is within the line. Returns the number of chars drawn.
+    const index_type columns = self->columns;
+    index_type x = self->cursor->x, last_x = x;
+    CPUCell *cp = s->cp;
+    // Cells are written from these templates as 64 bit values built in registers.
+    // The first word of a cell is its char. Assembling cells as CPUCell values or
+    // word arrays makes compilers build them on the stack with partial stores and
+    // reload them with wider loads, which stall on store forwarding.
+    // The words are kept in scalars rather than arrays, which compilers place on
+    // the stack. The first word of a cell is its char, written separately.
+    const uint32_t narrow1 = cell_word(&s->cc, 1), narrow2 = cell_word(&s->cc, 2);
+    const WideCellWords wide = wide_cell_words(&s->cc);
+    GraphemeSegmentationResult seg = s->seg;
+    // The segmentation step depends only on the current state and the grapheme
+    // segmentation property of the char, and in a run of text the same pair
+    // repeats, so cache the last step. This breaks the chain of dependent table
+    // lookups that otherwise links every char to the previous one.
+    uint32_t cached_seg_key = UINT32_MAX;
+    GraphemeSegmentationResult cached_seg = {0};
+    size_t i = 0;
+    for (; i < num_chars; i++) {
+        const char_type ch = chars[i];
+        if (ch < DEL || ch == IMAGE_PLACEHOLDER_CHAR || is_glyph_block_codepoint(ch)) break;
+        const CharDrawInfo info = char_draw_info_for(ch);
+        const index_type width = info.cells;
+        if (width == 0 || x + width > columns || cp[x].is_multicell) break;
+        if (width == 2 && cp[x + 1].is_multicell) break;
+        const uint32_t seg_key = ((uint32_t)seg.val << 8) | info.grapheme_segmentation_property;
+        if (seg_key != cached_seg_key) {
+            cached_seg = grapheme_segmentation_step_for_property(seg, info.grapheme_segmentation_property);
+            cached_seg_key = seg_key;
+        }
+        if (cached_seg.add_to_current_cell) break;
+        seg = cached_seg;
+        last_x = x;
+        const uint32_t ch_word = ch & 0x7fffffff;
+        uint8_t *dest = (uint8_t *)(cp + x);
+        if (width == 1) {
+            const uint64_t first = pack_cell_words(ch_word, narrow1);
+            memcpy(dest, &first, sizeof(first));
+            memcpy(dest + sizeof(first), &narrow2, sizeof(narrow2));
+            x++;
+        } else {
+            write_wide_cells(cp + x, ch, &wide);
+            x += 2;
+        }
+    }
+    if (i) {
+        self->cursor->x = x;
+        self->last_graphic_char = chars[i - 1];
+        s->seg = seg;
+        s->prev.y = self->cursor->y;
+        s->prev.x = last_x;
+        s->prev.cc = cp + last_x;
+    }
+    return i;
+}
+
+static inline __attribute__((always_inline)) void
+draw_text_loop_(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_state *s, const bool implicit, const uint8_t record) {
     init_text_loop_line(self, s);
+    if (implicit) draw_loop_line_gets_text(self, self->cursor->y);
     int char_width;
 #define TEMPLATE_CELLS 16
     CPUCell cpu_template[TEMPLATE_CELLS];
-    GPUCell gpu_template[TEMPLATE_CELLS];
     bool templates_initialized = false;
     for (size_t i = 0; i < num_chars; i++) {
         uint32_t ch = map_char(self, chars[i]);
         if (ch < DEL && s->seg.grapheme_break <= GBP_None) { // fast path for printable ASCII
             if (ch < ' ') {
+                // A control char that leaves the cursor on its row stores no text there, or a tab cell after the line's check; a
+                // line feed that scrolls leaves the cursor on a cleared line
+                const index_type y = self->cursor->y;
                 draw_control_char(self, s, ch);
+                if (implicit && self->cursor->y != y) draw_loop_line_gets_text(self, self->cursor->y);
                 continue;
             }
             if (LIKELY(!self->charset.current && !self->modes.mIRM && self->cursor->x < self->columns)) {
@@ -1575,23 +3532,20 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
                 CPUCell *cp = s->cp + self->cursor->x;
                 size_t n = printable_ascii_run_length(chars + i, limit);
                 // clamp the run at the first multicell cell, it needs the scalar path
-                size_t m = 0;
-                while (m + 4 <= n && !(cp[m].is_multicell | cp[m + 1].is_multicell | cp[m + 2].is_multicell | cp[m + 3].is_multicell)) m += 4;
-                while (m < n && !cp[m].is_multicell) m++;
-                n = m;
+                if (!s->line_has_no_multicell) {
+                    size_t m = 0;
+                    while (m + 4 <= n && !(cp[m].is_multicell | cp[m + 1].is_multicell | cp[m + 2].is_multicell | cp[m + 3].is_multicell)) m += 4;
+                    while (m < n && !cp[m].is_multicell) m++;
+                    n = m;
+                }
                 if (n) {
-                    GPUCell *gp = s->gp + self->cursor->x;
                     const CPUCell cc = s->cc;
-                    const GPUCell g = s->g;
                     // fill full blocks of cells from templates, the constant sized
                     // memcpy is inlined by the compiler as wide stores, the chars
                     // then need only a single 32-bit store per cell
                     if (n >= TEMPLATE_CELLS / 4 && !templates_initialized) {
                         templates_initialized = true;
-                        for (unsigned k = 0; k < TEMPLATE_CELLS; k++) {
-                            cpu_template[k] = cc;
-                            gpu_template[k] = g;
-                        }
+                        for (unsigned k = 0; k < TEMPLATE_CELLS; k++) cpu_template[k] = cc;
                     }
 #define copy_template(dest, template, elem)                                                                \
     {                                                                                                      \
@@ -1609,7 +3563,6 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
     }
                     size_t j;
                     copy_template(cp, cpu_template, cc);
-                    copy_template(gp, gpu_template, g);
 #undef copy_template
                     for (j = 0; j < n; j++) cell_set_char(cp + j, chars[i + j]);
                     self->last_graphic_char = chars[i + n - 1];
@@ -1617,6 +3570,7 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
                     s->prev.x = self->cursor->x + n - 1;
                     s->prev.cc = cp + n - 1;
                     self->cursor->x += n;
+                    if (implicit) record_written_line(self, self->cursor->y, record);
                     s->seg = (GraphemeSegmentationResult){.grapheme_break = GBP_None};
                     i += n - 1;
                     continue;
@@ -1625,15 +3579,34 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
             }
             char_width = 1;
             s->seg = (GraphemeSegmentationResult){.grapheme_break = GBP_None};
+            s->line_has_no_multicell = false;
         } else {
+            s->line_has_no_multicell = false;
+            if (ch > DEL && LIKELY(!self->charset.current && !self->modes.mIRM && self->cursor->x < self->columns) &&
+                !batched_non_ascii_draw_disabled_for_tests) {
+                const size_t n = draw_non_ascii_run(self, s, chars + i, num_chars - i);
+                if (n) {
+                    if (implicit) {
+                        record_written_line(self, self->cursor->y, record);
+                        bidi_note_run(self, self->cursor->y);
+                    }
+                    i += n - 1;
+                    continue;
+                }
+            }
             CharProps cp = char_props_for(ch);
             if (cp.is_invalid) {
-                if (ch < ' ') draw_control_char(self, s, ch);
+                if (ch < ' ') {
+                    const index_type y = self->cursor->y;
+                    draw_control_char(self, s, ch);
+                    if (implicit && self->cursor->y != y) draw_loop_line_gets_text(self, self->cursor->y);
+                }
                 continue;
             }
             s->seg = grapheme_segmentation_step(s->seg, cp);
             if (UNLIKELY(s->seg.add_to_current_cell && s->prev.cc)) {
-                draw_combining_char(self, s, ch);
+                if (implicit) i += draw_combining_char_run_implicit(self, s, ch, cp, chars + i + 1, num_chars - i - 1, record);
+                else i += draw_combining_char_run(self, s, ch, cp, chars + i + 1, num_chars - i - 1);
                 continue;
             }
             char_width = wcwidth_std(cp);
@@ -1642,7 +3615,13 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
                     // Preserve zero width chars as combining chars even though
                     // they were not added to the prev cell by grapheme segmentation.
                     // Zero width chars can only be represented as combining chars.
-                    if (s->prev.cc) draw_combining_char(self, s, ch);
+                    if (s->prev.cc) {
+                        const char_type before = s->prev.cc->ch_and_idx;
+                        draw_combining_char(self, s, ch);
+                        if (implicit) record_combining_write(self, s, before, record, bidi_char_sets_may_reorder(ch));
+                    } else if (implicit && (ch | 1) == 0x200f) { // LRM, RLM
+                        set_record_at_leading_mark(self, ch, record);
+                    }
                     continue;
                 }
                 char_width = 1;
@@ -1653,6 +3632,7 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
             if (s->cp[self->cursor->x].y) {
                 move_cursor_past_multicell(self, 1);
                 reinit_text_loop_line(self, s);
+                if (implicit) draw_loop_line_gets_text(self, self->cursor->y);
             } else nuke_multicell_char_at(self, self->cursor->x, self->cursor->y, s->cp[self->cursor->x].x != 0);
         }
 
@@ -1662,6 +3642,7 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
             if (self->modes.mDECAWM) {
                 continue_to_next_line(self);
                 reinit_text_loop_line(self, s);
+                if (implicit) draw_loop_line_gets_text(self, self->cursor->y);
             } else self->cursor->x = self->columns - char_width;
             CPUCell *c = &s->cp[self->cursor->x];
             if (c->is_multicell) {
@@ -1669,6 +3650,7 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
                     // this also removes the multicell chars in the cells the char will occupy
                     move_cursor_past_multicell(self, char_width);
                     reinit_text_loop_line(self, s);
+                    if (implicit) draw_loop_line_gets_text(self, self->cursor->y);
                 } else nuke_multicell_char_at(self, self->cursor->x, self->cursor->y, c->x > 0);
             }
         }
@@ -1685,58 +3667,81 @@ draw_text_loop(Screen *self, const uint32_t *chars, size_t num_chars, text_loop_
                     self->cursor->x++;
                     move_cursor_past_multicell(self, 2);
                     reinit_text_loop_line(self, s);
+                    if (implicit) draw_loop_line_gets_text(self, self->cursor->y);
                     fc = s->cp + self->cursor->x;
                     second = fc + 1;
                 } else nuke_multicell_char_at(self, self->cursor->x + 1, self->cursor->y, true);
             }
-            zero_cells(s, fc, s->gp + self->cursor->x);
-            *fc = (CPUCell){.ch_or_idx = ch, .is_multicell = true, .width = 2, .scale = 1, .natural_width = true, .hyperlink_id = s->cc.hyperlink_id};
-            *second = *fc;
-            second->x = 1;
-            s->gp[self->cursor->x + 1] = s->gp[self->cursor->x];
+            const WideCellWords wide = wide_cell_words(&s->cc);
+            write_wide_cells(fc, ch, &wide);
             s->prev.y = self->cursor->y;
             s->prev.x = self->cursor->x;
             s->prev.cc = fc;
             self->cursor->x += 2;
         } else {
-            zero_cells(s, fc, s->gp + self->cursor->x);
+            *fc = s->cc;
             cell_set_char(fc, ch);
+            if (UNLIKELY(is_glyph_block_codepoint(ch))) bind_registered_glyph(self, fc, ch);
             s->prev.y = self->cursor->y;
             s->prev.x = self->cursor->x;
             s->prev.cc = fc;
             self->cursor->x++;
             fc->is_multicell = false;
         }
+        if (implicit) {
+            record_written_line(self, s->prev.y, record);
+            LineAttrs *a = self->linebuf->line_attrs + s->prev.y;
+            if (!a->bidi_may_reorder && bidi_codepoint_may_reorder(ch)) a->bidi_may_reorder = true;
+        }
     }
 #undef init_line
 #undef TEMPLATE_CELLS
 }
 
-#define PREPARE_FOR_DRAW_TEXT                                                                                                       \
-    if (tc_should_gc(self->text_cache)) screen_garbage_collect_text_cache(self);                                                    \
-    const bool force_underline = OPT(underline_hyperlinks) == UNDERLINE_ALWAYS && self->active_hyperlink_id != 0;                   \
-    CellAttrs attrs = cursor_to_attrs(self->cursor);                                                                                \
-    if (force_underline) attrs.decoration = OPT(url_style);                                                                         \
-    text_loop_state s = {                                                                                                           \
-        .cc = (CPUCell){.hyperlink_id = self->active_hyperlink_id},                                                                 \
-        .g = (GPUCell){                                                                                                             \
-            .attrs = attrs,                                                                                                         \
-            .fg = self->cursor->sgr.fg & COL_MASK,                                                                                  \
-            .bg = self->cursor->sgr.bg & COL_MASK,                                                                                  \
-            .decoration_fg = force_underline ? ((OPT(url_color) & COL_MASK) << 8) | 2 : self->cursor->sgr.decoration_fg & COL_MASK, \
-        }};
+#define PREPARE_FOR_DRAW_TEXT                                                                                         \
+    if (tc_should_gc(self->text_cache)) screen_garbage_collect_text_cache(self);                                      \
+    if (style_table_needs_gc(self->style_table)) screen_garbage_collect_style_table(self);                            \
+    const bool force_underline = OPT(underline_hyperlinks) == UNDERLINE_ALWAYS && self->active_hyperlink_id != 0;     \
+    CellStyle draw_style = self->cursor->style;                                                                       \
+    uint32_t draw_style_idx;                                                                                          \
+    if (force_underline) {                                                                                            \
+        draw_style.attrs.decoration = OPT(url_style);                                                                 \
+        draw_style.decoration_fg = ((OPT(url_color) & COL_MASK) << 8) | 2;                                            \
+        draw_style_idx = style_table_intern_cached(self->style_table, &draw_style, &self->hyperlink_style_idx_cache); \
+    } else draw_style_idx = screen_cursor_style_idx(self);                                                            \
+    text_loop_state s = {                                                                                             \
+        .cc = (CPUCell){.hyperlink_id = self->active_hyperlink_id, .style_idx = draw_style_idx},                      \
+    };
 
 static void
 draw_text(Screen *self, const uint32_t *chars, size_t num_chars) {
     PREPARE_FOR_DRAW_TEXT;
     self->is_dirty = true;
-    draw_text_loop(self, chars, num_chars, &s);
+    draw_text_loop_(self, chars, num_chars, &s, false, 0);
+}
+
+// Text records each line it is written to, with the empty record when bidi mode is off or under force_ltr, and drops a record
+// its line kept while it held no text
+static void
+draw_text_implicit(Screen *self, const uint32_t *chars, size_t num_chars) {
+    PREPARE_FOR_DRAW_TEXT;
+    self->is_dirty = true;
+    draw_text_loop_(self, chars, num_chars, &s, true, current_bidi_record(self).val);
+}
+
+static void
+draw_text_in_mode(Screen *self, const uint32_t *chars, size_t num_chars) {
+#ifdef DEBUG
+    if ((self->modes.mBDSM || self->linebuf->bidi_stamped) && !self->bidi_records_writes) fatal("bidi: writes that must be recorded take the plain draw loop");
+#endif
+    if (UNLIKELY(self->bidi_records_writes)) draw_text_implicit(self, chars, num_chars);
+    else draw_text(self, chars, num_chars);
 }
 
 void
 screen_draw_text(Screen *self, const uint32_t *chars, size_t num_chars) {
     screen_on_input(self);
-    draw_text(self, chars, num_chars);
+    draw_text_in_mode(self, chars, num_chars);
 }
 
 static void
@@ -1748,10 +3753,12 @@ draw_codepoint(Screen *self, char_type ch) {
 
 void
 screen_align(Screen *self) {
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_screen_erased(self);
     self->margin_top = 0;
     self->margin_bottom = self->lines - 1;
     screen_cursor_position(self, 1, 1);
     linebuf_clear(self->linebuf, 'E');
+    bidi_note_maybe_unstamp(self->linebuf);
 }
 
 static size_t
@@ -1776,6 +3783,15 @@ decode_utf8_safe_string(const uint8_t *src, size_t sz, uint32_t *dest) {
     return d;
 }
 
+static bool
+multicell_may_reorder(unsigned scale, const ListOfChars *lc) {
+    if (scale > 1) return true;
+    for (size_t i = 0; i < lc->count; i++) {
+        if (bidi_char_sets_may_reorder(lc->chars[i])) return true;
+    }
+    return false;
+}
+
 static void
 handle_fixed_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *lc) {
     index_type width = mcd.width * mcd.scale;
@@ -1785,8 +3801,17 @@ handle_fixed_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *lc)
     lc->count = MIN(lc->count, MAX_NUM_CODEPOINTS_PER_CELL);
     PREPARE_FOR_DRAW_TEXT;
     mcd.hyperlink_id = s.cc.hyperlink_id;
+    mcd.style_idx = s.cc.style_idx;
     cell_set_chars(&mcd, self->text_cache, lc);
+    if (lc->count && is_glyph_block_codepoint(lc->chars[0])) bind_registered_glyph(self, &mcd, lc->chars[0]);
+    // The rows the char is written to are checked before the multicell chars in its way are removed: a row whose text the char
+    // replaces keeps its record
+    const index_type first_row = self->cursor->y;
+    if (UNLIKELY(self->linebuf->bidi_stamped)) {
+        for (index_type y = first_row; y < MIN(first_row + height, self->lines); y++) bidi_line_gets_text(self, y);
+    }
     move_cursor_past_multicell(self, width);
+    const bool moved_to_other_rows = self->cursor->y != first_row;
     if (height > 1) {
         if (self->cursor->y <= self->margin_bottom) {
             index_type available_height = self->margin_bottom - self->cursor->y + 1;
@@ -1808,15 +3833,23 @@ handle_fixed_width_multicell_command(Screen *self, CPUCell mcd, ListOfChars *lc)
             if (self->modes.mIRM) insert_characters(self, self->cursor->x, width, y, true);
         }
     }
+    // Only a record written in bidi mode sets the flag, so with the mode off it cannot change in the loop
+    const bool records_rows = self->modes.mBDSM || self->linebuf->bidi_stamped;
+    const bool may_reorder = UNLIKELY(records_rows) && multicell_may_reorder(mcd.scale, lc);
     for (index_type y = self->cursor->y; y < self->cursor->y + height; y++) {
-        linebuf_init_cells(self->linebuf, y, &s.cp, &s.gp);
+        linebuf_init_cells(self->linebuf, y, &s.cp, NULL);
         linebuf_mark_line_dirty(self->linebuf, y);
+        if (UNLIKELY(records_rows)) {
+            if (self->linebuf->bidi_stamped && moved_to_other_rows) bidi_line_gets_text(self, y);
+            // The first record written to a buffer is written while its flag is still unset
+            record_written_line(self, y, current_bidi_record(self).val);
+            bidi_note_may_reorder(self, y, may_reorder);
+        }
         mcd.x = 0;
         mcd.y = y - self->cursor->y;
         for (index_type x = self->cursor->x; x < self->cursor->x + width; x++, mcd.x++) {
             if (s.cp[x].is_multicell) nuke_multicell_char_at(self, x, y, s.cp[x].x + s.cp[x].y > 0);
             s.cp[x] = mcd;
-            s.gp[x] = s.g;
         }
     }
     self->cursor->x += width;
@@ -1889,6 +3922,7 @@ screen_handle_multicell_command(Screen *self, const MultiCellCommand *cmd, const
 void
 screen_alignment_display(Screen *self) {
     // https://www.vt100.net/docs/vt510-rm/DECALN.html
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_screen_erased(self);
     screen_cursor_position(self, 1, 1);
     self->margin_top = 0;
     self->margin_bottom = self->lines - 1;
@@ -1921,7 +3955,7 @@ select_graphic_rendition(Screen *self, int *params, unsigned int count, bool is_
             num = MIN(num, self->columns - x);
             for (index_type y = region.top; y < MIN(region.bottom + 1, self->lines); y++) {
                 linebuf_init_line(self->linebuf, y);
-                apply_sgr_to_cells(self->linebuf->line->gpu_cells + x, num, params, count, is_group);
+                apply_sgr_to_cells(self->style_table, self->linebuf->line->cpu_cells + x, num, params, count, is_group);
             }
         } else {
             index_type x, num;
@@ -1931,7 +3965,7 @@ select_graphic_rendition(Screen *self, int *params, unsigned int count, bool is_
                     x = MIN(region.left, self->columns - 1);
                     num = region.right >= x ? region.right - x + 1 : 0;
                     num = MIN(self->columns - x, num);
-                    apply_sgr_to_cells(self->linebuf->line->gpu_cells + x, num, params, count, is_group);
+                    apply_sgr_to_cells(self->style_table, self->linebuf->line->cpu_cells + x, num, params, count, is_group);
                 }
             } else {
                 for (index_type y = region.top; y < MIN(region.bottom + 1, self->lines); y++) {
@@ -1946,13 +3980,13 @@ select_graphic_rendition(Screen *self, int *params, unsigned int count, bool is_
                         num = self->columns;
                     }
                     linebuf_init_line(self->linebuf, y);
-                    apply_sgr_to_cells(self->linebuf->line->gpu_cells + x, num, params, count, is_group);
+                    apply_sgr_to_cells(self->style_table, self->linebuf->line->cpu_cells + x, num, params, count, is_group);
                 }
             }
         }
     } else {
         cursor_from_sgr(self->cursor, params, count, is_group);
-        self->sgr_blink_was_used |= self->cursor->sgr.blink;
+        self->sgr_blink_was_used |= self->cursor->style.attrs.blink;
     }
 }
 
@@ -2157,21 +4191,175 @@ screen_handle_graphics_command(Screen *self, const GraphicsCommand *cmd, const u
 }
 // }}}
 
+// Glyph protocol {{{
+
+// The payload formats kitty supports, advertised in the reply to the s verb
+#define GLYPH_SUPPORTED_FORMATS "vg"
+
+static bool
+glyph_is_registered(Screen *self, char_type cp) {
+    return glyph_registry_get(tc_glyph_registry(self->text_cache), cp) != NULL;
+}
+
+static void
+glyph_reply(Screen *self, const char *fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (n > 0 && (size_t)n < sizeof(buf)) write_escape_code_to_child(self, ESC_APC, buf);
+}
+
+static void
+glyph_handle_query(Screen *self, const GlyphCommand *cmd) {
+    if (cmd->has_cp == cmd->has_grapheme) {
+        glyph_reply(self, GLYPH_PROTOCOL_PREFIX "q;reason=malformed_query");
+        return;
+    }
+    if (cmd->has_grapheme) {
+        // kitty does not support grapheme queries
+        if (!cmd->grapheme_valid) {
+            glyph_reply(self, GLYPH_PROTOCOL_PREFIX "q;reason=malformed_query");
+            return;
+        }
+        // At most six hex digits and a comma per codepoint
+        char hex[GLYPH_MAX_GRAPHEME_CODEPOINTS * 7 + 1];
+        static_assert(sizeof("10ffff,") - 1 == 7, "fix the size of hex");
+        size_t pos = 0;
+        for (unsigned i = 0; i < cmd->grapheme_count && pos < sizeof(hex); i++) {
+            const int n = snprintf(hex + pos, sizeof(hex) - pos, "%s%x", i ? "," : "", cmd->grapheme[i]);
+            if (n < 0) return;
+            pos += n;
+        }
+        if (pos >= sizeof(hex)) return;
+        glyph_reply(self, GLYPH_PROTOCOL_PREFIX "q;grapheme=%s;reason=unsupported", hex);
+        return;
+    }
+    if (!cmd->cp_valid) {
+        glyph_reply(self, GLYPH_PROTOCOL_PREFIX "q;reason=malformed_query");
+        return;
+    }
+    if (is_glyph_block_codepoint(cmd->cp)) {
+        // No font assigns glyphs to codepoints in the block, so whether the
+        // codepoint is covered is determined by the registrations alone.
+        glyph_reply(self, GLYPH_PROTOCOL_PREFIX "q;cp=%x;status=%s", cmd->cp, glyph_is_registered(self, cmd->cp) ? "glossary" : "");
+    } else {
+        // Determining font coverage requires font fallback which is too slow
+        // to do while parsing input, so kitty never does it.
+        glyph_reply(self, GLYPH_PROTOCOL_PREFIX "q;cp=%x;reason=unknown", cmd->cp);
+    }
+}
+
+// Reply to r and c, reason is NULL on success
+static void
+glyph_reply_status(Screen *self, const GlyphCommand *cmd, const char *reason) {
+    if (cmd->reply == GLYPH_REPLY_NONE || (cmd->reply == GLYPH_REPLY_FAILURES && !reason)) return;
+    char cp[32] = {0};
+    if (cmd->has_cp && cmd->cp_valid) snprintf(cp, sizeof(cp), "cp=%x;", cmd->cp);
+    if (reason) glyph_reply(self, GLYPH_PROTOCOL_PREFIX "%c;%sstatus=1;reason=%s", cmd->verb, cp, reason);
+    else glyph_reply(self, GLYPH_PROTOCOL_PREFIX "%c;%sstatus=0", cmd->verb, cp);
+}
+
+// Whether the glyphs kept alive by this window are within the per window limits
+static bool
+glyph_window_within_limits(Screen *self, const VGGlyph *new_glyph) {
+    const GlyphRegistry *r = tc_glyph_registry(self->text_cache);
+    size_t count, memory;
+#define within                                                \
+    (tc_bound_glyph_usage(self->text_cache, &count, &memory), \
+     count + r->num_registered + 1 <= vg_window_glyph_limit && memory + r->memory + new_glyph->memory_size <= vg_window_memory_limit)
+    if (within) return true;
+    // Text that used glyphs may have been erased or scrolled out of the
+    // scrollback, garbage collect to release its glyphs. At most once a
+    // second, as it is expensive with a large scrollback.
+    const monotonic_t now = monotonic();
+    if (tc_has_adds_since_last_gc(self->text_cache) && (!self->last_glyph_limit_gc_at || now - self->last_glyph_limit_gc_at > s_double_to_monotonic_t(1.0))) {
+        self->last_glyph_limit_gc_at = now;
+        screen_garbage_collect_text_cache(self);
+        return within;
+    }
+#undef within
+    return false;
+}
+
+static const char *
+glyph_register(Screen *self, const GlyphCommand *cmd, const uint8_t *buf) {
+    if (!cmd->has_cp || !cmd->cp_valid || !is_glyph_block_codepoint(cmd->cp)) return "out_of_namespace";
+    if (cmd->fmt != GLYPH_FMT_VG) return "unsupported_format";
+    if (!cmd->has_vb || !cmd->placement_valid) return "malformed_payload";
+    if (cmd->payload_sz > GLYPH_MAX_PAYLOAD_SIZE) return "payload_too_large";
+    VGError err;
+    const char *err_msg;
+    VGGlyph *g = vg_parse(buf + cmd->payload_start, cmd->payload_sz, &cmd->placement, &err, &err_msg);
+    if (!g) {
+        switch (err) {
+            case VG_OK:
+            case VG_MALFORMED: return "malformed_payload";
+            case VG_TOO_LARGE: return "outline_too_large";
+            case VG_OUT_OF_MEMORY: return "no_space";
+        }
+        return "malformed_payload";
+    }
+    // A new glyph that takes the memory used by all glyphs over the budget
+    // is rejected, registering a glyph that already exists uses no memory
+    // Checked regardless of whether the glyph already exists, so that the
+    // result does not reveal whether other windows use it
+    if (vg_live_glyph_memory() > VG_MEMORY_BUDGET || !glyph_window_within_limits(self, g)) {
+        vg_decref(g);
+        return "no_space";
+    }
+    glyph_registry_set(tc_glyph_registry(self->text_cache), cmd->cp, g);
+    vg_decref(g);
+    return NULL;
+}
+
+static const char *
+glyph_clear(Screen *self, const GlyphCommand *cmd) {
+    GlyphRegistry *r = tc_glyph_registry(self->text_cache);
+    if (cmd->has_cp) {
+        if (!cmd->cp_valid || !is_glyph_block_codepoint(cmd->cp)) return "out_of_namespace";
+        glyph_registry_clear(r, cmd->cp);
+    } else glyph_registry_clear_all(r);
+    self->is_dirty = true;
+    return NULL;
+}
+
+void
+screen_handle_glyph_command(Screen *self, const GlyphCommand *cmd, const uint8_t *buf) {
+    switch (cmd->verb) {
+        case GLYPH_VERB_SUPPORT: glyph_reply(self, GLYPH_PROTOCOL_PREFIX "s;fmt=" GLYPH_SUPPORTED_FORMATS); break;
+        case GLYPH_VERB_QUERY: glyph_handle_query(self, cmd); break;
+        case GLYPH_VERB_REGISTER: glyph_reply_status(self, cmd, glyph_register(self, cmd, buf)); break;
+        case GLYPH_VERB_CLEAR: glyph_reply_status(self, cmd, glyph_clear(self, cmd)); break;
+    }
+}
+// }}}
+
 // Modes {{{
 
 
 void
 screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_screen) {
     bool to_alt = self->linebuf == self->main_linebuf;
+    // The regions are on the screen being switched away from
+    screen_smooth_scroll_remove_all(self);
+    bidi_layout_moved(self);
     self->active_hyperlink_id = 0;
     reset_pixel_scroll(self, 0);
     if (to_alt) {
         if (clear_alt_screen) {
             linebuf_clear(self->alt_linebuf, BLANK_CHAR);
+            bidi_note_maybe_unstamp(self->alt_linebuf);
             grman_clear(self->alt_grman, true, self->cell_size);
         }
         if (save_cursor) screen_save_cursor(self);
+        self->bidi.main_stash.mBDSM = self->modes.mBDSM;
+        self->bidi.main_stash.mBIDI_AUTODETECT = self->modes.mBIDI_AUTODETECT;
+        self->bidi.main_stash.rtl = self->bidi.rtl;
+        self->modes.mBDSM = self->modes.mBIDI_AUTODETECT = self->bidi.rtl = false;
         self->linebuf = self->alt_linebuf;
+        screen_bidi_records_writes_changed(self);
         self->tabstops = self->alt_tabstops;
         self->key_encoding_flags = self->alt_key_encoding_flags;
         self->grman = self->alt_grman;
@@ -2180,7 +4368,11 @@ screen_toggle_screen_buffer(Screen *self, bool save_cursor, bool clear_alt_scree
         self->alternate_screen.entered_at = monotonic();
     } else {
         self->alternate_screen.exited_at = monotonic();
+        self->modes.mBDSM = self->bidi.main_stash.mBDSM;
+        self->modes.mBIDI_AUTODETECT = self->bidi.main_stash.mBIDI_AUTODETECT;
+        self->bidi.rtl = self->bidi.main_stash.rtl;
         self->linebuf = self->main_linebuf;
+        screen_bidi_records_writes_changed(self);
         self->tabstops = self->main_tabstops;
         self->key_encoding_flags = self->main_key_encoding_flags;
         if (save_cursor) screen_restore_cursor(self);
@@ -2217,6 +4409,7 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
     switch (mode) {
         SIMPLE_MODE(LNM)
         SIMPLE_MODE(PASTE_EVENTS)
+        SIMPLE_MODE(WHEEL_EVENTS)
         SIMPLE_MODE(IRM)
         SIMPLE_MODE(DECARM)
         SIMPLE_MODE(BRACKETED_PASTE)
@@ -2233,6 +4426,11 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
 
         case DECSCLM:
         case DECNRCM: break; // we ignore these modes
+        case BDSM:
+            self->modes.mBDSM = val;
+            screen_bidi_records_writes_changed(self);
+            break;
+        case BIDI_AUTODETECT: self->modes.mBIDI_AUTODETECT = val; break;
         case DECCKM: self->modes.mDECCKM = val; break;
         case DECTCEM: self->modes.mDECTCEM = val; break;
         case DECSCNM:
@@ -2611,6 +4809,21 @@ screen_tab(Screen *self) {
 }
 
 void
+screen_tabn(Screen *self, unsigned int count) {
+    if (UNLIKELY(self->linebuf->bidi_stamped)) {
+        // The tab cells are written outside the draw loop, which checks and marks dirty the rows it writes. A tab does not
+        // take a leading mark's direction.
+        bidi_line_gets_text(self, self->cursor->y);
+        linebuf_mark_line_dirty(self->linebuf, self->cursor->y);
+    }
+    for (index_type i = 0; i < MAX(1u, count); i++) {
+        index_type x = self->cursor->x;
+        screen_tab(self);
+        if (self->cursor->x == x) break;
+    }
+}
+
+void
 screen_backtab(Screen *self, unsigned int count) {
     // Move back count tabs
     if (!count) count = 1;
@@ -2720,27 +4933,29 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
     }
 }
 
-#define INDEX_UP(add_to_history)                                                                       \
-    nuke_multiline_chars_torn_by_scroll(self, top, bottom, true, add_to_history);                      \
-    linebuf_index(self->linebuf, top, bottom);                                                         \
-    INDEX_GRAPHICS(-1, add_to_history)                                                                 \
-    if (add_to_history) {                                                                              \
-        /* Only add to history when no top margin has been set */                                      \
-        linebuf_init_line(self->linebuf, bottom);                                                      \
-        historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf);                \
-        /* Keep a scrolled back viewport anchored on the same content */                               \
-        if (self->scrolled_by) {                                                                       \
-            if (self->scrolled_by < self->historybuf->count) self->scrolled_by++;                      \
-            if (self->scrolled_by >= self->historybuf->count && self->pixel_scroll_offset_y) {         \
-                reset_pixel_scroll(self, 0);                                                           \
-                self->scroll_changed = true;                                                           \
-            }                                                                                          \
-        }                                                                                              \
-    }                                                                                                  \
-    last_visited_prompt_index(self, top, bottom, true, add_to_history);                                \
-    linebuf_clear_line(self->linebuf, bottom, true);                                                   \
-    self->is_dirty = true;                                                                             \
-    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, true, top, bottom); \
+#define INDEX_UP(add_to_history)                                                                                       \
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_lines_moved(self, top, bottom, true, add_to_history);                 \
+    nuke_multiline_chars_torn_by_scroll(self, top, bottom, true, add_to_history);                                      \
+    bidi_index_up_seams(self, top, bottom, add_to_history);                                                            \
+    linebuf_index(self->linebuf, top, bottom);                                                                         \
+    INDEX_GRAPHICS(-1, add_to_history)                                                                                 \
+    if (add_to_history) {                                                                                              \
+        /* Only add to history when no top margin has been set */                                                      \
+        linebuf_init_line(self->linebuf, bottom);                                                                      \
+        historybuf_add_line(self->historybuf, self->linebuf->line, &self->as_ansi_buf);                                \
+        /* Keep a scrolled back viewport anchored on the same content */                                               \
+        if (self->scrolled_by) {                                                                                       \
+            if (self->scrolled_by < self->historybuf->count) self->scrolled_by++;                                      \
+            if (self->scrolled_by >= self->historybuf->count && self->pixel_scroll_offset_y) {                         \
+                reset_pixel_scroll(self, 0);                                                                           \
+                self->scroll_changed = true;                                                                           \
+            }                                                                                                          \
+        }                                                                                                              \
+    }                                                                                                                  \
+    last_visited_prompt_index(self, top, bottom, true, add_to_history);                                                \
+    clear_scrolled_in_line(self, bottom);                                                                              \
+    self->is_dirty = true;                                                                                             \
+    if (UNLIKELY(self->selections.count)) index_selection(self, &self->selections, true, top, bottom, add_to_history); \
     if (UNLIKELY(self->url_ranges.count || self->url_ranges.in_progress)) clear_selection(&self->url_ranges);
 
 void
@@ -2836,7 +5051,10 @@ _reverse_scroll(Screen *self, unsigned int count, bool fill_from_scrollback) {
             if (copied && self->scrolled_by) self->scrolled_by--;
         }
         INDEX_DOWN(copied);
-        if (copied) linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
+        if (copied) {
+            linebuf_copy_line_to(self->main_linebuf, self->alt_linebuf->line, 0);
+            bidi_note_line_from_history(self, 0);
+        }
     }
 }
 
@@ -2911,6 +5129,7 @@ copy_specific_mode(Screen *self, unsigned int mode, const ScreenModes *src, Scre
         SIMPLE_MODE(FOCUS_TRACKING)
         SIMPLE_MODE(COLOR_PREFERENCE_NOTIFICATION)
         SIMPLE_MODE(PASTE_EVENTS)
+        SIMPLE_MODE(WHEEL_EVENTS)
         SIMPLE_MODE(INBAND_RESIZE_NOTIFICATION)
         SIMPLE_MODE(VISIBILITY_REPORTS)
         SIMPLE_MODE(DECCKM)
@@ -2932,6 +5151,8 @@ copy_specific_mode(Screen *self, unsigned int mode, const ScreenModes *src, Scre
             break;
             SIDE_EFFECTS(DECOM)
             SIDE_EFFECTS(DECCOLM)
+            SIDE_EFFECTS(BDSM) // kitty extension
+            SIDE_EFFECTS(BIDI_AUTODETECT)
     }
 #undef SIMPLE_MODE
 #undef SIDE_EFFECTS
@@ -2958,18 +5179,22 @@ copy_specific_modes(Screen *self, const ScreenModes *src, ScreenModes *dest) {
     copy_specific_mode(self, INBAND_RESIZE_NOTIFICATION, src, dest);
     copy_specific_mode(self, VISIBILITY_REPORTS, src, dest);
     copy_specific_mode(self, PASTE_EVENTS, src, dest);
+    copy_specific_mode(self, WHEEL_EVENTS, src, dest);
     copy_specific_mode(self, DECCKM, src, dest);
     copy_specific_mode(self, DECTCEM, src, dest);
     copy_specific_mode(self, DECAWM, src, dest);
     copy_specific_mode(self, MOUSE_BUTTON_TRACKING, src, dest);
     copy_specific_mode(self, MOUSE_UTF8_MODE, src, dest);
     copy_specific_mode(self, DECSCNM, src, dest);
+    copy_specific_mode(self, BDSM, src, dest);
+    copy_specific_mode(self, BIDI_AUTODETECT, src, dest);
 }
 
 void
 screen_save_modes(Screen *self) {
     // kitty extension to XTSAVE that saves a bunch of no side-effect modes
     copy_specific_modes(self, &self->modes, &self->saved_modes);
+    self->bidi.saved_rtl = self->bidi.rtl;
 }
 
 void
@@ -2994,6 +5219,7 @@ void
 screen_restore_modes(Screen *self) {
     // kitty extension to XTRESTORE that saves a bunch of no side-effect modes
     copy_specific_modes(self, &self->saved_modes, &self->modes);
+    self->bidi.rtl = self->bidi.saved_rtl;
 }
 
 void
@@ -3139,6 +5365,7 @@ screen_erase_in_line(Screen *self, unsigned int how, bool private) {
         default: break;
     }
     if (n > 0) {
+        bidi_note_maybe_unstamp(self->linebuf);
         nuke_multicell_char_intersecting_with(self, s, s + n, self->cursor->y, self->cursor->y + 1, false);
         screen_dirty_line_graphics(self, self->cursor->y, self->cursor->y, self->linebuf == self->main_linebuf);
         linebuf_init_line(self->linebuf, self->cursor->y);
@@ -3162,6 +5389,8 @@ dirty_scroll(Screen *self) {
 static void
 screen_clear_scrollback(Screen *self) {
     historybuf_clear(self->historybuf);
+    bidi_layout_moved(self);
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) self->smooth_scroll.regions[i].pushed_to_history = 0;
     reset_pixel_scroll(self, 0);
     if (self->scrolled_by != 0) {
         self->scrolled_by = 0;
@@ -3176,7 +5405,9 @@ screen_clear_scrollback(Screen *self) {
             nuke_multicell_char_at(self, x, 0, false);
         }
     }
+    bidi_mark_seam(self, 0);
     self->linebuf = orig;
+    reset_style_table_if_unused(self);
 }
 
 static void
@@ -3206,9 +5437,8 @@ nuke_multiline_chars_split_by_erase(Screen *self, unsigned int how, index_type a
     for (int top = 1; top >= 0; top--) {
         if (top ? how == 3 : how != 1) continue;
         CPUCell *cp;
-        GPUCell *gp;
         index_type y = top ? a : b - 1;
-        linebuf_init_cells(self->linebuf, y, &cp, &gp);
+        linebuf_init_cells(self->linebuf, y, &cp, NULL);
         for (index_type x = 0; x < self->columns; x++) {
             if (!cp[x].is_multicell) continue;
             if (top ? cp[x].y > 0 : cp[x].y + 1 < cp[x].scale) nuke_multicell_char_at(self, x, y, false);
@@ -3234,6 +5464,7 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
         :param bool private: when ``True`` character attributes are left unchanged
     */
     unsigned int a, b;
+    bidi_note_maybe_unstamp(self->linebuf);
     switch (how) {
         case 0:
             a = self->cursor->y + 1;
@@ -3249,6 +5480,7 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
             /* fallthrough */
         case 2:
         case 3:
+            if (UNLIKELY(self->smooth_scroll.count)) ssr_screen_erased(self);
             if (self->extra_cursors.count) {
                 self->extra_cursors.count = 0;
                 self->extra_cursors.dirty = true;
@@ -3260,6 +5492,12 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
         default: return;
     }
     if (b > a) {
+        // Multicell chars in smooth scroll regions can have parts in the
+        // overflow buffers of the regions, which must be removed with them,
+        // rather than being left to come back into the region later, no
+        // longer continuing a char. Erasing the complete display discards the
+        // overflow buffers above.
+        if (how < 2 && UNLIKELY(self->smooth_scroll.count)) nuke_multicell_char_intersecting_with(self, 0, self->columns, a, b, false);
         if (how < 3) nuke_multiline_chars_split_by_erase(self, how, a, b);
         if (how != 3) screen_dirty_line_graphics(self, a, b, self->linebuf == self->main_linebuf);
         if (private) {
@@ -3276,9 +5514,19 @@ screen_erase_in_display(Screen *self, unsigned int how, bool private) {
     }
     if (how < 2) {
         screen_erase_in_line(self, how, private);
-        if (how == 1) linebuf_clear_attrs_and_dirty(self->linebuf, self->cursor->y);
+        if (how == 1) {
+            // the record outlives the clear of the other attrs while the row holds text
+            LineAttrs *a = self->linebuf->line_attrs + self->cursor->y;
+            const LineAttrs record = *a;
+            linebuf_clear_attrs_and_dirty(self->linebuf, self->cursor->y);
+            if (UNLIKELY(self->linebuf->bidi_stamped)) {
+                line_attrs_set_bidi(a, record);
+                a->bidi_may_reorder = record.bidi_may_reorder;
+            }
+        }
     }
     if (how == 3 && self->linebuf == self->main_linebuf) { screen_clear_scrollback(self); }
+    if (how == 3) reset_style_table_if_unused(self);
 }
 
 void
@@ -3295,8 +5543,17 @@ screen_insert_lines(Screen *self, unsigned int count) {
         // remove chars straddling the bottom margin, as the lines at the bottom
         // of the region are pushed out, tearing them
         if (self->multiline_chars_used && !at_screen_bottom) nuke_multiline_chars_extending_below(self, bottom);
+        if (UNLIKELY(self->smooth_scroll.count)) ssr_lines_moved(self, self->cursor->y, bottom, false, false);
         screen_dirty_line_graphics(self, top, bottom, self->linebuf == self->main_linebuf);
         linebuf_insert_lines(self->linebuf, count, self->cursor->y, bottom);
+        if (UNLIKELY(self->linebuf->bidi_stamped)) {
+            self->linebuf->bidi_maybe_unstamp = true;
+            bidi_layout_moved(self);
+            bidi_mark_rows_moved_near_regions(self, self->cursor->y, bottom);
+            bidi_mark_seam(self, self->cursor->y);
+            bidi_mark_seam(self, self->cursor->y + MIN(count, bottom + 1 - self->cursor->y));
+            bidi_mark_seam(self, bottom + 1);
+        }
         last_visited_prompt_insert_or_delete_lines(self, self->cursor->y, bottom, count, true);
         self->is_dirty = true;
         clear_all_selections(self);
@@ -3330,6 +5587,7 @@ screen_scroll_until_cursor_prompt(Screen *self, bool add_to_scrollback) {
 static void
 screen_delete_lines_impl(Screen *self, index_type start, index_type count, index_type top, index_type bottom) {
     index_type y = start;
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_lines_moved(self, start, bottom, true, false);
     nuke_multiline_char_intersecting_with(self, 0, self->columns, y, y + 1, false);
     y += count;
     y = MIN(bottom, y);
@@ -3339,6 +5597,14 @@ screen_delete_lines_impl(Screen *self, index_type start, index_type count, index
     if (self->multiline_chars_used) nuke_multiline_chars_extending_below(self, bottom);
     screen_dirty_line_graphics(self, top, bottom, self->linebuf == self->main_linebuf);
     linebuf_delete_lines(self->linebuf, count, start, bottom);
+    if (UNLIKELY(self->linebuf->bidi_stamped)) {
+        self->linebuf->bidi_maybe_unstamp = true;
+        bidi_layout_moved(self);
+        bidi_mark_rows_moved_near_regions(self, start, bottom);
+        bidi_mark_seam(self, start);
+        bidi_mark_seam(self, bottom + 1 - MIN(count, bottom + 1 - start));
+        bidi_mark_seam(self, bottom + 1);
+    }
     self->is_dirty = true;
     clear_all_selections(self);
 }
@@ -3384,19 +5650,17 @@ screen_repeat_character(Screen *self, unsigned int count) {
 
 static void
 remove_characters(Screen *self, index_type at, index_type num, index_type y, bool replace_with_spaces) {
+    if (UNLIKELY(self->smooth_scroll.count)) ssr_row_cells_moved(self, at, y);
     // delete num chars at x=at setting them to the value of the num chars at [at + num, at + num + num)
     // multiline chars at x >= at are deleted and multicell chars split at x=at
     // and x=at + num - 1 are deleted
     nuke_multiline_char_intersecting_with(self, at, self->columns, y, y + 1, replace_with_spaces);
     nuke_split_multicell_char_at_left_boundary(self, at, y, replace_with_spaces);
     CPUCell *cp;
-    GPUCell *gp;
-    linebuf_init_cells(self->linebuf, y, &cp, &gp);
+    linebuf_init_cells(self->linebuf, y, &cp, NULL);
     // left shift
-    for (index_type i = at; i < self->columns - num; i++) {
-        cp[i] = cp[i + num];
-        gp[i] = gp[i + num];
-    }
+    for (index_type i = at; i < self->columns - num; i++) cp[i] = cp[i + num];
+    linebuf_mark_line_dirty(self->linebuf, y);
     nuke_incomplete_single_line_multicell_chars_in_range(self, at, self->columns, y, replace_with_spaces);
 }
 
@@ -3409,6 +5673,7 @@ screen_delete_characters(Screen *self, unsigned int count) {
         unsigned int x = self->cursor->x;
         unsigned int num = MIN(self->columns - x, count);
         if (!num) return; // cursor is in pending wrap state
+        bidi_note_maybe_unstamp(self->linebuf);
         remove_characters(self, x, num, self->cursor->y, false);
         linebuf_init_line(self->linebuf, self->cursor->y);
         line_apply_cursor(self->linebuf->line, self->cursor, self->columns - num, num, true);
@@ -3424,6 +5689,7 @@ screen_erase_characters(Screen *self, unsigned int count) {
     if (count == 0) count = 1;
     unsigned int x = self->cursor->x;
     unsigned int num = MIN(self->columns - x, count);
+    bidi_note_maybe_unstamp(self->linebuf);
     nuke_multicell_char_intersecting_with(self, x, x + num, self->cursor->y, self->cursor->y + 1, false);
     linebuf_init_line(self->linebuf, self->cursor->y);
     line_apply_cursor(self->linebuf->line, self->cursor, x, num, true);
@@ -3598,6 +5864,7 @@ report_mode_status(Screen *self, unsigned int which, bool private) {
         KNOWN_MODE(VISIBILITY_REPORTS);
         KNOWN_MODE(INBAND_RESIZE_NOTIFICATION);
         KNOWN_MODE(PASTE_EVENTS);
+        KNOWN_MODE(WHEEL_EVENTS);
 #undef KNOWN_MODE
         case ALTERNATE_SCREEN: ans = self->linebuf == self->alt_linebuf ? 1 : 2; break;
         case MOUSE_BUTTON_TRACKING: ans = self->modes.mouse_tracking_mode == BUTTON_MODE ? 1 : 2; break;
@@ -3607,6 +5874,8 @@ report_mode_status(Screen *self, unsigned int which, bool private) {
         case MOUSE_UTF8_MODE: ans = self->modes.mouse_tracking_protocol == UTF8_PROTOCOL ? 1 : 2; break;
         case MOUSE_SGR_PIXEL_MODE: ans = self->modes.mouse_tracking_protocol == SGR_PIXEL_PROTOCOL ? 1 : 2; break;
         case PENDING_UPDATE: ans = self->paused_rendering.expires_at ? 1 : 2; break;
+        case BDSM: ans = OPT(force_ltr) ? 4 : (self->modes.mBDSM ? 1 : 2); break;
+        case BIDI_AUTODETECT: ans = OPT(force_ltr) ? 4 : (self->modes.mBIDI_AUTODETECT ? 1 : 2); break;
     }
     int sz = snprintf(buf, sizeof(buf) - 1, "%s%u;%u$y", (private ? "?" : ""), which, ans);
     if (sz > 0) write_escape_code_to_child(self, ESC_CSI, buf);
@@ -3630,6 +5899,12 @@ screen_set_margins(Screen *self, unsigned int top, unsigned int bottom) {
         // bottom margins of the scrolling region (DECSTBM) changes.
         screen_cursor_position(self, 1, 1);
     }
+}
+
+void
+screen_set_bidi_direction(Screen *self, unsigned int direction, unsigned int path_extent UNUSED) {
+    if (direction > 2) return;
+    self->bidi.rtl = direction == 2;
 }
 
 void
@@ -4141,6 +6416,15 @@ copy_selections(Selections *dest, const Selections *src) {
 
 static Line *render_line_for_virtual_y(Screen *self, int y, Line *line, index_type *lnum, bool *is_history);
 
+// For a frame without maps: the history rows rendered at levels are shown in logical order from now on
+static void
+bidi_frame_unmapped(Screen *self) {
+    if (self->bidi_maps->live) historybuf_invalidate_render_cache(self->historybuf);
+    self->bidi_maps->live = false;
+    self->bidi_maps->valid = false;
+    self->bidi_maps->reusable = false;
+}
+
 bool
 screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
     if (!pause) {
@@ -4157,6 +6441,10 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
         // free extra cursors
         free(self->paused_rendering.extra_cursors.locations);
         zero_at_ptr(&self->paused_rendering.extra_cursors);
+        // The snapshot is kept for reuse, but its text must not keep text
+        // cache entries, and the glyph protocol glyphs they hold, alive
+        if (self->paused_rendering.linebuf) linebuf_clear(self->paused_rendering.linebuf, BLANK_CHAR);
+        ssr_release_pause_capture(self);
         return true;
     }
     if (self->paused_rendering.expires_at) return false;
@@ -4185,6 +6473,10 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
             return false;
         }
     }
+    // Mapped before the copy, which takes history rows missing from the render cache without marking them dirty
+    const BidiMaps *b = bidi_live_frame_reorders(self) ? bidi_prepare_live(self, false) : NULL;
+    if (!b && self->bidi_maps) bidi_frame_unmapped(self);
+    self->paused_rendering.linebuf->bidi_stamped = b != NULL;
     Line line = {.text_cache = self->text_cache};
     for (index_type y = 0; y < num_rows; y++) {
         index_type lnum;
@@ -4210,6 +6502,7 @@ screen_pause_rendering(Screen *self, bool pause, int for_in_ms) {
         }
     }
     grman_pause_rendering(self->grman, self->paused_rendering.grman);
+    ssr_capture_for_pause(self);
     return true;
 }
 
@@ -4255,13 +6548,13 @@ get_line_edge_colors_at_row(Screen *self, index_type y, color_type *left, color_
     char_type left_char = line_get_char(line, cell_color_x);
     bool reversed = false;
     colors_for_cell(line, self->color_profile, &cell_color_x, &left_cell_fg, &left_cell_bg, &reversed);
-    if (left_is_default) *left_is_default = (line->gpu_cells[cell_color_x].bg & 0xff) == 0;
+    if (left_is_default) *left_is_default = (line_cell_style(line, cell_color_x)->bg & 0xff) == 0;
     if (left) *left = effective_cell_edge_color(left_char, left_cell_fg, left_cell_bg, true);
     if (line->xnum > 0) cell_color_x = line->xnum - 1;
     char_type right_char = line_get_char(line, cell_color_x);
     reversed = false; // reset: colors_for_cell only sets this flag, never clears it
     colors_for_cell(line, self->color_profile, &cell_color_x, &right_cell_fg, &right_cell_bg, &reversed);
-    if (right_is_default) *right_is_default = (line->gpu_cells[cell_color_x].bg & 0xff) == 0;
+    if (right_is_default) *right_is_default = (line_cell_style(line, cell_color_x)->bg & 0xff) == 0;
     if (right) *right = effective_cell_edge_color(right_char, right_cell_fg, right_cell_bg, false);
     return true;
 }
@@ -4275,13 +6568,19 @@ get_line_edge_colors(Screen *self, color_type *left, color_type *right) {
 
 static void
 update_line_data(Line *line, unsigned int dest_y, uint8_t *data) {
-    size_t base = sizeof(GPUCell) * dest_y * line->xnum;
-    memcpy(data + base, line->gpu_cells, line->xnum * sizeof(GPUCell));
+    CellGPUData *dest = (CellGPUData *)(data + sizeof(CellGPUData) * dest_y * line->xnum);
+    cells_for_gpu(line->cpu_cells, line->render_cells, line->xnum, dest);
+}
+
+static void
+update_line_data_permuted(Line *line, unsigned int dest_y, uint8_t *data, const uint16_t *v2l) {
+    CellGPUData *dest = (CellGPUData *)(data + sizeof(CellGPUData) * dest_y * line->xnum);
+    cells_for_gpu_permuted(line->cpu_cells, line->render_cells, v2l, line->xnum, dest);
 }
 
 static void
 update_line_data_blank(unsigned xnum, unsigned int dest_y, uint8_t *data) {
-    const size_t sz = xnum * sizeof(GPUCell);
+    const size_t sz = xnum * sizeof(CellGPUData);
     memset(data + sz * dest_y, 0, sz);
 }
 
@@ -4291,7 +6590,7 @@ render_line_for_virtual_y(Screen *self, int y, Line *line, index_type *lnum, boo
     if (y < (int)self->scrolled_by) {
         int idx = (int)self->scrolled_by - 1 - y;
         if (idx >= 0 && (unsigned)idx < self->historybuf->count) {
-            historybuf_init_line(self->historybuf, idx, line);
+            if (historybuf_init_line_for_render(self->historybuf, idx, line, render_lines_for_screen(self))) line->attrs.has_dirty_text = true;
             line->xnum = self->columns;
             line->ynum = (index_type)MIN(MAX(y, 0), (int)self->lines - 1);
             *lnum = (index_type)idx;
@@ -4333,6 +6632,18 @@ color_to_id(color_type c) {
     return (c >> 8) & 0xffffff;
 }
 
+static bool
+ssr_is_column_edge(const Screen *self, int32_t row, index_type x) {
+    // Whether x is the left or right edge of the rectangle of a smooth scroll
+    // region intersecting the row, the cells on either side of which move
+    // independently
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        if ((int32_t)r->top <= row && row < (int32_t)r->bottom && (x == r->left || x == r->right)) return true;
+    }
+    return false;
+}
+
 // Scan the line and create cell images in place of unicode placeholders
 // reserved for image placement.
 static void
@@ -4353,7 +6664,6 @@ screen_render_line_graphics(Screen *self, Line *line, int32_t row) {
     uint32_t prev_img_col = 0;
     for (i = 0; i < line->xnum; i++) {
         CPUCell *cpu_cell = line->cpu_cells + i;
-        GPUCell *gpu_cell = line->gpu_cells + i;
         uint32_t cur_img_id_lower24bits = 0;
         uint32_t cur_placement_id = 0;
         uint32_t cur_img_id_higher8bits = 0;
@@ -4363,8 +6673,9 @@ screen_render_line_graphics(Screen *self, Line *line, int32_t row) {
             line->attrs.has_image_placeholders = true;
             // The lower 24 bits of the image id are encoded in the foreground
             // color, and the placement id is (optionally) in the underline color.
-            cur_img_id_lower24bits = color_to_id(gpu_cell->fg);
-            cur_placement_id = color_to_id(gpu_cell->decoration_fg);
+            const CellStyle *st = style_table_get(self->style_table, cpu_cell->style_idx);
+            cur_img_id_lower24bits = color_to_id(st->fg);
+            cur_placement_id = color_to_id(st->decoration_fg);
             text_in_cell(cpu_cell, self->text_cache, self->lc);
             // If the char has diacritics, use them as row and column indices.
             if (self->lc->count > 1 && self->lc->chars[1]) cur_img_row = diacritic_to_rowcolumn(self->lc->chars[1]);
@@ -4376,15 +6687,20 @@ screen_render_line_graphics(Screen *self, Line *line, int32_t row) {
         // The current run is continued if the lower 24 bits of the image id and
         // the placement id are the same as in the previous cell and everything
         // else is unknown or compatible with the previous cell.
-        if (run_length > 0 && cur_img_id_lower24bits == prev_img_id_lower24bits && cur_placement_id == prev_placement_id &&
-            (!cur_img_row || cur_img_row == prev_img_row) && (!cur_img_col || cur_img_col == prev_img_col + 1) &&
-            (!cur_img_id_higher8bits || cur_img_id_higher8bits == prev_img_id_higher8bits)) {
-            // This cell continues the current run.
-            run_length++;
+        const bool continues_run = run_length > 0 && cur_img_id_lower24bits == prev_img_id_lower24bits && cur_placement_id == prev_placement_id &&
+                                   (!cur_img_row || cur_img_row == prev_img_row) && (!cur_img_col || cur_img_col == prev_img_col + 1) &&
+                                   (!cur_img_id_higher8bits || cur_img_id_higher8bits == prev_img_id_higher8bits);
+        if (continues_run) {
             // If some values are unknown, infer them from the previous cell.
             cur_img_row = MAX(prev_img_row, 1u);
             cur_img_col = prev_img_col + 1;
             cur_img_id_higher8bits = MAX(prev_img_id_higher8bits, 1u);
+        }
+        // Runs are split at the edges of smooth scroll regions, so that the
+        // parts of the image on either side move with their cells
+        if (continues_run && !(UNLIKELY(self->smooth_scroll.count) && ssr_is_column_edge(self, row, i))) {
+            // This cell continues the current run.
+            run_length++;
         } else {
             // This cell breaks the current run. Render the current run if it
             // has a non-zero length.
@@ -4426,6 +6742,8 @@ screen_update_only_line_graphics_data(Screen *self) {
     self->scroll_changed = false;
     const unsigned int render_lines = render_lines_for_screen(self);
     const int render_row_offset = pixel_scroll_enabled(self);
+    // Rows marked clean here were not seen by a walk
+    if (self->bidi_maps) self->bidi_maps->reusable = false;
     Line line = {.text_cache = self->text_cache};
     for (unsigned int render_row = 0; render_row < render_lines; render_row++) {
         const int virtual_y = (int)render_row - render_row_offset;
@@ -4441,6 +6759,190 @@ screen_update_only_line_graphics_data(Screen *self) {
     }
 }
 
+// The paused rendering snapshot holds the rows that were rendered when
+// rendering was paused: with pixel scrolling an extra leading row, then the
+// rows of the screen, which show the scrollback if it was scrolled back. Row
+// y of the linebuf, the coordinates of the cursor and of selections, is at
+// snapshot row y + paused_snapshot_row_offset(), so negative values of y are
+// scrollback rows.
+static int
+paused_snapshot_row_offset(const Screen *self) {
+    return (int)self->paused_rendering.pixel_scroll + (int)self->paused_rendering.scrolled_by;
+}
+
+static Line *
+paused_line_for_linebuf_row(Screen *self, int y) {
+    // Must only be called while rendering is paused, NULL if the row is not in the snapshot
+    const int row = y + paused_snapshot_row_offset(self);
+    if (row < 0 || row >= (int)self->paused_rendering.linebuf->ynum) return NULL;
+    linebuf_init_line(self->paused_rendering.linebuf, (index_type)row);
+    return self->paused_rendering.linebuf->line;
+}
+
+Line *
+screen_line_for_cursor(Screen *self, index_type x, index_type y, Line *overlay_line) {
+    // The line, as rendered, with the cell under a cursor at (x, y) in linebuf
+    // coordinates, or NULL if there is no such cell. While rendering is paused
+    // that is a row of the snapshot. Otherwise it is the linebuf row, except
+    // on the row of an active overlay, whose pre-edit text is drawn over the
+    // linebuf only in the overlay cells, then it is overlay_line, set to the
+    // linebuf row with the overlay cells. Other than overlay_line, the
+    // returned line is the shared line object of the linebuf or the snapshot,
+    // so it is only valid until the next linebuf_init_line() on them.
+    if (x >= self->columns || y >= self->lines) return NULL;
+    if (self->paused_rendering.expires_at) return paused_line_for_linebuf_row(self, (int)y);
+    linebuf_init_line(self->linebuf, y);
+    if (!screen_is_overlay_active(self) || y != self->overlay_line.ynum) return self->linebuf->line;
+    *overlay_line = *self->linebuf->line;
+    overlay_line->cpu_cells = self->overlay_line.cpu_cells;
+    overlay_line->render_cells = self->overlay_line.render_cells;
+    return overlay_line;
+}
+
+index_type
+screen_multicell_char_rows_for_cursor(Screen *self, const CPUCell *ref, index_type x, index_type y) {
+    // The number of rows, from row y down, of the multicell char whose cell,
+    // as rendered, at (x, y) in linebuf coordinates is ref. Only the rows that
+    // actually continue the char are counted, as the char can be cut off at
+    // the bottom of the screen or split by a vertically scrolled smooth scroll
+    // region, with its lower rows in the overflow buffer. Does not change the
+    // shared line objects, so the line returned by screen_line_for_cursor()
+    // stays valid.
+    LineBuf *lb = self->linebuf;
+    int offset = 0;
+    if (self->paused_rendering.expires_at) {
+        lb = self->paused_rendering.linebuf;
+        offset = paused_snapshot_row_offset(self);
+    }
+    index_type n = 1;
+    for (; ref->y + n < ref->scale; n++) {
+        const int row = (int)(y + n) + offset;
+        if (y + n >= self->lines || row < 0 || row >= (int)lb->ynum) break;
+        if (!continues_multicell_char(linebuf_cpu_cells_for_line(lb, (index_type)row) + x, ref, ref->y + n)) break;
+    }
+    return n;
+}
+
+// Bidi upload {{{
+static bool
+screen_bidi_maps_usable(const Screen *self) {
+    const BidiMaps *b = self->bidi_maps;
+    const LineBuf *shown = self->paused_rendering.expires_at ? self->paused_rendering.linebuf : self->linebuf;
+    return b && b->valid && b->cols == self->columns && b->rows == render_lines_for_screen(self) && b->source == shown;
+}
+
+static const BidiMaps *
+selection_bidi_maps(Screen *self) {
+    // The maps the selection data is put in visual order by, NULL when they do not describe the frame
+    BidiMaps *b = self->bidi_maps;
+    b->changed = false;
+    return (b->selection_used_maps = screen_bidi_maps_usable(self)) ? b : NULL;
+}
+
+static void
+copy_selection_in_visual_order(const BidiMaps *b, const uint8_t *src, uint8_t *dest, size_t stride) {
+    const size_t row_size = (size_t)b->cols * stride;
+    for (index_type r = 0; r < b->rows;) {
+        if (b->active[r]) {
+            bidi_copy_row_bytes(b->v2l + (size_t)r * b->cols, b->cols, src + r * row_size, dest + r * row_size, stride);
+            r++;
+            continue;
+        }
+        index_type end = r + 1;
+        while (end < b->rows && !b->active[end]) end++;
+        memcpy(dest + r * row_size, src + r * row_size, (end - r) * row_size);
+        r = end;
+    }
+}
+
+static bool
+bidi_selection_dirty(const Screen *self) {
+    const BidiMaps *b = self->bidi_maps;
+    return (b->changed || screen_bidi_maps_usable(self) != b->selection_used_maps) &&
+           (self->selections.count || self->url_ranges.count || self->extra_cursors.count);
+}
+
+void
+screen_bidi_logical_click(Screen *self, index_type *x, index_type y, bool *in_left_half) {
+    if (!screen_bidi_maps_usable(self)) return;
+    const BidiMaps *b = self->bidi_maps;
+    const index_type render_row = y + pixel_scroll_enabled(self);
+    *x = bidi_logical_x(b, render_row, *x);
+    // The left half of a right-to-left cell is drawn on its right
+    if (bidi_cell_is_rtl(b, render_row, *x)) *in_left_half = !*in_left_half;
+}
+
+index_type
+screen_bidi_visual_x(Screen *self, index_type x, index_type y) {
+    if (!screen_bidi_maps_usable(self)) return x;
+    return bidi_visual_x(self->bidi_maps, y + pixel_scroll_enabled(self), x, 1);
+}
+
+static inline index_type
+cell_span(const CPUCell *c) {
+    return c->is_multicell && c->x == 0 ? mcd_x_limit(c) : 1;
+}
+
+// Indexes the bidi maps and the paused snapshot
+static inline index_type
+render_row_of(const Screen *self, index_type y) {
+    return y + rendered_scrolled_by(self) + pixel_scroll_enabled(self);
+}
+
+// For a beam of a right-to-left cell, the left edge of the column past its character
+static index_type
+cursor_cell_visual(Screen *self, index_type x, index_type y, CursorShape shape) {
+    if (x >= self->columns || !screen_bidi_maps_usable(self)) return x;
+    const BidiMaps *b = self->bidi_maps;
+    const index_type render_row = render_row_of(self, y);
+    if (render_row >= b->rows || !b->has_levels[render_row]) return x;
+    const CPUCell *cells = self->paused_rendering.expires_at ? linebuf_cpu_cells_for_line(self->paused_rendering.linebuf, render_row)
+                                                             : linebuf_cpu_cells_for_line(self->linebuf, y);
+    const bool beam_past = shape == CURSOR_BEAM && bidi_cell_is_rtl(b, render_row, x);
+    // Both cells of a wide character put the beam on the character's edge
+    if (beam_past && cells[x].is_multicell) x -= MIN(x, (index_type)cells[x].x);
+    const index_type span = cell_span(cells + x), visual = bidi_visual_x(b, render_row, x, span);
+    return beam_past && visual + span < self->columns ? visual + span : visual;
+}
+
+static bool
+screen_overlay_visual_start(Screen *self, index_type *start) {
+    const OverlayLine *ol = &self->overlay_line;
+    if (!ol->is_active || self->paused_rendering.expires_at || !screen_bidi_maps_usable(self)) return false;
+    const BidiMaps *b = self->bidi_maps;
+    const index_type render_row = render_row_of(self, ol->ynum);
+    if (render_row >= b->rows || !b->has_levels[render_row]) return false;
+    *start = MIN(cursor_cell_visual(self, ol->xstart, ol->ynum, CURSOR_BLOCK), self->columns - MIN(ol->text_len, self->columns));
+    return true;
+}
+
+// Valid after the upload, when the maps are for the frame. A beam on an odd-level cell follows the text it would extend.
+index_type
+screen_cursor_drawn_x(Screen *self, index_type x, index_type y, CursorShape shape) {
+    index_type start;
+    // The pre-edit block is drawn left to right
+    if (screen_overlay_visual_start(self, &start)) return start + self->overlay_line.cursor_x - screen_overlay_line_start(self);
+    return cursor_cell_visual(self, x, y, shape);
+}
+
+index_type
+screen_ime_anchor_x(Screen *self) {
+    index_type x;
+    if (screen_is_overlay_active(self)) return screen_overlay_visual_start(self, &x) ? x : screen_overlay_line_start(self);
+    if (self->paused_rendering.expires_at) return self->cursor->x;
+    return cursor_cell_visual(self, self->cursor->x, self->cursor->y, CURSOR_BLOCK);
+}
+// }}}
+
+#ifdef DEBUG
+static void
+bidi_check_unmapped_levels(const Line *line) {
+    for (index_type x = 0; x < line->xnum; x++) {
+        if (line->render_cells[x].level) fatal("bidi: a row of a frame with no row mapped holds levels");
+    }
+}
+#endif
+
 void
 screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_data, bool cursor_has_moved) {
     if (self->paused_rendering.expires_at) {
@@ -4448,19 +6950,28 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
             LineBuf *linebuf = self->paused_rendering.linebuf;
             // The GPU buffer was invalidated so every row must be written. The
             // paused linebuf has exactly render_lines_for_screen() rows.
-            const index_type row_offset = self->paused_rendering.pixel_scroll;
+            const int row_offset = paused_snapshot_row_offset(self);
+            // The map of the pause: no upload runs while paused
+            BidiMaps *b = UNLIKELY(linebuf->bidi_stamped) ? bidi_maps_for_upload(self, linebuf, linebuf->ynum) : NULL;
+            if (!b && self->bidi_maps) self->bidi_maps->valid = self->bidi_maps->reusable = false;
             for (index_type y = 0; y < linebuf->ynum; y++) {
                 linebuf_init_line(linebuf, y);
-                if (linebuf->line->attrs.has_dirty_text) {
-                    // The extra leading row is never the cursor row
-                    const index_type lnum = y < row_offset ? self->lines : y - row_offset;
-                    render_line(fonts_data, linebuf->line, lnum, &self->paused_rendering.cursor, self->disable_ligatures, self->lc);
+                const uint8_t *levels = NULL;
+                const uint16_t *v2l = NULL;
+                const bool relevel = UNLIKELY(b) && bidi_row(b, y, &levels, &v2l);
+                if (linebuf->line->attrs.has_dirty_text || relevel) {
+                    // The extra leading row and scrollback rows are never the cursor row
+                    const index_type lnum = (int)y < row_offset ? self->lines : y - (index_type)row_offset;
+                    render_line(fonts_data, linebuf->line, lnum, &self->paused_rendering.cursor, self->disable_ligatures, self->lc, levels);
+                    if (UNLIKELY(b)) bidi_store_levels(b, y, linebuf->line);
                     // Cell images are not rendered here: this would modify the live grman using snapshot row numbers
                     if (linebuf->line->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, linebuf->line, &self->as_ansi_buf);
                     linebuf_mark_line_clean(linebuf, y);
                 }
-                update_line_data(linebuf->line, y, address);
+                if (UNLIKELY(v2l)) update_line_data_permuted(linebuf->line, y, address, v2l);
+                else update_line_data(linebuf->line, y, address);
             }
+            if (self->smooth_scroll_render.num_strip_cells) ssr_update_strip_cell_data(self, address, fonts_data, b);
         }
         return;
     }
@@ -4472,7 +6983,14 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
     self->scroll_changed = false;
     const unsigned int render_lines = render_lines_for_screen(self);
     const int render_row_offset = pixel_scroll_enabled(self);
+    BidiMaps *b = UNLIKELY(bidi_live_frame_reorders(self)) ? bidi_prepare_live(self, true) : NULL;
+    if (!b && self->bidi_maps) bidi_frame_unmapped(self);
+    // With no row mapped the rows are uploaded as without maps, and the levels stored in their render cells are already 0
+    const bool mapped = UNLIKELY(b) && b->mapped;
     Line line = {.text_cache = self->text_cache};
+    const uint8_t *levels = NULL;
+    const uint16_t *v2l = NULL;
+    bool relevel = false;
     for (unsigned int render_row = 0; render_row < render_lines; render_row++) {
         const int virtual_y = (int)render_row - render_row_offset;
         bool is_history = false;
@@ -4482,25 +7000,39 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
             update_line_data_blank(self->columns, render_row, address);
             continue;
         }
+        if (UNLIKELY(mapped)) {
+            levels = NULL;
+            v2l = NULL;
+            relevel = bidi_row(b, render_row, &levels, &v2l);
+        }
         if (is_history) {
             // we render line graphics even if the line is not dirty as graphics commands received after
             // the unicode placeholder was first scanned can alter it.
             screen_render_line_graphics(self, linep, virtual_y - (int)self->scrolled_by);
-            if (force_history_render || linep->attrs.has_dirty_text) {
-                render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc);
+            if (force_history_render || linep->attrs.has_dirty_text || relevel) {
+                render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc, levels);
+                if (UNLIKELY(mapped)) bidi_store_levels(b, render_row, linep);
+#ifdef DEBUG
+                else if (b) bidi_check_unmapped_levels(linep);
+#endif
                 if (screen_has_marker(self)) mark_text_in_line(self->marker, linep, &self->as_ansi_buf);
                 historybuf_mark_line_clean(self->historybuf, lnum);
             }
         } else {
-            if (linep->attrs.has_dirty_text || (cursor_has_moved && (self->cursor->y == lnum || self->last_rendered.cursor.y == lnum))) {
-                render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc);
+            if (linep->attrs.has_dirty_text || (cursor_has_moved && (self->cursor->y == lnum || self->last_rendered.cursor.y == lnum)) || relevel) {
+                render_line(fonts_data, linep, lnum, self->cursor, self->disable_ligatures, self->lc, levels);
+                if (UNLIKELY(mapped)) bidi_store_levels(b, render_row, linep);
+#ifdef DEBUG
+                else if (b) bidi_check_unmapped_levels(linep);
+#endif
                 screen_render_line_graphics(self, linep, virtual_y - (int)self->scrolled_by);
                 if (linep->attrs.has_dirty_text && screen_has_marker(self)) mark_text_in_line(self->marker, linep, &self->as_ansi_buf);
                 if (is_overlay_active && lnum == self->overlay_line.ynum) render_overlay_line(self, linep, fonts_data);
                 linebuf_mark_line_clean(self->linebuf, lnum);
             }
         }
-        update_line_data(linep, render_row, address);
+        if (UNLIKELY(v2l)) update_line_data_permuted(linep, render_row, address, v2l);
+        else update_line_data(linep, render_row, address);
     }
     if (is_overlay_active && self->overlay_line.ynum + self->scrolled_by < self->lines) {
         if (self->overlay_line.is_dirty) {
@@ -4509,6 +7041,8 @@ screen_update_cell_data(Screen *self, void *address, FONTS_DATA_HANDLE fonts_dat
         }
         update_overlay_line_data(self, address);
     }
+    if (self->smooth_scroll_render.num_strip_cells)
+        ssr_update_strip_cell_data(self, address, fonts_data, self->bidi_maps && self->bidi_maps->live ? self->bidi_maps : NULL);
 }
 
 static bool
@@ -4656,13 +7190,10 @@ static XRange
 xrange_for_iteration_with_multicells(const IterationData *idata, const int y, const Line *line) {
     XRange ans = xrange_for_iteration(idata, y, line);
     if (ans.x_limit > ans.x) {
-        CPUCell *c;
-        index_type ml;
-        if (ans.x && (c = &line->cpu_cells[ans.x])->is_multicell && c->x) ans.x = ans.x > c->x ? ans.x - c->x : 0;
-        if (ans.x_limit < line->xnum && (c = &line->cpu_cells[ans.x_limit - 1])->is_multicell && c->x + 1u < (ml = mcd_x_limit(c))) {
-            ans.x_limit += ml - 1 - c->x;
-            if (ans.x_limit > line->xnum) ans.x_limit = line->xnum;
-        }
+        // Extend the range to include all the cells of the multicell chars at
+        // its ends, that are present in the line
+        if (ans.x < line->xnum) ans.x = multicell_char_columns(line->cpu_cells, line->xnum, ans.x).start;
+        if (ans.x_limit < line->xnum) ans.x_limit = multicell_char_columns(line->cpu_cells, line->xnum, ans.x_limit - 1).limit;
     }
     return ans;
 }
@@ -4686,31 +7217,28 @@ render_iteration_data(const Screen *self, const Selection *s, IterationData *ans
 }
 
 static void
-apply_selection(Screen *self, uint8_t *data, Selection *s, uint8_t set_mask, int extra_leading_rows, int scrolled_by) {
+apply_selection(Screen *self, uint8_t *data, size_t stride, Selection *s, uint8_t set_mask, int extra_leading_rows, int scrolled_by) {
     render_iteration_data(self, s, &s->last_rendered);
     Line *line;
     const int y_min = MAX(-extra_leading_rows - scrolled_by, s->last_rendered.y), y_limit = MIN(s->last_rendered.y_limit, (int)self->lines - scrolled_by);
     for (int y = y_min; y < y_limit; y++) {
         if (self->paused_rendering.expires_at) {
-            // paused_rendering.linebuf stores only the rendered rows captured at pause time
-            const int paused_y = y + scrolled_by + extra_leading_rows;
-            if (paused_y < 0 || paused_y >= (int)self->paused_rendering.linebuf->ynum) continue;
-            linebuf_init_line(self->paused_rendering.linebuf, paused_y);
-            line = self->paused_rendering.linebuf->line;
+            line = paused_line_for_linebuf_row(self, y);
+            if (!line) continue;
         } else {
             line = checked_range_line(self, y);
             if (!line) continue;
         }
         const int y_in_data = (y + extra_leading_rows + scrolled_by);
-        uint8_t *line_start = data + self->columns * y_in_data;
+        uint8_t *line_start = data + stride * self->columns * y_in_data;
         XRange xr = xrange_for_iteration_with_multicells(&s->last_rendered, y, line);
         for (index_type x = xr.x; x < xr.x_limit; x++) {
-            line_start[x] |= set_mask;
+            line_start[stride * x] |= set_mask;
             CPUCell *c = &line->cpu_cells[x];
             if (c->is_multicell && c->scale > 1) {
-                for (int ym = MAX(0, y_in_data - c->y); ym < y_in_data; ym++) data[self->columns * ym + x] |= set_mask;
+                for (int ym = MAX(0, y_in_data - c->y); ym < y_in_data; ym++) data[stride * (self->columns * ym + x)] |= set_mask;
                 for (int ym = y_in_data + 1; ym < MIN((int)self->lines + extra_leading_rows, y_in_data + c->scale - c->y); ym++)
-                    data[self->columns * ym + x] |= set_mask;
+                    data[stride * (self->columns * ym + x)] |= set_mask;
             }
         }
     }
@@ -4761,17 +7289,32 @@ screen_update_graphics_layers(Screen *self) {
     // While rendering is paused, the frozen image placements must be positioned using the
     // scroll position captured with the frozen text, not the live one, which new output may have changed
     GraphicsManager *grman = self->paused_rendering.expires_at ? self->paused_rendering.grman : self->grman;
+    // Images moving with smooth scroll regions are drawn shifted with them
+    static_assert(MAX_IMAGE_LAYER_REGIONS == MAX_SMOOTH_SCROLL_REGIONS, "Fix MAX_IMAGE_LAYER_REGIONS");
+    ImageLayerRegion regions[MAX_SMOOTH_SCROLL_REGIONS];
+    const SmoothScrollRender *sr = &self->smooth_scroll_render;
+    for (unsigned i = 0; i < sr->count; i++)
+        regions[i] = (ImageLayerRegion){
+            .id = sr->regions[i].id,
+            .horizontal = sr->regions[i].horizontal,
+            .offset = (float)sr->regions[i].offset / (float)MAX(1u, sr->regions[i].horizontal ? self->cell_size.width : self->cell_size.height),
+            .left = (int32_t)sr->regions[i].left,
+            .top = (int32_t)sr->regions[i].top,
+            .right = (int32_t)(sr->regions[i].left + sr->regions[i].width),
+            .bottom = (int32_t)(sr->regions[i].top + sr->regions[i].height)};
     return grman_update_layers(
         grman,
         rendered_scrolled_by(self),
         scroll_offset_lines_for_screen(self),
         -1.f,
-        1.f,
+        -1.f,
         2.f / self->columns,
         2.f / self->lines,
         self->columns,
         self->lines,
-        self->cell_size);
+        self->cell_size,
+        regions,
+        sr->count);
 }
 
 bool
@@ -4798,28 +7341,54 @@ screen_scrollbar_geometry(const Screen *self, float *handle_position, float *vis
 }
 
 void
-screen_apply_selection(Screen *self, void *address_, size_t size) {
-    uint8_t *address = address_;
-    memset(address, 0, size);
+screen_apply_selection(Screen *self, void *address_, size_t num_cells, size_t stride) {
+    // address_ is write only memory when called by the renderer, so the data
+    // is built in system memory and copied to it at the end, never read from it.
+    uint8_t *const dest = address_, *strips = NULL;
+    // The data for the strips of the smooth scroll regions is written only
+    // when there is room for it, as when called by the renderer
+    const size_t num_strip_cells = self->smooth_scroll_render.num_strip_cells;
+    if (num_strip_cells && num_cells == (size_t)render_lines_for_screen(self) * self->columns + num_strip_cells) {
+        num_cells -= num_strip_cells;
+        strips = dest + num_cells * stride;
+    }
+    const size_t num_screen_cells = num_cells, sz = num_screen_cells * stride;
+    if (!sz) {
+        // There are no screen cells for the strips to be copied from
+        if (strips) memset(strips, 0, num_strip_cells * stride);
+        return;
+    }
+    if (self->selection_scratch_sz < sz) {
+        uint8_t *n = realloc(self->selection_scratch, sz);
+        if (!n) fatal("Out of memory");
+        self->selection_scratch = n;
+        self->selection_scratch_sz = sz;
+    }
+    uint8_t *const screen_data = self->selection_scratch, *address = screen_data;
+    memset(address, 0, sz);
     const unsigned offset = pixel_scroll_enabled(self);
     const unsigned scrolled_by = rendered_scrolled_by(self);
     Selections *sel = self->paused_rendering.expires_at ? &self->paused_rendering.selections : &self->selections;
-    for (size_t i = 0; i < sel->count; i++) apply_selection(self, address, sel->items + i, 1, offset, scrolled_by);
+    for (size_t i = 0; i < sel->count; i++) apply_selection(self, address, stride, sel->items + i, 1, offset, scrolled_by);
     sel->last_rendered_count = sel->count;
     sel = self->paused_rendering.expires_at ? &self->paused_rendering.url_ranges : &self->url_ranges;
     for (size_t i = 0; i < sel->count; i++) {
         Selection *s = sel->items + i;
         if (OPT(underline_hyperlinks) == UNDERLINE_NEVER && s->is_hyperlink) continue;
-        apply_selection(self, address, s, 2, offset, scrolled_by);
+        apply_selection(self, address, stride, s, 2, offset, scrolled_by);
     }
     sel->last_rendered_count = sel->count;
-    address += (size_t)offset * self->columns;
-    size -= (size_t)offset * self->columns;
+    address += (size_t)offset * self->columns * stride;
+    num_cells -= (size_t)offset * self->columns;
     ExtraCursors *ec = self->paused_rendering.expires_at ? &self->paused_rendering.extra_cursors : &self->extra_cursors;
     for (unsigned i = 0; i < ec->count; i++) {
-        if (ec->locations[i].cell < size) address[ec->locations[i].cell] |= (ec->locations[i].shape & 7) << 2;
+        if (ec->locations[i].cell < num_cells) address[(size_t)ec->locations[i].cell * stride] |= (ec->locations[i].shape & 7) << 2;
     }
     ec->dirty = false;
+    const BidiMaps *b = self->bidi_maps ? selection_bidi_maps(self) : NULL;
+    if (b) copy_selection_in_visual_order(b, screen_data, dest, stride);
+    else memcpy(dest, screen_data, sz);
+    if (strips) ssr_write_strip_selection_data(self, b, screen_data, strips, stride);
 }
 
 static index_type
@@ -4846,21 +7415,54 @@ limit_without_trailing_whitespace(const Line *line, index_type limit) {
     return limit;
 }
 
+// The cells whose text is extracted for a selection, one bit per cell for the lines in [y_start, y_limit)
+typedef struct SelectedCells {
+    int y_start, y_limit;
+    index_type columns;
+    uint8_t *bits;
+} SelectedCells;
+
 static void
-flag_selection_to_extract_text(Screen *self, const Selection *s, int *miny, int *y_limit) {
+free_selected_cells(SelectedCells *sc) {
+    free(sc->bits);
+    sc->bits = NULL;
+}
+#define RAII_SelectedCells(name) __attribute__((cleanup(free_selected_cells))) SelectedCells name = {0}
+
+static inline size_t
+selected_cell_pos(const SelectedCells *sc, int y, index_type x) {
+    return (size_t)(y - sc->y_start) * sc->columns + x;
+}
+
+static inline bool
+is_cell_selected(const SelectedCells *sc, int y, index_type x) {
+    const size_t pos = selected_cell_pos(sc, y, x);
+    return (sc->bits[pos >> 3] >> (pos & 7)) & 1;
+}
+
+static inline void
+select_cell(SelectedCells *sc, int y, index_type x) {
+    const size_t pos = selected_cell_pos(sc, y, x);
+    sc->bits[pos >> 3] |= 1u << (pos & 7);
+}
+
+static bool
+flag_selection_to_extract_text(Screen *self, const Selection *s, int *miny, int *y_limit, SelectedCells *sc) {
+    // Find the cells whose text is in the selection. Returns false on allocation failure.
     IterationData idata;
     bool has_history = self->linebuf == self->main_linebuf;
     iteration_data(s, &idata, self->columns, has_history ? -self->historybuf->count : 0, 0);
     Line *line;
     *miny = idata.y;
     *y_limit = MIN(idata.y_limit, (int)self->lines);
-    if (*miny >= *y_limit) return;
+    if (*miny >= *y_limit) return true;
+    // Multiline chars can extend above the first line of the selection
     static const int max_scale = ((1u << SCALE_BITS) - 1u);
-    for (int y = idata.y - max_scale; y < *y_limit; y++) {
-        line = checked_range_line(self, y);
-        if (line)
-            for (index_type x = 0; x < line->xnum; x++) line->cpu_cells[x].temp_flag = 0;
-    }
+    sc->y_start = idata.y - max_scale;
+    sc->y_limit = *y_limit;
+    sc->columns = self->columns;
+    sc->bits = calloc(((size_t)(sc->y_limit - sc->y_start) * sc->columns + 7) / 8, 1);
+    if (!sc->bits) return false;
     Line temp = {.xnum = self->columns, .text_cache = self->text_cache};
     for (int y = idata.y; y < *y_limit; y++) {
         range_line(self, y, &temp);
@@ -4868,12 +7470,12 @@ flag_selection_to_extract_text(Screen *self, const Selection *s, int *miny, int 
         XRange xr = xrange_for_iteration_with_multicells(&idata, y, &temp);
         for (index_type x = xr.x; x < xr.x_limit; x++) {
             c = temp.cpu_cells + x;
-            c->temp_flag = 1;
+            select_cell(sc, y, x);
             if (c->is_multicell && c->y) {
                 for (int ym = y - c->y; ym < y; ym++) {
                     line = checked_range_line(self, ym);
                     if (line) {
-                        line->cpu_cells[x].temp_flag = 1;
+                        select_cell(sc, ym, x);
                         *miny = MIN(*miny, ym);
                     }
                 }
@@ -4884,16 +7486,18 @@ flag_selection_to_extract_text(Screen *self, const Selection *s, int *miny, int 
     while (*y_limit > *miny) {
         range_line(self, *y_limit - 1, &temp);
         for (index_type x = 0; x < temp.xnum; x++) {
-            if (temp.cpu_cells[x].temp_flag && temp.cpu_cells[x].ch_and_idx && (!temp.cpu_cells[x].is_multicell || !temp.cpu_cells[x].y)) return;
+            if (is_cell_selected(sc, *y_limit - 1, x) && temp.cpu_cells[x].ch_and_idx && (!temp.cpu_cells[x].is_multicell || !temp.cpu_cells[x].y)) return true;
         }
         (*y_limit)--;
     }
+    return true;
 }
 
 static PyObject *
 text_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool strip_trailing_whitespace) {
     int min_y, y_limit;
-    flag_selection_to_extract_text(self, sel, &min_y, &y_limit);
+    RAII_SelectedCells(sc);
+    if (!flag_selection_to_extract_text(self, sel, &min_y, &y_limit, &sc)) return PyErr_NoMemory();
     if (min_y >= y_limit) return PyTuple_New(0);
     size_t before = self->as_ansi_buf.len;
     RAII_PyObject(ans, PyTuple_New(y_limit - min_y));
@@ -4903,8 +7507,8 @@ text_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
     for (int i = 0, y = min_y; y < y_limit; y++, i++) {
         Line *line = range_line_(self, y);
         index_type x_limit = line->xnum, x_start = 0;
-        while (x_limit && !line->cpu_cells[x_limit - 1].temp_flag) x_limit--;
-        while (x_start < x_limit && !line->cpu_cells[x_start].temp_flag) x_start++;
+        while (x_limit && !is_cell_selected(&sc, y, x_limit - 1)) x_limit--;
+        while (x_start < x_limit && !is_cell_selected(&sc, y, x_start)) x_start++;
         bool is_only_whitespace_line = false;
         // Don't strip trailing whitespace from soft-wrapped lines as those spaces
         // are part of the original text content that continues on the next line
@@ -4926,7 +7530,7 @@ text_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
         } else {
             while (x_start < x_limit) {
                 index_type end = x_start;
-                while (end < x_limit && line->cpu_cells[end].temp_flag) end++;
+                while (end < x_limit && is_cell_selected(&sc, y, end)) end++;
                 if (!unicode_in_range(line, x_start, end, true, add_trailing_newline, false, !is_first_line, &self->as_ansi_buf)) return PyErr_NoMemory();
                 x_start = MAX(x_start + 1, end);
             }
@@ -4942,7 +7546,8 @@ text_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
 static PyObject *
 ansi_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool strip_trailing_whitespace) {
     int min_y, y_limit;
-    flag_selection_to_extract_text(self, sel, &min_y, &y_limit);
+    RAII_SelectedCells(sc);
+    if (!flag_selection_to_extract_text(self, sel, &min_y, &y_limit, &sc)) return PyErr_NoMemory();
     if (min_y >= y_limit) return PyTuple_New(0);
     ANSILineState s = {.output_buf = &self->as_ansi_buf};
     s.output_buf->active_hyperlink_id = 0;
@@ -4953,13 +7558,16 @@ ansi_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
     if (!ans || !nl || !empty_string) return NULL;
     bool has_escape_codes = false;
     bool need_newline = false;
+    ansi_bidi_continue(&s, screen_bidi_record_above(self, min_y), false);
     for (int i = 0, y = min_y; y < y_limit && i < PyTuple_GET_SIZE(ans) - 1; y++, i++) {
         const bool is_first_line = y == min_y;
         s.output_buf->len = 0;
         Line *line = range_line_(self, y);
+        ansi_bidi_row_start(&s, line);
+        const bool bidi_continued = line->cpu_cells[line->xnum - 1].next_char_was_wrapped && y + 1 < y_limit;
         index_type x_limit = line->xnum, x_start = 0;
-        while (x_limit && !line->cpu_cells[x_limit - 1].temp_flag) x_limit--;
-        while (x_start < x_limit && !line->cpu_cells[x_start].temp_flag) x_start++;
+        while (x_limit && !is_cell_selected(&sc, y, x_limit - 1)) x_limit--;
+        while (x_start < x_limit && !is_cell_selected(&sc, y, x_start)) x_start++;
         bool is_only_whitespace_line = false;
         // Don't strip trailing whitespace from soft-wrapped lines as those spaces
         // are part of the original text content that continues on the next line
@@ -4975,23 +7583,53 @@ ansi_for_range(Screen *self, const Selection *sel, bool insert_newlines, bool st
         if (x_limit <= x_start && (is_only_whitespace_line || line_is_empty(line))) {
             // we want a newline on only whitespace lines even if they are continued
             if (insert_newlines) need_newline = true;
-            PyTuple_SET_ITEM(ans, i, Py_NewRef(need_newline ? nl : empty_string));
+            if (UNLIKELY(s.bidi_open)) {
+                // No text of the paragraph is written here, so its controls are not opened here. Those written are reset before
+                // the newline, which can be forced on a continued line, so that they are the defaults at every hard line break,
+                // and opened again before the next text of the paragraph.
+                const uint8_t record = s.bidi_open;
+                const bool written = !s.bidi_prefix;
+                if (written && (need_newline || !bidi_continued)) {
+                    ansi_bidi_close(&s);
+                    has_escape_codes = true;
+                }
+                if (need_newline) {
+                    ensure_space_for(s.output_buf, buf, Py_UCS4, s.output_buf->len + 1, capacity, 2048, false);
+                    s.output_buf->buf[s.output_buf->len++] = '\n';
+                }
+                if (bidi_continued) ansi_bidi_continue(&s, record, written && !need_newline);
+                else s.bidi_open = s.bidi_prefix = 0;
+            }
+            if (s.output_buf->len) {
+                PyObject *t = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, s.output_buf->buf, s.output_buf->len);
+                if (!t) return NULL;
+                PyTuple_SET_ITEM(ans, i, t);
+            } else PyTuple_SET_ITEM(ans, i, Py_NewRef(need_newline ? nl : empty_string));
         } else {
             char_type prefix_char = need_newline ? '\n' : 0;
             while (x_start < x_limit) {
                 index_type end = x_start;
-                while (end < x_limit && line->cpu_cells[end].temp_flag) end++;
+                while (end < x_limit && is_cell_selected(&sc, y, end)) end++;
                 if (line_as_ansi(line, &s, x_start, end, prefix_char, !is_first_line)) has_escape_codes = true;
                 need_newline = insert_newlines && !line->cpu_cells[line->xnum - 1].next_char_was_wrapped;
                 prefix_char = 0;
                 x_start = MAX(x_start + 1, end);
+            }
+            if (UNLIKELY(s.bidi_open) && !bidi_continued) {
+                ansi_bidi_close(&s);
+                has_escape_codes = true;
             }
             PyObject *t = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, s.output_buf->buf, s.output_buf->len);
             if (!t) return NULL;
             PyTuple_SET_ITEM(ans, i, t);
         }
     }
-    PyObject *t = PyUnicode_FromFormat("%s%s", has_escape_codes ? "\x1b[m" : "", s.output_buf->active_hyperlink_id ? "\x1b]8;;\x1b\\" : "");
+    // A paragraph cut by the end of the selection
+    s.output_buf->len = 0;
+    if (s.bidi_open && !s.bidi_prefix) ansi_bidi_close(&s);
+    RAII_PyObject(bidi_close, PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, s.output_buf->buf, s.output_buf->len));
+    if (!bidi_close) return NULL;
+    PyObject *t = PyUnicode_FromFormat("%U%s%s", bidi_close, has_escape_codes ? "\x1b[m" : "", s.output_buf->active_hyperlink_id ? "\x1b]8;;\x1b\\" : "");
     if (!t) return NULL;
     PyTuple_SET_ITEM(ans, PyTuple_GET_SIZE(ans) - 1, t);
     return Py_NewRef(ans);
@@ -5127,7 +7765,7 @@ extend_url(
         if (line && cell_is_char(line->cpu_cells, sentinel)) {
             *y -= scale;
             *x = line->xnum - 1;
-            if (line->cpu_cells[*x].is_multicell) *x -= line->cpu_cells[*x].x;
+            *x = multicell_char_columns(line->cpu_cells, line->xnum, *x).start;
         }
     }
 }
@@ -5226,8 +7864,8 @@ detect_url_with_regex(Screen *self, index_type x, index_type y, TextCache *text_
             if (end > mouse_start && end > start) {
                 RegexCellPos s = regex_line.positions.items[start], e = regex_line.positions.items[end - 1];
                 visual_line(self, e.y, &line);
-                const CPUCell *c = line.cpu_cells + e.x;
-                if (c->is_multicell) e.x = MIN(self->columns - 1, e.x + mcd_x_limit(c) - 1);
+                // end at the last cell of the char, that is present in the line
+                e.x = multicell_char_columns(line.cpu_cells, line.xnum, e.x).limit - 1;
                 self->url_ranges.count = 0;
                 add_url_range(self, s.x, s.y, e.x, e.y, false);
                 return true;
@@ -5250,11 +7888,20 @@ screen_detect_url(Screen *screen, unsigned int x, unsigned int y, bool mark) {
     Line *line = screen_visual_line(screen, y);
     if (!line || x >= screen->columns) return 0;
     if (line->cpu_cells[x].is_multicell && line->cpu_cells[x].scale > 1 && line->cpu_cells[x].y) {
-        if (line->cpu_cells[x].y > y) return 0;
-        y -= line->cpu_cells[x].y;
+        // Move to the top row of the char, following the rows that actually
+        // continue it, as it can be split by a vertically scrolled smooth
+        // scroll region, with its top rows in the overflow buffer
+        const CPUCell ref = line->cpu_cells[x];
+        index_type ry = ref.y;
+        for (; ry && y; ry--, y--) {
+            Line *above = screen_visual_line(screen, y - 1);
+            if (!above || !continues_multicell_char(above->cpu_cells + x, &ref, ry - 1)) break;
+        }
+        if (ry) return 0;
         line = screen_visual_line(screen, y);
+        if (!line) return 0;
     }
-    if (line->cpu_cells[x].is_multicell && line->cpu_cells[x].x) x = x > line->cpu_cells[x].x ? x - line->cpu_cells[x].x : 0;
+    x = multicell_char_columns(line->cpu_cells, line->xnum, x).start;
     hyperlink_id_type hid;
     if ((hid = line->cpu_cells[x].hyperlink_id)) {
         // Marking a hyperlink scans the surrounding lines, so skip it when not needed
@@ -5470,20 +8117,18 @@ screen_draw_overlay_line(Screen *self) {
     // dashed avoids colliding with the styles applications already use: curly
     // for spell checking and straight for hyperlinks. Saved and restored around
     // the draw, like the modes above.
-    const bool orig_italic = self->cursor->sgr.italic;
-    const uint8_t orig_decoration = self->cursor->sgr.decoration;
-    const color_type orig_decoration_fg = self->cursor->sgr.decoration_fg;
-    self->cursor->sgr.italic = true;
-    self->cursor->sgr.decoration = 5; // dashed
-    self->cursor->sgr.decoration_fg = ((colorprofile_to_color_with_fallback(
-                                            self->color_profile,
-                                            self->color_profile->overridden.highlight_bg,
-                                            self->color_profile->configured.highlight_bg,
-                                            self->color_profile->overridden.default_fg,
-                                            self->color_profile->configured.default_fg) &
-                                        COL_MASK)
-                                       << 8) |
-                                      2;
+    const CellStyle orig_style = self->cursor->style;
+    self->cursor->style.attrs.italic = true;
+    self->cursor->style.attrs.decoration = 5; // dashed
+    self->cursor->style.decoration_fg = ((colorprofile_to_color_with_fallback(
+                                              self->color_profile,
+                                              self->color_profile->overridden.highlight_bg,
+                                              self->color_profile->configured.highlight_bg,
+                                              self->color_profile->overridden.default_fg,
+                                              self->color_profile->configured.default_fg) &
+                                          COL_MASK)
+                                         << 8) |
+                                        2;
     self->cursor->x = xstart;
     self->cursor->y = self->overlay_line.ynum;
     self->overlay_line.xnum = 0;
@@ -5498,13 +8143,34 @@ screen_draw_overlay_line(Screen *self) {
             c++;
         }
     }
+    // Chars of several rows in the cells the text covers are blanked on this row only. The draw would otherwise move the text
+    // to another row past them, or remove them from all their rows.
+    {
+        CPUCell *cells = self->linebuf->line->cpu_cells;
+        const index_type limit = MIN(self->columns, xstart + self->overlay_line.text_len);
+        for (index_type x = xstart; x < limit; x++) {
+            const CPUCell *c = cells + x;
+            if (!c->is_multicell || (c->scale < 2 && !c->y)) continue;
+            const index_type start = x - MIN(x, (index_type)c->x), end = MIN(self->columns, start + mcd_x_limit(c));
+            for (index_type cx = MAX(start, xstart); cx < end; cx++) {
+                const CPUCell old = cells[cx];
+                cells[cx] = (CPUCell){.ch_or_idx = ' ', .hyperlink_id = old.hyperlink_id, .style_idx = old.style_idx};
+            }
+            x = MAX(x, end) - 1;
+        }
+    }
+    self->overlay_line.drawing = true;
+    self->overlay_line.draw_left = xstart;
     index_type before;
     const int kind = PyUnicode_KIND(self->overlay_line.overlay_text);
     const void *data = PyUnicode_DATA(self->overlay_line.overlay_text);
     const Py_ssize_t sz = PyUnicode_GET_LENGTH(self->overlay_line.overlay_text);
     for (Py_ssize_t pos = 0; pos < sz; pos++) {
         before = self->cursor->x;
-        draw_codepoint(self, PyUnicode_READ(kind, data, pos));
+        const char_type ch = PyUnicode_READ(kind, data, pos);
+        // A control char would act on the screen: a line feed scrolls it
+        if (ch < ' ' || (0x7f <= ch && ch < 0xa0)) continue;
+        draw_codepoint(self, ch);
         index_type len = self->cursor->x - before;
         if (columns_exceeded > 0) {
             // Reset the cursor to maintain right alignment when the overlay exceeds the screen width.
@@ -5534,10 +8200,9 @@ screen_draw_overlay_line(Screen *self) {
         }
         self->overlay_line.xnum += len;
     }
+    self->overlay_line.drawing = false;
     self->overlay_line.cursor_x = overlay_line_cursor_x(self);
-    self->cursor->sgr.italic = orig_italic;
-    self->cursor->sgr.decoration = orig_decoration;
-    self->cursor->sgr.decoration_fg = orig_decoration_fg;
+    self->cursor->style = orig_style;
     self->cursor = orig_cursor;
     self->modes.mDECAWM = orig_line_wrap_mode;
     self->modes.mDECTCEM = orig_cursor_enable_mode;
@@ -5569,13 +8234,21 @@ update_overlay_position(Screen *self) {
 static void
 render_overlay_line(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data) {
 #define ol self->overlay_line
-    line_save_cells(line, 0, line->xnum, ol.original_line.gpu_cells, ol.original_line.cpu_cells);
+    line_save_cells(line, 0, line->xnum, ol.original_line.render_cells, ol.original_line.cpu_cells);
     screen_draw_overlay_line(self);
-    render_line(fonts_data, line, ol.ynum, self->cursor, self->disable_ligatures, self->lc);
-    line_save_cells(line, 0, line->xnum, ol.gpu_cells, ol.cpu_cells);
-    line_reset_cells(line, 0, line->xnum, ol.original_line.gpu_cells, ol.original_line.cpu_cells);
+    // The pre-edit text is shaped in the direction guessed from it, as with bidi mode off, also on a line with a record
+    const uint8_t *levels = NULL;
+    BidiMaps *b = self->bidi_maps;
+    if (b) {
+        ensure_space_for(b, row_levels, uint8_t, line->xnum, row_levels_cap, line->xnum, false);
+        memset(b->row_levels, BIDI_LEVEL_FIXED, line->xnum);
+        levels = b->row_levels;
+    }
+    render_line(fonts_data, line, ol.ynum, self->cursor, self->disable_ligatures, self->lc, levels);
+    line_save_cells(line, 0, line->xnum, ol.render_cells, ol.cpu_cells);
+    line_reset_cells(line, 0, line->xnum, ol.original_line.render_cells, ol.original_line.cpu_cells);
     ol.is_dirty = false;
-    const index_type x = screen_overlay_line_start(self), y = MIN(ol.ynum + self->scrolled_by, self->lines - 1);
+    const index_type x = screen_ime_anchor_x(self), y = MIN(ol.ynum + self->scrolled_by, self->lines - 1);
     // The IME is anchored at the start of the pre-edit text, see prepare_ime_position_update_event()
     if (ol.last_ime_pos.x != x || ol.last_ime_pos.y != y) {
         ol.last_ime_pos.x = x;
@@ -5587,9 +8260,21 @@ render_overlay_line(Screen *self, Line *line, FONTS_DATA_HANDLE fonts_data) {
 
 static void
 update_overlay_line_data(Screen *self, uint8_t *data) {
-    const int render_row_offset = pixel_scroll_enabled(self);
-    const size_t base = sizeof(GPUCell) * (self->overlay_line.ynum + self->scrolled_by + render_row_offset) * self->columns;
-    memcpy(data + base, self->overlay_line.gpu_cells, self->columns * sizeof(GPUCell));
+    const index_type render_row = render_row_of(self, self->overlay_line.ynum);
+    CellGPUData *row = (CellGPUData *)(data + sizeof(CellGPUData) * render_row * self->columns);
+    index_type start;
+    if (screen_overlay_visual_start(self, &start)) {
+        // The row was uploaded through its map, only the pre-edit block goes over it
+        const index_type s = screen_overlay_line_start(self), n = MIN(self->overlay_line.text_len, self->columns);
+        if (!n) return;
+        cells_for_gpu(self->overlay_line.cpu_cells + s, self->overlay_line.render_cells + s, n, row + start);
+        // The block can cut a wide character, whose other half the bidi-off upload blanks
+        const CPUCell *cells = linebuf_cpu_cells_for_line(self->linebuf, self->overlay_line.ynum);
+        if (start) bidi_blank_cut_half(self->bidi_maps, cells, render_row, row, start - 1, start);
+        if (start + n < self->columns) bidi_blank_cut_half(self->bidi_maps, cells, render_row, row, start + n, start + n - 1);
+        return;
+    }
+    cells_for_gpu(self->overlay_line.cpu_cells, self->overlay_line.render_cells, self->columns, row);
 }
 
 // }}}
@@ -5681,14 +8366,25 @@ get_range_line(void *x, int y) {
     return range_line_(x, y);
 }
 
+static uint8_t
+visual_bidi_above(void *x) {
+    Screen *self = x;
+    return screen_bidi_record_above(self, -(int)self->scrolled_by);
+}
+
+static uint8_t
+range_bidi_above(void *x) {
+    return screen_bidi_record_above(x, 0);
+}
+
 static PyObject *
 as_text(Screen *self, PyObject *args) {
-    return as_text_generic(args, self, get_visual_line, self->lines, &self->as_ansi_buf, false);
+    return as_text_generic(args, self, get_visual_line, self->lines, &self->as_ansi_buf, false, visual_bidi_above, false);
 }
 
 static PyObject *
 as_text_non_visual(Screen *self, PyObject *args) {
-    return as_text_generic(args, self, get_range_line, self->lines, &self->as_ansi_buf, false);
+    return as_text_generic(args, self, get_range_line, self->lines, &self->as_ansi_buf, false, range_bidi_above, false);
 }
 
 static PyObject *
@@ -5698,7 +8394,7 @@ as_text_for_history_buf(Screen *self, PyObject *args) {
 
 static PyObject *
 as_text_generic_wrapper(Screen *self, PyObject *args, get_line_func get_line) {
-    return as_text_generic(args, self, get_line, self->lines, &self->as_ansi_buf, false);
+    return as_text_generic(args, self, get_line, self->lines, &self->as_ansi_buf, false, range_bidi_above, false);
 }
 
 static PyObject *
@@ -5721,6 +8417,12 @@ static Line *
 get_line_from_offset(void *x, int y) {
     OutputOffset *r = x;
     return range_line_(r->screen, r->start + y);
+}
+
+static uint8_t
+offset_bidi_above(void *x) {
+    OutputOffset *r = x;
+    return screen_bidi_record_above(r->screen, r->start);
 }
 
 static bool
@@ -5834,7 +8536,6 @@ remove_multicell_fragments_cut_off_above_screen(Screen *self, index_type num_lin
                 found = true;
                 cell_set_char(c, 0);
                 cell_clear_multicell(c);
-                clear_sprite_position(line->gpu_cells[x]);
             }
         }
         if (!found) break; // a multicell char cannot skip a line
@@ -5890,7 +8591,14 @@ erase_last_command(Screen *self, PyObject *args UNUSED) {
         else *r += *r < start ? (int)num_deleted_from_history : -(int)num_lines_to_erase_in_screen;
     }
     // The line above the erased region no longer wraps into the line after it
-    if ((line = checked_range_line(self, start - 1))) line->cpu_cells[line->xnum - 1].next_char_was_wrapped = false;
+    if ((line = checked_range_line(self, start - 1))) {
+        line->cpu_cells[line->xnum - 1].next_char_was_wrapped = false;
+        // its paragraph ends there now, which a clean row in the history would not show
+        if (self->main_linebuf->bidi_stamped || self->historybuf->bidi_stamped) {
+            mark_range_line_dirty(self, start - 1);
+            self->historybuf->bidi_walked = 0;
+        }
+    }
     if (num_lines_to_erase_in_screen) {
         // Anchor the on-screen deletion at the top of the region, not at
         // cursor->y - count: a multi-line prompt or rows skipped above would
@@ -5919,6 +8627,9 @@ erase_last_command(Screen *self, PyObject *args UNUSED) {
         self->is_dirty = true;
         dirty_scroll(self);
     }
+    // The line after the erased region, where it is now, starts a paragraph of its own
+    if (self->main_linebuf->bidi_stamped || self->historybuf->bidi_stamped)
+        mark_range_line_dirty(self, num_lines_to_erase_in_screen ? screen_start : live_prompt_start);
     Py_RETURN_TRUE;
 }
 
@@ -5977,11 +8688,14 @@ cmd_output(Screen *self, PyObject *args) {
         } break;
         default: PyErr_Format(PyExc_KeyError, "%u is not a valid type of command", which); return NULL;
     }
+    // The caller then puts the scrollback pager history before the output
+    const bool after_pagerhist = oo.reached_upper_limit && self->linebuf == self->main_linebuf && OPT(scrollback_pager_history_size) > 0;
     if (found) {
-        RAII_PyObject(ret, as_text_generic(as_text_args, &oo, get_line_from_offset, oo.num_lines, &self->as_ansi_buf, false));
+        RAII_PyObject(
+            ret, as_text_generic(as_text_args, &oo, get_line_from_offset, oo.num_lines, &self->as_ansi_buf, false, offset_bidi_above, after_pagerhist));
         if (!ret) return NULL;
     }
-    if (oo.reached_upper_limit && self->linebuf == self->main_linebuf && OPT(scrollback_pager_history_size) > 0) Py_RETURN_TRUE;
+    if (after_pagerhist) Py_RETURN_TRUE;
     Py_RETURN_FALSE;
 }
 
@@ -6069,6 +8783,17 @@ screen_truncate_point_for_length(PyObject UNUSED *self, PyObject *args) {
 
 
 static PyObject *
+test_text_of_line_for_cursor(Screen *self, PyObject *args) {
+    unsigned int x, y;
+    if (!PyArg_ParseTuple(args, "II", &x, &y)) return NULL;
+    Line overlay_line;
+    Line *line = screen_line_for_cursor(self, x, y, &overlay_line);
+    if (!line) Py_RETURN_NONE;
+    RAII_ANSIBuf(buf);
+    return line_as_unicode(line, false, &buf);
+}
+
+static PyObject *
 line(Screen *self, PyObject *val) {
     unsigned long y = PyLong_AsUnsignedLong(val);
     if (y >= self->lines) {
@@ -6104,7 +8829,7 @@ draw(Screen *self, PyObject *src) {
     if (PyUnicode_READY(src) != 0) { return PyErr_NoMemory(); }
     Py_UCS4 *buf = PyUnicode_AsUCS4Copy(src);
     if (!buf) return NULL;
-    draw_text(self, buf, PyUnicode_GetLength(src));
+    draw_text_in_mode(self, buf, PyUnicode_GetLength(src));
     PyMem_Free(buf);
     Py_RETURN_NONE;
 }
@@ -6176,8 +8901,11 @@ set_progress(Screen *self, PyObject *a) {
     ProgressBarState new_state = (ProgressBarState)(state > PROGRESS_STATE_PAUSED ? PROGRESS_STATE_UNSET : state);
     uint8_t new_percent = (uint8_t)(percent > 100 ? 100 : percent);
     if (self->progress_state != new_state || self->progress_percent != new_percent) {
+        self->progress_previous_percent = self->progress_percent;
+        self->progress_previous_state = self->progress_state;
         self->progress_state = new_state;
         self->progress_percent = new_percent;
+        self->progress_changed_at = monotonic();
         // Start or stop indeterminate animation
         if (new_state == PROGRESS_STATE_INDETERMINATE && self->progress_indeterminate_anim_at == 0) {
             self->progress_indeterminate_anim_at = monotonic();
@@ -6228,6 +8956,7 @@ MODE_GETSET(focus_tracking_enabled, FOCUS_TRACKING)
 MODE_GETSET(color_preference_notification, COLOR_PREFERENCE_NOTIFICATION)
 MODE_GETSET(in_band_resize_notification, INBAND_RESIZE_NOTIFICATION)
 MODE_GETSET(paste_events, PASTE_EVENTS)
+MODE_GETSET(wheel_events, WHEEL_EVENTS)
 MODE_GETSET(auto_repeat_enabled, DECARM)
 MODE_GETSET(cursor_visible, DECTCEM)
 MODE_GETSET(cursor_key_mode, DECCKM)
@@ -6635,6 +9364,7 @@ screen_is_selection_dirty(Screen *self) {
     IterationData q;
     if (self->paused_rendering.expires_at) return false;
     if (self->scrolled_by != self->last_rendered.scrolled_by) return true;
+    if (self->bidi_maps && bidi_selection_dirty(self)) return true;
     if (self->selections.last_rendered_count != self->selections.count || self->url_ranges.last_rendered_count != self->url_ranges.count ||
         self->extra_cursors.dirty)
         return true;
@@ -7184,6 +9914,109 @@ toggle_alt_screen(Screen *self, PyObject *a UNUSED) {
 }
 
 static PyObject *
+smooth_scroll_define(Screen *self, PyObject *args) {
+    unsigned int id, left, top, right, bottom, capacity = 1;
+    int private_overflow = 0, horizontal = 0;
+    if (!PyArg_ParseTuple(args, "IIIII|Ipp", &id, &left, &top, &right, &bottom, &capacity, &private_overflow, &horizontal)) return NULL;
+    return Py_NewRef(screen_smooth_scroll_define(self, id, left, top, right, bottom, capacity, private_overflow, horizontal) ? Py_True : Py_False);
+}
+
+static PyObject *
+smooth_scroll(Screen *self, PyObject *args) {
+    unsigned int id;
+    int delta, rows_shifted;
+    if (!PyArg_ParseTuple(args, "Ii", &id, &delta)) return NULL;
+    if (!screen_smooth_scroll(self, id, delta, &rows_shifted)) Py_RETURN_NONE;
+    return PyLong_FromLong(rows_shifted);
+}
+
+static PyObject *
+smooth_scroll_remove(Screen *self, PyObject *args) {
+    unsigned int id;
+    if (!PyArg_ParseTuple(args, "I", &id)) return NULL;
+    return Py_NewRef(screen_smooth_scroll_remove(self, id) ? Py_True : Py_False);
+}
+
+static PyObject *
+smooth_scroll_regions(Screen *self, PyObject *args UNUSED) {
+    RAII_PyObject(ans, PyTuple_New(self->smooth_scroll.count));
+    if (!ans) return NULL;
+    for (unsigned i = 0; i < self->smooth_scroll.count; i++) {
+        const SmoothScrollRegion *r = self->smooth_scroll.regions + i;
+        PyObject *d = Py_BuildValue(
+            "{sI sI sI sI sI sI si sI sI sO sO sO}",
+            "id",
+            r->id,
+            "left",
+            r->left,
+            "top",
+            r->top,
+            "right",
+            r->right,
+            "bottom",
+            r->bottom,
+            "capacity",
+            r->capacity,
+            "offset",
+            r->offset,
+            "num_before",
+            r->num_before,
+            "num_after",
+            r->num_after,
+            "private_overflow",
+            r->private_overflow ? Py_True : Py_False,
+            "uses_history",
+            ssr_uses_history(self, r) ? Py_True : Py_False,
+            "horizontal",
+            r->horizontal ? Py_True : Py_False);
+        if (!d) return NULL;
+        PyTuple_SET_ITEM(ans, i, d);
+    }
+    return Py_NewRef(ans);
+}
+
+static PyObject *
+smooth_scroll_overflow(Screen *self, PyObject *args) {
+    // The text of the rows in an overflow buffer of a region, nearest first
+    unsigned int id;
+    int above;
+    if (!PyArg_ParseTuple(args, "Ip", &id, &above)) return NULL;
+    SmoothScrollRegion *r = ssr_for_id(self, id);
+    if (!r) {
+        PyErr_Format(PyExc_KeyError, "No smooth scroll region with id: %u", id);
+        return NULL;
+    }
+    const index_type n = above ? r->num_before : r->num_after;
+    if (r->horizontal) {
+        // The columns to the left or right of each row, in order from left to right
+        RAII_PyObject(ans, PyTuple_New(ssr_height(r)));
+        if (!ans) return NULL;
+        for (index_type y = 0; y < ssr_height(r); y++) {
+            Line line = {.text_cache = self->text_cache};
+            linebuf_init_line_at(r->overflow, above ? y : ssr_height(r) + y, &line);
+            if (above) {
+                line.cpu_cells += r->capacity - n;
+                line.render_cells += r->capacity - n;
+            }
+            line.xnum = n;
+            PyObject *t = line_as_unicode(&line, false, &self->as_ansi_buf);
+            if (!t) return NULL;
+            PyTuple_SET_ITEM(ans, y, t);
+        }
+        return Py_NewRef(ans);
+    }
+    RAII_PyObject(ans, PyTuple_New(n));
+    if (!ans) return NULL;
+    for (index_type i = 0; i < n; i++) {
+        linebuf_init_line(r->overflow, ssr_slot(r, above, i));
+        PyObject *t = line_as_unicode(r->overflow->line, false, &self->as_ansi_buf);
+        if (!t) return NULL;
+        PyTuple_SET_ITEM(ans, i, t);
+    }
+    return Py_NewRef(ans);
+}
+
+static PyObject *
 pause_rendering(Screen *self, PyObject *args) {
     int msec = 100;
     int pause = 1;
@@ -7223,10 +10056,8 @@ screen_mark_all(Screen *self) {
         linebuf_init_line(self->alt_linebuf, y);
         mark_text_in_line(self->marker, self->alt_linebuf->line, &self->as_ansi_buf);
     }
-    for (index_type y = 0; y < self->historybuf->count; y++) {
-        historybuf_init_line(self->historybuf, y, self->historybuf->line);
-        mark_text_in_line(self->marker, self->historybuf->line, &self->as_ansi_buf);
-    }
+    // Marks are render data, history lines are marked when rendered
+    for (index_type y = 0; y < self->historybuf->count; y++) historybuf_mark_line_dirty(self->historybuf, y);
     self->is_dirty = true;
 }
 
@@ -7258,10 +10089,20 @@ scroll_to_next_mark(Screen *self, PyObject *args) {
     unsigned int mark = 0;
     if (!PyArg_ParseTuple(args, "|Ip", &mark, &backwards)) return NULL;
     if (!screen_has_marker(self) || self->linebuf == self->alt_linebuf) Py_RETURN_FALSE;
+    // History lines have no render data and so no marks, compute them in a scratch buffer
+    RAII_ALLOC(RenderCell, scratch, calloc(self->historybuf->xnum, sizeof(RenderCell)));
+    if (!scratch) return PyErr_NoMemory();
+    bool found;
+#define history_line_has_mark(y)                                                  \
+    (historybuf_init_line(self->historybuf, y, self->historybuf->line),           \
+     self->historybuf->line->render_cells = scratch,                              \
+     mark_text_in_line(self->marker, self->historybuf->line, &self->as_ansi_buf), \
+     found = line_has_mark(self->historybuf->line, mark),                         \
+     self->historybuf->line->render_cells = NULL,                                 \
+     found)
     if (backwards) {
         for (unsigned int y = self->scrolled_by; y < self->historybuf->count; y++) {
-            historybuf_init_line(self->historybuf, y, self->historybuf->line);
-            if (line_has_mark(self->historybuf->line, mark)) {
+            if (history_line_has_mark(y)) {
                 screen_history_scroll(self, y - self->scrolled_by + 1, true);
                 Py_RETURN_TRUE;
             }
@@ -7270,8 +10111,11 @@ scroll_to_next_mark(Screen *self, PyObject *args) {
         Line *line;
         for (unsigned int y = self->scrolled_by; y > 0; y--) {
             if (y > self->lines) {
-                historybuf_init_line(self->historybuf, y - self->lines, self->historybuf->line);
-                line = self->historybuf->line;
+                if (history_line_has_mark(y - self->lines)) {
+                    screen_history_scroll(self, self->scrolled_by - y + 1, false);
+                    Py_RETURN_TRUE;
+                }
+                continue;
             } else {
                 linebuf_init_line(self->linebuf, self->lines - y);
                 line = self->linebuf->line;
@@ -7282,6 +10126,7 @@ scroll_to_next_mark(Screen *self, PyObject *args) {
             }
         }
     }
+#undef history_line_has_mark
     Py_RETURN_FALSE;
 }
 
@@ -7292,8 +10137,7 @@ marked_cells(Screen *self, PyObject *o UNUSED) {
     for (index_type y = 0; y < self->lines; y++) {
         linebuf_init_line(self->linebuf, y);
         for (index_type x = 0; x < self->columns; x++) {
-            GPUCell *gpu_cell = self->linebuf->line->gpu_cells + x;
-            const unsigned int mark = gpu_cell->attrs.mark;
+            const unsigned int mark = self->linebuf->line->render_cells[x].mark;
             if (mark) {
                 RAII_PyObject(t, Py_BuildValue("III", x, y, mark));
                 if (!t) { return NULL; }
@@ -7521,17 +10365,23 @@ line_edge_colors(Screen *self, PyObject *a UNUSED) {
     return Py_BuildValue("kk", (unsigned long)left, (unsigned long)right);
 }
 
+// With strips true, the data of the strips, laid out as the renderer lays them out, follows that of the screen cells
 static PyObject *
-current_selections(Screen *self, PyObject *a UNUSED) {
-    PyObject *ans = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)render_lines_for_screen(self) * self->columns);
+current_selections(Screen *self, PyObject *args) {
+    int strips = 0;
+    if (!PyArg_ParseTuple(args, "|p", &strips)) return NULL;
+    if (strips) screen_prepare_smooth_scroll_render(self); // mimic what the renderer does
+    const size_t num_cells = (size_t)render_lines_for_screen(self) * self->columns + (strips ? self->smooth_scroll_render.num_strip_cells : 0);
+    PyObject *ans = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)num_cells);
     if (!ans) return NULL;
-    screen_apply_selection(self, PyBytes_AS_STRING(ans), PyBytes_GET_SIZE(ans));
+    screen_apply_selection(self, PyBytes_AS_STRING(ans), PyBytes_GET_SIZE(ans), 1);
     self->last_rendered.scrolled_by = rendered_scrolled_by(self); // mimic what the renderer does
     return ans;
 }
 
 static PyObject *
 update_graphics_layers(Screen *self, PyObject *a UNUSED) {
+    screen_prepare_smooth_scroll_render(self); // mimic what the renderer does
     screen_update_graphics_layers(self);
     return grman_render_data_as_python(self->paused_rendering.expires_at ? self->paused_rendering.grman : self->grman);
 }
@@ -7627,6 +10477,43 @@ test_commit_write_buffer(Screen *screen, PyObject *args) {
     memcpy(destbuf.buf, srcbuf.buf, s);
     vt_parser_commit_write(screen->vt_parser, s);
     return PyLong_FromSize_t(s);
+}
+
+static bool
+verify_styles_in_line(const CellStyleTable *t, const char *which, index_type y, const CPUCell *c, index_type xnum, PyObject *ans) {
+    for (index_type x = 0; x < xnum; x++) {
+        if (c[x].style_idx >= t->count) {
+            RAII_PyObject(e, Py_BuildValue("sIII", which, y, x, (unsigned)c[x].style_idx));
+            if (!e || PyList_Append(ans, e) != 0) return false;
+            if (PyList_GET_SIZE(ans) > 16) return true;
+        }
+    }
+    return true;
+}
+
+static PyObject *
+test_verify_styles(Screen *self, PyObject *a UNUSED) {
+    // Check that the style index of every cell is valid. Returns a list of invalid cells.
+    RAII_PyObject(ans, PyList_New(0));
+    if (!ans) return NULL;
+    const CellStyleTable *t = self->style_table;
+    LineBuf *bufs[3] = {self->main_linebuf, self->alt_linebuf, paused_linebuf_in_use(self)};
+    const char *names[3] = {"main", "alt", "paused"};
+    for (unsigned b = 0; b < arraysz(bufs); b++) {
+        LineBuf *lb = bufs[b];
+        if (!lb) continue;
+        for (index_type y = 0; y < lb->ynum; y++) {
+            if (!verify_styles_in_line(t, names[b], y, linebuf_cpu_cells_for_line(lb, y), lb->xnum, ans)) return NULL;
+        }
+    }
+    for (index_type y = 0; y < self->historybuf->count; y++) {
+        if (!verify_styles_in_line(t, "history", y, historybuf_cpu_cells(self->historybuf, y), self->historybuf->xnum, ans)) return NULL;
+    }
+    if (self->overlay_line.cpu_cells && !verify_styles_in_line(t, "overlay", 0, self->overlay_line.cpu_cells, self->columns, ans)) return NULL;
+    if (self->overlay_line.original_line.cpu_cells &&
+        !verify_styles_in_line(t, "overlay_original", 0, self->overlay_line.original_line.cpu_cells, self->columns, ans))
+        return NULL;
+    return Py_NewRef(ans);
 }
 
 static PyObject *
@@ -7752,6 +10639,224 @@ cpu_cells(Screen *self, PyObject *args) {
 }
 
 static PyObject *
+cell_style_idx(Screen *self, PyObject *args) {
+    int y;
+    unsigned int x;
+    if (!PyArg_ParseTuple(args, "iI", &y, &x)) return NULL;
+    if (y >= (int)self->lines || x >= self->columns) {
+        PyErr_SetString(PyExc_IndexError, "out of bounds");
+        return NULL;
+    }
+    CPUCell *cells;
+    if (y >= 0) cells = linebuf_cpu_cells_for_line(self->linebuf, y);
+    else {
+        Line *l = self->linebuf == self->main_linebuf ? checked_range_line(self, y) : NULL;
+        if (!l) {
+            PyErr_SetString(PyExc_IndexError, "y out of bounds");
+            return NULL;
+        }
+        cells = l->cpu_cells;
+    }
+    return PyLong_FromUnsignedLong(cells[x].style_idx);
+}
+
+static PyObject *
+style_table_info(Screen *self, PyObject *a UNUSED) {
+    return Py_BuildValue(
+        "{sI sI sI sK sO}",
+        "count",
+        self->style_table->count,
+        "max_count",
+        style_table_max_count(self->style_table),
+        "generation",
+        self->style_table->generation,
+        "gc_count",
+        (unsigned long long)style_table_gc_count(self->style_table),
+        "degraded",
+        style_table_is_degraded(self->style_table) ? Py_True : Py_False);
+}
+
+static PyObject *
+test_gc_style_table(Screen *self, PyObject *args) {
+    unsigned int quantize_bits = 0;
+    if (!PyArg_ParseTuple(args, "|I", &quantize_bits)) return NULL;
+    if (quantize_bits > 7) {
+        PyErr_SetString(PyExc_ValueError, "quantize_bits must be less than 8");
+        return NULL;
+    }
+    if (!garbage_collect_style_table(self, quantize_bits, false)) return PyErr_NoMemory();
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+test_set_style_table_limit(Screen *self, PyObject *val) {
+    if (!PyLong_Check(val)) {
+        PyErr_SetString(PyExc_TypeError, "limit must be an int");
+        return NULL;
+    }
+    unsigned long limit = PyLong_AsUnsignedLong(val);
+    if (PyErr_Occurred()) return NULL;
+    style_table_set_max_count(self->style_table, limit > UINT32_MAX ? UINT32_MAX : (uint32_t)limit);
+    Py_RETURN_NONE;
+}
+
+static PyObject *
+test_bidi_line_record(Screen *self, PyObject *val) {
+    unsigned long y = PyLong_AsUnsignedLong(val);
+    if (PyErr_Occurred()) return NULL;
+    if (y >= self->lines) {
+        PyErr_SetString(PyExc_IndexError, "line out of range");
+        return NULL;
+    }
+    LineAttrs a = self->linebuf->line_attrs[y];
+    // A record kept by a line without text is not used, see line_has_bidi_record(). It is not dropped here, so that reading a
+    // line before a write to it does not do the write's work.
+    Line line;
+    linebuf_init_line_at(self->linebuf, y, &line);
+    if (a.bidi_stamp != BIDI_STAMP_NONE && line_is_empty(&line)) line_attrs_set_bidi(&a, (LineAttrs){0});
+    return Py_BuildValue("iOO", (int)a.bidi_stamp, a.bidi_rtl ? Py_True : Py_False, a.bidi_auto ? Py_True : Py_False);
+}
+
+// The record of range line y as a serializer reads it, see line_bidi_record_for_ansi(), and whether the line continues the one
+// above it
+static PyObject *
+test_bidi_range_line_record(Screen *self, PyObject *val) {
+    const long y = PyLong_AsLong(val);
+    if (PyErr_Occurred()) return NULL;
+    if (y < -(long)self->historybuf->count || y >= (long)self->lines) {
+        PyErr_SetString(PyExc_IndexError, "line out of range");
+        return NULL;
+    }
+    Line line = {.xnum = self->columns, .text_cache = self->text_cache};
+    range_line(self, (int)y, &line);
+    const LineAttrs a = {.val = line_bidi_record_for_ansi(&line)};
+    return Py_BuildValue(
+        "(iOO)O",
+        (int)a.bidi_stamp,
+        a.bidi_rtl ? Py_True : Py_False,
+        a.bidi_auto ? Py_True : Py_False,
+        range_line_is_continued(self, (int)y) ? Py_True : Py_False);
+}
+
+static PyObject *
+test_writes_are_recorded(Screen *self, PyObject *args UNUSED) {
+    return PyBool_FromLong(self->bidi_records_writes);
+}
+
+static PyObject *
+test_bidi_may_reorder(Screen *self, PyObject *val) {
+    unsigned long y = PyLong_AsUnsignedLong(val);
+    if (PyErr_Occurred()) return NULL;
+    if (y >= self->lines) {
+        PyErr_SetString(PyExc_IndexError, "line out of range");
+        return NULL;
+    }
+    return Py_NewRef(self->linebuf->line_attrs[y].bidi_may_reorder ? Py_True : Py_False);
+}
+
+static PyObject *
+test_bidi_v2l(Screen *self, PyObject *val) {
+    const unsigned long r = PyLong_AsUnsignedLong(val);
+    if (PyErr_Occurred()) return NULL;
+    const BidiMaps *b = self->bidi_maps;
+    // A row shaped at its levels has a map, the identity when they leave it in logical order
+    if (!screen_bidi_maps_usable(self) || r >= b->rows || !b->has_levels[r]) Py_RETURN_NONE;
+    PyObject *ans = PyTuple_New(b->cols);
+    if (!ans) return NULL;
+    for (index_type x = 0; x < b->cols; x++) PyTuple_SET_ITEM(ans, x, PyLong_FromUnsignedLong(bidi_logical_x(b, r, x)));
+    return ans;
+}
+
+// The level each cell of a render row, or of the pre-edit overlay line, was last rendered at, None for a row without a line
+static PyObject *
+test_render_levels(Screen *self, PyObject *args) {
+    unsigned int render_row;
+    int overlay = 0;
+    if (!PyArg_ParseTuple(args, "I|p", &render_row, &overlay)) return NULL;
+    Line line = {.text_cache = self->text_cache};
+    const RenderCell *rc = self->overlay_line.render_cells;
+    if (!overlay) {
+        index_type lnum;
+        bool is_history;
+        const Line *l = render_row < render_lines_for_screen(self)
+                            ? render_line_for_virtual_y(self, (int)render_row - pixel_scroll_enabled(self), &line, &lnum, &is_history)
+                            : NULL;
+        if (!l) Py_RETURN_NONE;
+        rc = l->render_cells;
+    }
+    PyObject *ans = PyBytes_FromStringAndSize(NULL, self->columns);
+    if (!ans) return NULL;
+    for (index_type x = 0; x < self->columns; x++) PyBytes_AS_STRING(ans)[x] = (char)rc[x].level;
+    return ans;
+}
+
+static PyObject *
+test_bidi_resolved(Screen *self, PyObject *a UNUSED) {
+    if (!screen_bidi_maps_usable(self)) Py_RETURN_NONE;
+    return PyLong_FromUnsignedLong(self->bidi_maps->resolved);
+}
+
+static PyObject *
+test_bidi_walk_matches_full(Screen *self, PyObject *a UNUSED) {
+    return PyBool_FromLong(bidi_walk_matches_full(self));
+}
+
+static PyObject *
+test_bidi_walk_reused(Screen *self, PyObject *a UNUSED) {
+    return PyBool_FromLong(screen_bidi_maps_usable(self) && self->bidi_maps->last_walk_reused);
+}
+
+// Uploads repeat frames without a GPU, with the font group of the given size and dpi, returning the cell data of the last
+static PyObject *
+test_update_cell_data(Screen *self, PyObject *args) {
+    double font_sz_in_pts, dpi_x, dpi_y;
+    unsigned int repeat = 1;
+    if (!PyArg_ParseTuple(args, "ddd|I", &font_sz_in_pts, &dpi_x, &dpi_y, &repeat)) return NULL;
+    FONTS_DATA_HANDLE fonts_data = load_fonts_data(font_sz_in_pts, dpi_x, dpi_y);
+    screen_prepare_smooth_scroll_render(self); // mimic what the renderer does
+    PyObject *ans = PyBytes_FromStringAndSize(
+        NULL, (Py_ssize_t)(sizeof(CellGPUData) * (render_lines_for_screen(self) * self->columns + self->smooth_scroll_render.num_strip_cells)));
+    if (!ans) return NULL;
+    memset(PyBytes_AS_STRING(ans), 0, PyBytes_GET_SIZE(ans));
+    for (unsigned int i = 0; i < repeat; i++) screen_update_cell_data(self, PyBytes_AS_STRING(ans), fonts_data, false);
+    return ans;
+}
+
+static PyObject *
+test_bidi_bracket_limit(Screen *self UNUSED, PyObject *a UNUSED) {
+    return Py_BuildValue("Ns", PyBool_FromLong(bidi_n0_walk_is_slow()), fribidi_version_info);
+}
+
+// The logical cell and half of a click on the visual column x of screen row y, as the mouse code maps it
+static PyObject *
+test_bidi_logical_click(Screen *self, PyObject *args) {
+    index_type x, y;
+    int in_left_half;
+    if (!PyArg_ParseTuple(args, "IIp", &x, &y, &in_left_half)) return NULL;
+    bool left = in_left_half;
+    screen_bidi_logical_click(self, &x, y, &left);
+    return Py_BuildValue("IO", x, left ? Py_True : Py_False);
+}
+
+static PyObject *
+test_hyperlink_under_mouse(Screen *self, PyObject *a UNUSED) {
+    return Py_BuildValue("II", self->current_hyperlink_under_mouse.x, self->current_hyperlink_under_mouse.y);
+}
+
+// The drawn column of the cursor of the given shape, or of the pre-edit cursor while one is active, and the IME anchor column
+static PyObject *
+test_cursor_x(Screen *self, PyObject *args) {
+    int shape = CURSOR_BLOCK;
+    if (!PyArg_ParseTuple(args, "|i", &shape)) return NULL;
+    const Cursor *c = self->paused_rendering.expires_at ? &self->paused_rendering.cursor : self->cursor;
+    const bool overlay = screen_is_overlay_active(self);
+    return Py_BuildValue(
+        "II",
+        screen_cursor_drawn_x(self, overlay ? self->overlay_line.cursor_x : c->x, overlay ? self->overlay_line.ynum : c->y, shape),
+        screen_ime_anchor_x(self));
+}
+
+static PyObject *
 test_ch_and_idx(PyObject *self UNUSED, PyObject *val) {
     CPUCell c = {0};
     if (PyLong_Check(val)) {
@@ -7769,6 +10874,25 @@ static PyMethodDef methods[] = {
     METHODB(test_create_write_buffer, METH_NOARGS),
     METHODB(test_commit_write_buffer, METH_VARARGS),
     METHODB(test_parse_written_data, METH_VARARGS),
+    METHODB(test_verify_styles, METH_NOARGS),
+    METHODB(cell_style_idx, METH_VARARGS),
+    METHODB(style_table_info, METH_NOARGS),
+    METHODB(test_set_style_table_limit, METH_O),
+    METHODB(test_bidi_line_record, METH_O),
+    METHODB(test_bidi_range_line_record, METH_O),
+    METHODB(test_bidi_may_reorder, METH_O),
+    METHODB(test_writes_are_recorded, METH_NOARGS),
+    METHODB(test_bidi_v2l, METH_O),
+    METHODB(test_render_levels, METH_VARARGS),
+    METHODB(test_bidi_resolved, METH_NOARGS),
+    METHODB(test_bidi_walk_matches_full, METH_NOARGS),
+    METHODB(test_bidi_walk_reused, METH_NOARGS),
+    METHODB(test_update_cell_data, METH_VARARGS),
+    METHODB(test_bidi_bracket_limit, METH_NOARGS),
+    METHODB(test_bidi_logical_click, METH_VARARGS),
+    METHODB(test_hyperlink_under_mouse, METH_NOARGS),
+    METHODB(test_cursor_x, METH_VARARGS),
+    METHODB(test_gc_style_table, METH_VARARGS),
     METHODB(test_draw_overlay_line, METH_VARARGS),
     METHODB(test_update_overlay_text, METH_VARARGS),
     METHODB(restore_scrollback, METH_O),
@@ -7798,21 +10922,23 @@ static PyMethodDef methods[] = {
             MND(current_key_encoding_flags, METH_NOARGS) MND(text_for_selection, METH_VARARGS) MND(text_for_marked_url, METH_VARARGS)
                 MND(is_rectangle_select, METH_NOARGS) MND(scroll, METH_VARARGS) MND(scroll_to_absolute, METH_O) MND(fractional_scroll, METH_O)
                     MND(scroll_to_prompt, METH_VARARGS) MND(set_last_visited_prompt, METH_VARARGS) MND(send_escape_code_to_child, METH_VARARGS)
-                        MND(pause_rendering, METH_VARARGS) MND(hyperlink_at, METH_VARARGS) MND(toggle_alt_screen, METH_NOARGS) MND(reset_callbacks, METH_NOARGS)
-                            MND(paste, METH_O) MND(paste_bytes, METH_O) MND(focus_changed, METH_O) MND(has_focus, METH_NOARGS)
-                                MND(has_activity_since_last_focus, METH_NOARGS) MND(copy_colors_from, METH_O) MND(set_marker, METH_VARARGS)
-                                    MND(marked_cells, METH_NOARGS) MND(scroll_to_next_mark, METH_VARARGS) MND(update_only_line_graphics_data, METH_NOARGS)
-                                        MND(bell, METH_NOARGS) MND(current_selections, METH_NOARGS) MND(update_graphics_layers, METH_NOARGS)
-                                            MND(rendered_scroll_state, METH_NOARGS) MND(scrollbar_geometry, METH_NOARGS) MND(has_scrollbar, METH_O)
-                                                MND(is_selection_dirty,
-                                                    METH_NOARGS){"select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
+                        MND(pause_rendering, METH_VARARGS) MND(smooth_scroll_define, METH_VARARGS) MND(smooth_scroll, METH_VARARGS)
+                            MND(smooth_scroll_remove, METH_VARARGS) MND(smooth_scroll_regions, METH_NOARGS) MND(smooth_scroll_overflow, METH_VARARGS)
+                                MND(test_text_of_line_for_cursor, METH_VARARGS) MND(hyperlink_at, METH_VARARGS) MND(toggle_alt_screen, METH_NOARGS)
+                                    MND(reset_callbacks, METH_NOARGS) MND(paste, METH_O) MND(paste_bytes, METH_O) MND(focus_changed, METH_O)
+                                        MND(has_focus, METH_NOARGS) MND(has_activity_since_last_focus, METH_NOARGS) MND(copy_colors_from, METH_O)
+                                            MND(set_marker, METH_VARARGS) MND(marked_cells, METH_NOARGS) MND(scroll_to_next_mark, METH_VARARGS)
+                                                MND(update_only_line_graphics_data, METH_NOARGS) MND(bell, METH_NOARGS) MND(current_selections, METH_VARARGS)
+                                                    MND(update_graphics_layers, METH_NOARGS) MND(rendered_scroll_state, METH_NOARGS)
+                                                        MND(scrollbar_geometry, METH_NOARGS) MND(has_scrollbar, METH_O) MND(is_selection_dirty, METH_NOARGS){
+                                                            "select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
 
     {NULL} /* Sentinel */
 };
 
 static PyGetSetDef getsetters[] = {
     GETSET(in_bracketed_paste_mode) GETSET(color_preference_notification) GETSET(auto_repeat_enabled) GETSET(focus_tracking_enabled)
-        GETSET(in_band_resize_notification) GETSET(paste_events) GETSET(cursor_visible) GETSET(cursor_key_mode) GETSET(disable_ligatures)
+        GETSET(in_band_resize_notification) GETSET(paste_events) GETSET(wheel_events) GETSET(cursor_visible) GETSET(cursor_key_mode) GETSET(disable_ligatures)
             GETSET(render_unfocused_cursor){NULL} /* Sentinel */
 };
 
@@ -7866,11 +10992,18 @@ test_set_history_reuse(PyObject *self UNUSED, PyObject *val) {
     Py_RETURN_NONE;
 }
 
+static PyObject *
+test_set_batched_non_ascii_draw(PyObject *self UNUSED, PyObject *val) {
+    batched_non_ascii_draw_disabled_for_tests = !PyObject_IsTrue(val);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
     {"is_emoji_presentation_base", (PyCFunction)screen_is_emoji_presentation_base, METH_O, ""},
     {"truncate_point_for_length", (PyCFunction)screen_truncate_point_for_length, METH_VARARGS, ""},
     {"test_ch_and_idx", test_ch_and_idx, METH_O, ""},
     {"test_set_history_reuse", test_set_history_reuse, METH_O, ""},
+    {"test_set_batched_non_ascii_draw", test_set_batched_non_ascii_draw, METH_O, ""},
     {NULL} /* Sentinel */
 };
 

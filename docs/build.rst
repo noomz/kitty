@@ -88,11 +88,13 @@ Run-time dependencies:
 * ``libpng``
 * ``liblcms2``
 * ``libxxhash``
+* ``libfribidi`` >= 1.0
 * ``openssl``
 * ``shader-slang`` (needed only if you use custom shaders)
 * ``pixman`` (not needed on macOS)
 * ``cairo`` (not needed on macOS)
 * ``freetype`` (not needed on macOS)
+* ``libbrotli`` (not needed on macOS)
 * ``fontconfig`` (not needed on macOS)
 * ``libcanberra`` (not needed on macOS)
 * ``libsystemd`` (optional, not needed on non systemd systems)
@@ -106,6 +108,8 @@ Build-time dependencies:
 * ``gcc`` or ``clang``
 * ``simde``
 * ``shader-slang``
+* ``vulkan-headers`` (needed only on Linux and BSD, to build the Vulkan GPU driver,
+  without them kitty uses only OpenGL)
 * ``go`` >= _build_go_version (see :file:`go.mod` for go packages used during building)
 * ``pkg-config``
 * Symbols NERD Font Mono either installed system-wide or placed in :file:`fonts/SymbolsNerdFontMono-Regular.ttf`
@@ -120,6 +124,7 @@ Build-time dependencies:
   - ``libxxhash-dev``
   - ``libsimde-dev``
   - ``libcairo2-dev``
+  - ``libfribidi-dev``
 
   .. _x11-dev-libs:
 

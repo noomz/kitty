@@ -29,6 +29,7 @@
 
 #define _GNU_SOURCE
 #include "internal.h"
+#include <X11/Xutil.h>
 #include "math.h"
 #include "backend_utils.h"
 #include "linux_notify.h"
@@ -66,6 +67,7 @@ x11_scroll_stop_timer_callback(unsigned long long timer_id UNUSED, void *data UN
         x11_momentum_scroll_state.last_event.x_offset = 0;
         x11_momentum_scroll_state.last_event.unscaled.x = 0;
         x11_momentum_scroll_state.last_event.unscaled.y = 0;
+        x11_momentum_scroll_state.last_event.phase = GLFW_SCROLL_PHASE_ENDED;
         glfw_handle_scroll_event_for_momentum(w, &x11_momentum_scroll_state.last_event, true, true);
     } else {
         // Window no longer exists, cancel any ongoing momentum
@@ -80,6 +82,25 @@ x11_cancel_momentum_scroll_timer(void) {
         x11_momentum_scroll_state.timer_id = 0;
     }
     x11_momentum_scroll_state.window_id = 0;
+}
+
+// XInput has no end of gesture events, so a gesture is considered to end when
+// no scroll events arrive for a while. If something other than scrolling
+// happens before that, the gesture is cancelled instead.
+static void
+x11_cancel_scroll_gesture(void) {
+    if (!x11_momentum_scroll_state.timer_id) return;
+    _GLFWwindow *w = _glfwWindowForId(x11_momentum_scroll_state.window_id);
+    GLFWScrollEvent ev = x11_momentum_scroll_state.last_event;
+    x11_cancel_momentum_scroll_timer();
+    if (w) {
+        ev.x_offset = 0;
+        ev.y_offset = 0;
+        ev.unscaled.x = 0;
+        ev.unscaled.y = 0;
+        ev.phase = GLFW_SCROLL_PHASE_CANCELLED;
+        _glfwInputScroll(w, &ev);
+    }
 }
 
 // Additional mouse button names for XButtonEvent
@@ -107,6 +128,141 @@ static void handle_xdnd_status(const XClientMessageEvent *event);
 static void handle_xdnd_finished(const XClientMessageEvent *event);
 static bool create_drag_thumbnail(const GLFWimage *thumbnail, int x, int y);
 static bool render_drag_thumbnail_to_pixmap(const GLFWimage *thumbnail);
+
+// Render frames using the Present extension {{{
+// A render frame is requested with a PresentNotifyMSC request for the next
+// vertical blank (MSC) of the CRTC the window is on. The X server answers it
+// with a PresentCompleteNotify event. These events are delivered to a special
+// event queue rather than to the Xlib event queue, as Xlib cannot parse them.
+// Since X servers differ in how they interpret a request for "the next MSC"
+// (Xwayland completes it immediately), the current MSC is first queried with
+// a request that completes immediately, and then the frame is requested for
+// the MSC after it. Xwayland also completes requests for a specific MSC one
+// MSC early, which is detected and compensated for.
+
+static void
+sendNotifyMSC(_GLFWwindow *window, uint64_t target_msc) {
+    xcb_connection_t *conn = XGetXCBConnection(_glfw.x11.display);
+    window->x11.frame.serial++;
+    _glfw.x11.present.notify_msc(conn, window->x11.handle, window->x11.frame.serial, target_msc, 0, 0);
+    xcb_flush(conn);
+}
+
+static void
+destroyPresentEvents(_GLFWwindow *window) {
+    if (!window->x11.frame.special_event) return;
+    xcb_connection_t *conn = XGetXCBConnection(_glfw.x11.display);
+    // Stop the X server sending events before removing the queue, so that they
+    // dont end up in the Xlib event queue
+    if (window->x11.handle) _glfw.x11.present.select_input(conn, window->x11.frame.eid, window->x11.handle, 0);
+    xcb_unregister_for_special_event(conn, window->x11.frame.special_event);
+    window->x11.frame.special_event = NULL;
+    window->x11.frame.pending = false;
+}
+
+static bool
+ensurePresentEvents(_GLFWwindow *window) {
+    if (window->x11.frame.special_event) return true;
+    if (window->x11.frame.failed || !window->x11.handle) return false;
+    xcb_connection_t *conn = XGetXCBConnection(_glfw.x11.display);
+    const uint32_t eid = xcb_generate_id(conn);
+    // Register the queue before selecting the events so that none are missed
+    xcb_special_event_t *special_event = xcb_register_for_special_xge(conn, _glfw.x11.present.id, eid, NULL);
+    if (!special_event) {
+        window->x11.frame.failed = true;
+        _glfwInputError(GLFW_PLATFORM_ERROR, "X11: Failed to register for Present events");
+        return false;
+    }
+    xcb_generic_error_t *err =
+        xcb_request_check(conn, _glfw.x11.present.select_input_checked(conn, eid, window->x11.handle, GLFW_XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY));
+    if (err) {
+        window->x11.frame.failed = true;
+        _glfwInputError(GLFW_PLATFORM_ERROR, "X11: Failed to select Present events with error code: %d", err->error_code);
+        free(err);
+        xcb_unregister_for_special_event(conn, special_event);
+        return false;
+    }
+    window->x11.frame.special_event = special_event;
+    window->x11.frame.eid = eid;
+    return true;
+}
+
+// Estimate the frame period from consecutive frames. Frames separated by a
+// period of inactivity can give wildly wrong estimates, as some X servers,
+// such as Xwayland, dont increment the MSC when the window is idle, so
+// implausible values are discarded and the median of recent estimates is used.
+static void
+recordFramePeriod(_GLFWwindow *window, uint64_t msc, uint64_t ust) {
+    if (window->x11.frame.last_msc && msc > window->x11.frame.last_msc && ust > window->x11.frame.last_ust) {
+        const monotonic_t period = (monotonic_t)((ust - window->x11.frame.last_ust) * 1000ull / (msc - window->x11.frame.last_msc));
+        if (period >= ms_to_monotonic_t(1ll) && period <= ms_to_monotonic_t(50ll)) {
+            const unsigned n = arraysz(window->x11.frame.period_samples);
+            window->x11.frame.period_samples[window->x11.frame.next_period_sample] = period;
+            window->x11.frame.next_period_sample = (window->x11.frame.next_period_sample + 1) % n;
+            if (window->x11.frame.num_period_samples < n) window->x11.frame.num_period_samples++;
+        }
+    }
+    window->x11.frame.last_msc = msc;
+    window->x11.frame.last_ust = ust;
+}
+
+static int
+compareMonotonic(const void *a, const void *b) {
+    const monotonic_t x = *(const monotonic_t *)a, y = *(const monotonic_t *)b;
+    return (x > y) - (x < y);
+}
+
+// Dispatch render frames to the callbacks. Must be called whenever data could
+// have been read from the X connection, as that is when events are moved to
+// the special event queues, after which the X connection does not poll ready.
+static unsigned
+dispatchPresentEvents(void) {
+    if (!_glfw.x11.present.available) return 0;
+    unsigned dispatched = 0;
+    xcb_connection_t *conn = XGetXCBConnection(_glfw.x11.display);
+    for (_GLFWwindow *window = _glfw.windowListHead; window; window = window->next) {
+        if (!window->x11.frame.special_event) continue;
+        bool frame_ready = false;
+        xcb_generic_event_t *ev;
+        while ((ev = xcb_poll_for_special_event(conn, window->x11.frame.special_event)) != NULL) {
+            const GLFWXcbPresentCompleteNotifyEvent *ce = (const GLFWXcbPresentCompleteNotifyEvent *)ev;
+            // The events for buffers presented to the window by the GPU driver
+            // are also received and are ignored, as are responses to superseded
+            // requests, since the response to the latest request arrives at the
+            // same or the next vertical blank
+            if (ce->event_type == GLFW_XCB_PRESENT_COMPLETE_NOTIFY && ce->kind == GLFW_XCB_PRESENT_COMPLETE_KIND_NOTIFY_MSC &&
+                ce->serial == window->x11.frame.serial && window->x11.frame.pending) {
+                if (window->x11.frame.querying) {
+                    window->x11.frame.querying = false;
+                    window->x11.frame.query_msc = ce->msc;
+                    sendNotifyMSC(window, ce->msc + 1 + _glfw.x11.present.extra_target_msc);
+                } else if (ce->msc > window->x11.frame.query_msc) {
+                    window->x11.frame.pending = false;
+                    frame_ready = true;
+                    recordFramePeriod(window, ce->msc, ce->ust);
+                } else {
+                    // Completed before the MSC changed, so the X server completes
+                    // requests early, compensate for it. Limit the compensation
+                    // so that a broken server cannot cause a request storm.
+                    if (_glfw.x11.present.extra_target_msc < 2) {
+                        _glfw.x11.present.extra_target_msc++;
+                        debug_rendering(
+                            "X server completes PresentNotifyMSC early, requesting %llu extra MSC(s)\n",
+                            (unsigned long long)_glfw.x11.present.extra_target_msc);
+                    }
+                    sendNotifyMSC(window, window->x11.frame.query_msc + 1 + _glfw.x11.present.extra_target_msc);
+                }
+            }
+            free(ev);
+        }
+        if (frame_ready && window->x11.frame.callback) {
+            dispatched++;
+            window->x11.frame.callback(window->x11.frame.id);
+        }
+    }
+    return dispatched;
+}
+// }}}
 
 static void
 handleEvents(monotonic_t timeout) {
@@ -1392,10 +1548,16 @@ handle_xi_motion_event(_GLFWwindow *window, XIDeviceEvent *de) {
                 .y_offset = yOffset * (type == GLFW_SCROLL_OFFEST_HIGHRES ? _glfw.x11.contentScaleY : 1),
                 .unscaled = {.x = xOffset, .y = yOffset},
                 .offset_type = type,
+                .source = d->is_finger_based ? GLFW_SCROLL_SOURCE_FINGER
+                                             : (type == GLFW_SCROLL_OFFEST_HIGHRES ? GLFW_SCROLL_SOURCE_UNKNOWN : GLFW_SCROLL_SOURCE_WHEEL),
             };
 
-            // For high-resolution, finger-based scrolling, use timer-based momentum scrolling
-            if (d->is_finger_based && type == GLFW_SCROLL_OFFEST_HIGHRES && glfw_is_momentum_scroll_enabled()) {
+            // For high-resolution, finger-based scrolling, use a timer to detect
+            // the end of the gesture, for gesture phases and momentum scrolling
+            if (d->is_finger_based && type == GLFW_SCROLL_OFFEST_HIGHRES) {
+                const bool gesture_in_progress = x11_momentum_scroll_state.timer_id && x11_momentum_scroll_state.window_id == window->id;
+                if (!gesture_in_progress) x11_cancel_scroll_gesture();
+                ev.phase = gesture_in_progress ? GLFW_SCROLL_PHASE_CHANGED : GLFW_SCROLL_PHASE_BEGAN;
                 // Reset the timer on each scroll event
                 x11_cancel_momentum_scroll_timer();
 
@@ -1417,7 +1579,7 @@ handle_xi_motion_event(_GLFWwindow *window, XIDeviceEvent *de) {
     }
     if (scroll_valuator_found) _glfw.x11.xi.last_smooth_scroll_time = de->time;
     else {
-        x11_cancel_momentum_scroll_timer();
+        x11_cancel_scroll_gesture();
         glfw_cancel_momentum_scroll();
         handle_mouse_move_event(window, (int)de->event_x, (int)de->event_y);
     }
@@ -1926,7 +2088,7 @@ processEvent(XEvent *event) {
 
         case KeyPress: {
             UPDATE_KEYMAP_IF_NEEDED;
-            x11_cancel_momentum_scroll_timer();
+            x11_cancel_scroll_gesture();
             glfw_cancel_momentum_scroll();
             glfw_xkb_handle_key_event(window, &_glfw.x11.xkb, event->xkey.keycode, GLFW_PRESS);
             return;
@@ -1934,7 +2096,7 @@ processEvent(XEvent *event) {
 
         case KeyRelease: {
             UPDATE_KEYMAP_IF_NEEDED;
-            x11_cancel_momentum_scroll_timer();
+            x11_cancel_scroll_gesture();
             glfw_cancel_momentum_scroll();
             if (!_glfw.x11.xkb.detectable) {
                 // HACK: Key repeat events will arrive as KeyRelease/KeyPress
@@ -1969,8 +2131,8 @@ processEvent(XEvent *event) {
         case ButtonPress: {
             const int mods = translateState(event->xbutton.state);
 
-#define cancel_momentum()               \
-    x11_cancel_momentum_scroll_timer(); \
+#define cancel_momentum()        \
+    x11_cancel_scroll_gesture(); \
     glfw_cancel_momentum_scroll()
 
             if (event->xbutton.button == Button1) {
@@ -1990,16 +2152,20 @@ processEvent(XEvent *event) {
             // such as from XTEST (x11vnc, xdotool) are handled normally.
             else if (event->xbutton.button == Button4) {
                 if (!isEmulatedScrollButton(&event->xbutton))
-                    _glfwInputScroll(window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .y_offset = 1, .unscaled.y = 1});
+                    _glfwInputScroll(
+                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .y_offset = 1, .unscaled.y = 1});
             } else if (event->xbutton.button == Button5) {
                 if (!isEmulatedScrollButton(&event->xbutton))
-                    _glfwInputScroll(window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .y_offset = -1, .unscaled.y = -1});
+                    _glfwInputScroll(
+                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .y_offset = -1, .unscaled.y = -1});
             } else if (event->xbutton.button == Button6) {
                 if (!isEmulatedScrollButton(&event->xbutton))
-                    _glfwInputScroll(window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .x_offset = 1, .unscaled.x = 1});
+                    _glfwInputScroll(
+                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .x_offset = 1, .unscaled.x = 1});
             } else if (event->xbutton.button == Button7) {
                 if (!isEmulatedScrollButton(&event->xbutton))
-                    _glfwInputScroll(window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .x_offset = -1, .unscaled.x = -1});
+                    _glfwInputScroll(
+                        window, &(GLFWScrollEvent){.keyboard_modifiers = mods, .source = GLFW_SCROLL_SOURCE_WHEEL, .x_offset = -1, .unscaled.x = -1});
             }
 
             else {
@@ -2073,7 +2239,7 @@ processEvent(XEvent *event) {
                 handle_drag_motion(root_x, root_y, event->xmotion.time);
             }
 
-            x11_cancel_momentum_scroll_timer();
+            x11_cancel_scroll_gesture();
             glfw_cancel_momentum_scroll();
             handle_mouse_move_event(window, event->xmotion.x, event->xmotion.y);
             return;
@@ -2317,43 +2483,33 @@ _glfwPushSelectionToManagerX11(void) {
 //////////////////////////////////////////////////////////////////////////
 
 int
-_glfwPlatformCreateWindow(
-    _GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _GLFWctxconfig *ctxconfig, const _GLFWfbconfig *fbconfig, const GLFWLayerShellConfig *lsc) {
+_glfwPlatformCreateWindow(_GLFWwindow *window, const _GLFWwndconfig *wndconfig, const _GLFWfbconfig *fbconfig UNUSED, const GLFWLayerShellConfig *lsc) {
     Visual *visual = NULL;
-    int depth;
+    int depth = 0;
     if (lsc) {
         window->x11.layer_shell.is_active = true;
         window->x11.layer_shell.config = *lsc;
     } else window->x11.layer_shell.is_active = false;
 
-    if (ctxconfig->client != GLFW_NO_API) {
-        if (ctxconfig->source == GLFW_NATIVE_CONTEXT_API) {
-            if (!_glfwInitGLX()) return false;
-            if (!_glfwChooseVisualGLX(wndconfig, ctxconfig, fbconfig, &visual, &depth)) return false;
-        } else if (ctxconfig->source == GLFW_EGL_CONTEXT_API) {
-            if (!_glfwInitEGL()) return false;
-            if (!_glfwChooseVisualEGL(wndconfig, ctxconfig, fbconfig, &visual, &depth)) return false;
-        } else if (ctxconfig->source == GLFW_OSMESA_CONTEXT_API) {
-            if (!_glfwInitOSMesa()) return false;
+    if (wndconfig->x11.visualID) {
+        // The visual chosen by the GPU driver
+        XVisualInfo desired = {.visualid = wndconfig->x11.visualID, .screen = _glfw.x11.screen};
+        int count = 0;
+        XVisualInfo *result = XGetVisualInfo(_glfw.x11.display, VisualIDMask | VisualScreenMask, &desired, &count);
+        if (!result || !count) {
+            if (result) XFree(result);
+            _glfwInputError(GLFW_PLATFORM_ERROR, "X11: Failed to find the visual with id: 0x%lx", wndconfig->x11.visualID);
+            return false;
         }
-    }
-
-    if (!visual) {
+        visual = result->visual;
+        depth = result->depth;
+        XFree(result);
+    } else {
         visual = DefaultVisual(_glfw.x11.display, _glfw.x11.screen);
         depth = DefaultDepth(_glfw.x11.display, _glfw.x11.screen);
     }
 
     if (!createNativeWindow(window, wndconfig, visual, depth)) return false;
-
-    if (ctxconfig->client != GLFW_NO_API) {
-        if (ctxconfig->source == GLFW_NATIVE_CONTEXT_API) {
-            if (!_glfwCreateContextGLX(window, ctxconfig, fbconfig)) return false;
-        } else if (ctxconfig->source == GLFW_EGL_CONTEXT_API) {
-            if (!_glfwCreateContextEGL(window, ctxconfig, fbconfig)) return false;
-        } else if (ctxconfig->source == GLFW_OSMESA_CONTEXT_API) {
-            if (!_glfwCreateContextOSMesa(window, ctxconfig, fbconfig)) return false;
-        }
-    }
 
     if (window->monitor) {
         _glfwPlatformShowWindow(window, false);
@@ -2371,7 +2527,8 @@ _glfwPlatformDestroyWindow(_GLFWwindow *window) {
 
     if (window->monitor) releaseMonitor(window);
 
-    if (window->context.destroy) window->context.destroy(window);
+    destroyPresentEvents(window);
+    window->x11.frame.callback = NULL;
 
     if (window->x11.handle) {
         XDeleteContext(_glfw.x11.display, window->x11.handle, _glfw.x11.context);
@@ -2948,6 +3105,8 @@ _glfwDispatchX11Events(void) {
 #if defined(__linux__)
     if (_glfw.joysticksInitialized) _glfwDetectJoystickConnectionLinux();
 #endif
+    // Events may have been read from the X connection since the last dispatch, for example, during rendering
+    dispatched += dispatchPresentEvents();
     dispatched += dispatch_x11_queued_events(XEventsQueued(_glfw.x11.display, QueuedAfterFlush));
 
     window = _glfw.x11.disabledCursorWindow;
@@ -2967,6 +3126,7 @@ _glfwDispatchX11Events(void) {
     // as something might have inserted events into the queue, but we want to guarantee
     // a flush.
     dispatched += dispatch_x11_queued_events(XEventsQueued(_glfw.x11.display, QueuedAlready));
+    dispatched += dispatchPresentEvents();
     return dispatched;
 }
 
@@ -3270,45 +3430,8 @@ _glfwPlatformGetClipboard(GLFWClipboardType clipboard_type, const char *mime_typ
     getSelectionString(which, atoms, count, write_data, object, true);
 }
 
-EGLenum
-_glfwPlatformGetEGLPlatform(EGLint **attribs) {
-    if (_glfw.egl.ANGLE_platform_angle) {
-        int type = 0;
-
-        if (_glfw.egl.ANGLE_platform_angle_opengl) {
-            if (_glfw.hints.init.angleType == GLFW_ANGLE_PLATFORM_TYPE_OPENGL) type = EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE;
-        }
-
-        if (_glfw.egl.ANGLE_platform_angle_vulkan) {
-            if (_glfw.hints.init.angleType == GLFW_ANGLE_PLATFORM_TYPE_VULKAN) type = EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE;
-        }
-
-        if (type) {
-            *attribs = calloc(5, sizeof(EGLint));
-            (*attribs)[0] = EGL_PLATFORM_ANGLE_TYPE_ANGLE;
-            (*attribs)[1] = type;
-            (*attribs)[2] = EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE;
-            (*attribs)[3] = EGL_PLATFORM_X11_EXT;
-            (*attribs)[4] = EGL_NONE;
-            return EGL_PLATFORM_ANGLE_ANGLE;
-        }
-    }
-
-    if (_glfw.egl.EXT_platform_base && _glfw.egl.EXT_platform_x11) return EGL_PLATFORM_X11_EXT;
-
-    return 0;
-}
-
-EGLNativeDisplayType
-_glfwPlatformGetEGLNativeDisplay(void) {
-    return _glfw.x11.display;
-}
-
-EGLNativeWindowType
-_glfwPlatformGetEGLNativeWindow(_GLFWwindow *window) {
-    if (_glfw.egl.platform) return &window->x11.handle;
-    else return (EGLNativeWindowType)window->x11.handle;
-}
+void
+_glfwPlatformWindowContentsPresented(_GLFWwindow *window UNUSED) {}
 
 void
 _glfwPlatformGetRequiredInstanceExtensions(char **extensions) {
@@ -3462,6 +3585,18 @@ glfwGetX11Window(GLFWwindow *handle) {
     return window->x11.handle;
 }
 
+GLFWAPI void
+glfwX11PushErrorTrap(void) {
+    _GLFW_REQUIRE_INIT();
+    _glfwPushErrorTrapX11();
+}
+
+GLFWAPI int
+glfwX11PopErrorTrap(void) {
+    _GLFW_REQUIRE_INIT_OR_RETURN(Success);
+    return _glfwPopErrorTrapX11();
+}
+
 GLFWAPI int
 glfwGetNativeKeyForName(const char *keyName, bool caseSensitive) {
     return glfw_xkb_keysym_from_name(keyName, caseSensitive);
@@ -3480,6 +3615,42 @@ glfwDBusSetUserNotificationHandler(GLFWDBusnotificationactivatedfun handler) {
 GLFWAPI bool
 glfwDBusMonitorSessionState(GLFWDBussessionstatefun callback) {
     return glfw_dbus_monitor_session_state(callback);
+}
+
+// The estimated interval between frames of the monitor the window is on, or zero if unknown
+GLFWAPI monotonic_t
+glfwX11GetFramePeriod(GLFWwindow *handle) {
+    _GLFW_REQUIRE_INIT_OR_RETURN(0);
+    _GLFWwindow *window = (_GLFWwindow *)handle;
+    const unsigned n = window->x11.frame.num_period_samples;
+    if (!n) return 0;
+    monotonic_t samples[arraysz(window->x11.frame.period_samples)];
+    memcpy(samples, window->x11.frame.period_samples, n * sizeof(samples[0]));
+    qsort(samples, n, sizeof(samples[0]), compareMonotonic);
+    return samples[n / 2];
+}
+
+GLFWAPI bool
+glfwX11SupportsFrameEvents(void) {
+    _GLFW_REQUIRE_INIT_OR_RETURN(false);
+    return _glfw.x11.present.available;
+}
+
+// Request a callback at the next vertical blank of the monitor the window is
+// on. Returns false if this is not supported, in which case the callback will
+// not be called. A request supersedes any previous pending request.
+GLFWAPI bool
+glfwX11RequestFrameEvent(GLFWwindow *handle, unsigned long long id, void (*callback)(unsigned long long id)) {
+    _GLFW_REQUIRE_INIT_OR_RETURN(false);
+    _GLFWwindow *window = (_GLFWwindow *)handle;
+    if (!_glfw.x11.present.available || !ensurePresentEvents(window)) return false;
+    window->x11.frame.id = id;
+    window->x11.frame.callback = callback;
+    window->x11.frame.pending = true;
+    window->x11.frame.querying = true;
+    // A target MSC of zero with a divisor of zero completes immediately, reporting the current MSC
+    sendNotifyMSC(window, 0);
+    return true;
 }
 
 GLFWAPI int

@@ -16,11 +16,30 @@ import alpha_blend;
 // See https://github.com/kovidgoyal/kitty/issues/10549
 static const float2 vertex_pos_map[4] = { float2(1, 1), float2(1, -1), float2(-1, -1), float2(-1, 1) };
 
+// The uniform parameters of the program, shared by all its stages. See
+// PUSH_CONSTANTS_MAX_SIZE in slang.py for why they are declared this way.
+struct Params {
+    float2 size; // of the rectangle in pixels, the viewport is the rectangle
+    float2 params;
+    float4 color;
+    float4 background_color;
+    float4 outer_color;
+};
+[[vk::push_constant]]
+ConstantBuffer<Params> uniforms;
+
+struct VertexOutput {
+    // Position within the rectangle, (0, 0) at one corner and (1, 1) at the
+    // opposite one. The shape is symmetric so which corner does not matter.
+    float2 uv : TEXCOORD;
+    float4 position : SV_Position;
+};
+
 [shader("vertex")]
-float4
-vertex_main(uint vertex_id: SV_VertexID)
-    : SV_Position {
-    return float4(vertex_pos_map[vertex_id], 0, 1);
+VertexOutput
+vertex_main(uint vertex_id: SV_VertexID) {
+    float2 pos = vertex_pos_map[vertex_id];
+    return { pos * 0.5 + 0.5, float4(pos, 0, 1) };
 }
 
 // Signed distance function for a rounded rectangle
@@ -34,23 +53,15 @@ rounded_rectangle_sdf(float2 p, float2 b, float r) {
 
 [shader("fragment")]
 float4
-fragment_main(
-    uniform float4 rect,
-    uniform float2 params,
-    uniform float4 color,
-    uniform float4 background_color,
-    uniform float4 outer_color,
-    float4 frag_coord: SV_Position // SV_Position provides gl_FragCoord equivalent in Slang
-    )
+fragment_main(float2 uv: TEXCOORD)
     : SV_Target {
-    float2 size = rect.zw; // GLSL .ba maps to .zw or .ba in Slang (using .zw is typical)
-    float2 origin = rect.xy;
-    float thickness = params[0];
-    float corner_radius = params[1];
+    float2 size = uniforms.size;
+    float thickness = uniforms.params[0];
+    float corner_radius = uniforms.params[1];
 
-    // Position must be relative to the center of the rectangle of (size) located at (origin)
-    // frag_coord.xy maps directly to gl_FragCoord.xy
-    float2 position = frag_coord.xy - size / 2.0 - origin;
+    // Position in pixels relative to the center of the rectangle. Not
+    // computed from SV_Position, as its origin differs between backends.
+    float2 position = uv * size - size / 2.0;
 
     // Calculate distance to rounded rectangle
     float dist = rounded_rectangle_sdf(position, size * 0.5 - corner_radius, corner_radius);
@@ -64,12 +75,12 @@ fragment_main(
     float outer_coverage = smoothstep(-step_size, step_size, outer_edge);
     float alpha = outer_coverage - smoothstep(-step_size, step_size, inner_edge);
 
-    float4 ans = color;
+    float4 ans = uniforms.color;
     ans.a *= alpha;
 
     // background_color shows under and inside the border, outer_color fills
     // the corner regions between the rounded outline and the bounding rect
-    float4 under = lerp(outer_color, background_color, outer_coverage);
+    float4 under = lerp(uniforms.outer_color, uniforms.background_color, outer_coverage);
     // pre-multiplied output
     return alpha_blend(ans, under);
 }

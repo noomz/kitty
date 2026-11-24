@@ -147,8 +147,14 @@ test_utf8_decode_to_sentinel(PyObject *self UNUSED, PyObject *args) {
         case 1: func = utf8_decode_to_esc_scalar; break;
         case 2: func = utf8_decode_to_esc_128; break;
         case 3: func = utf8_decode_to_esc_256; break;
-        case 4: func = utf8_decode_to_esc_512; break;
     }
+    // The SIMD decoders read up to a vector beyond the end of the input, as
+    // real callers have slack after their data, so copy into a padded buffer
+    RAII_ALLOC(uint8_t, padded, malloc(src_sz + 128));
+    if (!padded) return PyErr_NoMemory();
+    memcpy(padded, src, src_sz);
+    memset(padded + src_sz, 0, 128);
+    src = padded;
     RAII_PyObject(ans, PyUnicode_FromString(""));
     ssize_t p = 0;
     while (p < src_sz && !found_sentinel) {
@@ -348,12 +354,11 @@ init_simd(void *x) {
         Py_INCREF(Py_##val);                                             \
         if (0 != PyModule_AddObject(module, #x, Py_##val)) return false; \
     }
-#define do_check()                                                                                                                    \
-    {                                                                                                                                 \
-        has_sse4_2 = __builtin_cpu_supports("sse4.2") != 0;                                                                           \
-        has_avx2 = __builtin_cpu_supports("avx2") != 0;                                                                               \
-        has_avx512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl") && \
-                     __builtin_cpu_supports("avx512vbmi2");                                                                           \
+#define do_check()                                                                                                                  \
+    {                                                                                                                               \
+        has_sse4_2 = __builtin_cpu_supports("sse4.2") != 0;                                                                         \
+        has_avx2 = __builtin_cpu_supports("avx2") != 0;                                                                             \
+        has_avx512 = __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl"); \
     }
 
 #ifdef __APPLE__
@@ -396,7 +401,9 @@ init_simd(void *x) {
 #undef do_check
     if (has_avx512) {
         A(has_avx512, True);
-        utf8_decode_to_esc_impl = utf8_decode_to_esc_512;
+        // The AVX2 UTF-8 decoder, which decodes blocks of valid UTF-8 using
+        // the approach of simdutf, is much faster than the AVX-512 one, so it
+        // is used by the has_avx2 branch below.
         find_either_of_two_bytes_impl = find_either_of_two_bytes_512;
         xor_data64_impl = xor_data64_512;
         printable_ascii_run_length_impl = printable_ascii_run_length_512;

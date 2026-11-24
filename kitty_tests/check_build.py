@@ -150,6 +150,42 @@ class TestBuild(BaseTest):
             self.assertTrue(os.path.isfile(path), f'{path} is not a file')
             self.assertTrue(os.access(path, os.X_OK), f'{path} is not executable')
 
+    def test_gpu_drivers(self) -> None:
+        import ctypes
+        import glob
+
+        from kitty.constants import gpu_driver_path, is_macos, shaders_dir
+
+        def check(name: str) -> None:
+            path = gpu_driver_path(name)
+            self.assertTrue(os.path.isfile(path), f'{path} is not a file')
+            self.assertTrue(os.access(path, os.X_OK), f'{path} is not executable')
+            lib = ctypes.CDLL(path)
+            self.assertTrue(hasattr(lib, 'kitty_gpu_driver_load'), f'{path} does not export kitty_gpu_driver_load')
+
+        check('opengl')
+        if is_macos:
+            check('metal')
+            self.assertTrue(glob.glob(os.path.join(shaders_dir, 'msl-*', 'cell.json')), 'The built-in shaders have not been compiled for the Metal GPU driver')
+        # The Vulkan driver is built only when the Vulkan headers are available
+        if not is_macos and os.path.exists(gpu_driver_path('vulkan')):
+            check('vulkan')
+            self.assertTrue(
+                glob.glob(os.path.join(shaders_dir, 'spirv-*', 'cell.json')), 'The built-in shaders have not been compiled for the Vulkan GPU driver'
+            )
+
+    def test_gpu_driver_shaders(self) -> None:
+        # The built-in shaders must have been compiled for the shader target of the driver
+        from kitty.constants import gpu_driver_path, shaders_dir
+        from kitty.fast_data_types import gpu_shader_target, load_gpu_driver
+
+        if not gpu_shader_target():
+            load_gpu_driver(gpu_driver_path('opengl'))
+        target = gpu_shader_target()
+        self.assertTrue(target, 'The GPU driver did not report a shader target')
+        q = os.path.join(shaders_dir, target, 'cell.json')
+        self.assertTrue(os.path.isfile(q), f'The built-in shaders have not been compiled for the {target} shader target of the GPU driver')
+
     def test_all_kitten_names(self) -> None:
         from kittens.runner import all_kitten_names
 

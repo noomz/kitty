@@ -29,7 +29,8 @@ get_coords_for_blit(uint vertex_id, float4 src_rect, float4 dest_rect) {
 }
 
 
-public ConstantBuffer<KittyCustomShaderData> csd;
+[[vk::binding(10)]]
+public ConstantBuffer<KittyCustomShaderData> csd; // binding slots: see SHADER_BINDING_SLOTS in slang.py
 
 
 public float4
@@ -59,7 +60,16 @@ linear2srgb(float3 x) { // vector
     return lerp(lower, upper, step(float3(0.0031308f), x));
 }
 
-uniform Sampler2D backbuffer, a, b, persist;
+[[vk::binding(1)]]
+uniform Sampler2D backbuffer;
+[[vk::binding(3)]]
+uniform Sampler2D a;
+[[vk::binding(4)]]
+uniform Sampler2D b;
+[[vk::binding(5)]]
+uniform Sampler2D persist;
+[[vk::binding(12)]]
+uniform Sampler2D<uint> kitty_windows; // a single channel R32UI texture describing the visible windows
 
 // The size of the pointer map grid, POINTER_MAP_SIZE is defined by kitty from state.h when compiling
 static const float pointer_map_size = POINTER_MAP_SIZE;
@@ -90,22 +100,27 @@ public float4
 pipeline_fragment_main(float2 backbuffer_pos, int group, float4 viewport, float animation_progress, bool convert_to_srgb, uint active_groups) {
     float4 color = backbuffer.Sample(backbuffer_pos); // pre multiplied linear RGB
     color = float4(color.rgb / color.a, color.a);     // un pre multiplied color passed through pipeline
-    // src_rect encodes (0, sy, sx, 0) — the fraction of the shared texture occupied by the current
-    // viewport. The shared texture is grown to fit the largest OS Window viewport and never
-    // shrunk, so sx/sy are less than one whenever this window is smaller than that. Normalize
-    // backbuffer_pos so that t.pos is always in [0,1] viewport UV and wrap the samplers so that
-    // shaders can address them in that same space, regardless of the size of the shared texture.
-    float2 src_scale = float2(max(1e-6, csd.src_rect[right]), max(1e-6, csd.src_rect[top]));
-    float2 viewport_pos = backbuffer_pos / src_scale;
+    // src_rect encodes (0, 0, sx, sy) — the fraction of the shared texture occupied by the current
+    // viewport, which is in its top left corner. The shared texture is grown to fit the largest
+    // OS Window viewport and never shrunk, so sx/sy are less than one whenever this window is
+    // smaller than that. Normalize backbuffer_pos so that t.pos is always in [0,1] viewport UV,
+    // which has its origin at the bottom left, unlike texture co-ordinates, and wrap the samplers
+    // so that shaders can address them in that same space, regardless of the size of the shared
+    // texture.
+    float2 src_scale = float2(max(1e-6, csd.src_rect[right]), max(1e-6, csd.src_rect[bottom]));
+    float2 tex_pos = backbuffer_pos / src_scale;
+    float2 viewport_pos = float2(tex_pos.x, 1.f - tex_pos.y);
     if (group < 0) return encode_pointer_map(viewport_pos, active_groups);
-    // Half a texel inset, in viewport UV, so that clamped samples do not bilinearly blend in the
-    // stale texels that lie just outside the viewport region of the shared texture.
+    // Half a texel inset, in normalized texture co-ordinates, so that clamped samples do not
+    // bilinearly blend in the stale texels that lie just outside the viewport region of the
+    // shared texture.
     float2 max_pos = 1.f - 0.5f / max(float2(csd.viewport_size_pixels), float2(1.f));
     KittyTextures t = {
         { backbuffer, src_scale, max_pos },
         { a, src_scale, max_pos },
         { b, src_scale, max_pos },
         { persist, src_scale, max_pos },
+        { csd.num_windows, kitty_windows, csd.viewport_size_pixels, csd.timestamp_seconds, csd.timestamp_fraction },
         viewport_pos,
         viewport,
         animation_progress,

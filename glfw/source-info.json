@@ -3,10 +3,7 @@
     "headers": [
       "cocoa_platform.h",
       "cocoa_joystick.h",
-      "posix_thread.h",
-      "nsgl_context.h",
-      "egl_context.h",
-      "osmesa_context.h"
+      "posix_thread.h"
     ],
     "sources": [
       "cocoa_init.m",
@@ -14,10 +11,7 @@
       "cocoa_monitor.m",
       "cocoa_window.m",
       "cocoa_displaylink.m",
-      "posix_thread.c",
-      "nsgl_context.m",
-      "egl_context.c",
-      "osmesa_context.c"
+      "posix_thread.c"
     ]
   },
   "common": {
@@ -26,29 +20,12 @@
       "mappings.h"
     ],
     "sources": [
-      "context.c",
       "init.c",
       "input.c",
       "monitor.c",
       "vulkan.c",
       "monotonic.c",
       "window.c"
-    ]
-  },
-  "osmesa": {
-    "headers": [
-      "null_platform.h",
-      "null_joystick.h",
-      "posix_thread.h",
-      "osmesa_context.h"
-    ],
-    "sources": [
-      "null_init.c",
-      "null_monitor.c",
-      "null_window.c",
-      "null_joystick.c",
-      "posix_thread.c",
-      "osmesa_context.c"
     ]
   },
   "wayland": {
@@ -61,8 +38,6 @@
       "dbus_glfw.h",
       "ibus_glfw.h",
       "backend_utils.h",
-      "egl_context.h",
-      "osmesa_context.h",
       "linux_joystick.h",
       "null_joystick.h",
       "linux_notify.h",
@@ -93,7 +68,6 @@
       "staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml",
       "unstable/pointer-gestures/pointer-gestures-unstable-v1.xml",
       "unstable/xdg-output/xdg-output-unstable-v1.xml",
-
       "kwin-blur-v1.xml",
       "wlr-layer-shell-unstable-v1.xml",
       "wlr-virtual-pointer-unstable-v1.xml",
@@ -110,8 +84,6 @@
       "xkb_glfw.c",
       "dbus_glfw.c",
       "ibus_glfw.c",
-      "egl_context.c",
-      "osmesa_context.c",
       "backend_utils.c",
       "linux_joystick.c",
       "linux_desktop_settings.c",
@@ -126,26 +98,6 @@
     1,
     17
   ],
-  "win32": {
-    "headers": [
-      "win32_platform.h",
-      "win32_joystick.h",
-      "wgl_context.h",
-      "egl_context.h",
-      "osmesa_context.h"
-    ],
-    "sources": [
-      "win32_init.c",
-      "win32_joystick.c",
-      "win32_monitor.c",
-      "win32_time.c",
-      "win32_thread.c",
-      "win32_window.c",
-      "wgl_context.c",
-      "egl_context.c",
-      "osmesa_context.c"
-    ]
-  },
   "x11": {
     "headers": [
       "x11_platform.h",
@@ -154,9 +106,6 @@
       "ibus_glfw.h",
       "backend_utils.h",
       "posix_thread.h",
-      "glx_context.h",
-      "egl_context.h",
-      "osmesa_context.h",
       "linux_joystick.h",
       "null_joystick.h",
       "linux_notify.h",
@@ -172,9 +121,6 @@
       "dbus_glfw.c",
       "ibus_glfw.c",
       "posix_thread.c",
-      "glx_context.c",
-      "egl_context.c",
-      "osmesa_context.c",
       "backend_utils.c",
       "linux_joystick.c",
       "null_joystick.c",

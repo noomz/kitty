@@ -8,23 +8,8 @@
 #pragma once
 
 #include "text-cache.h"
+#include "style-table.h"
 
-typedef union CellAttrs {
-    struct {
-        uint16_t decoration : 3;
-        uint16_t bold : 1;
-        uint16_t italic : 1;
-        uint16_t reverse : 1;
-        uint16_t strike : 1;
-        uint16_t dim : 1;
-        uint16_t blink : 1;
-        uint16_t mark : 2;
-        // named so that initializers zero it, see CPUCell
-        uint32_t padding : 21;
-    };
-    uint32_t val;
-} CellAttrs;
-static_assert(sizeof(CellAttrs) == sizeof(uint32_t), "Fix the ordering of CellAttrs");
 
 #define WIDTH_MASK (3u)
 #define DECORATION_MASK (7u)
@@ -41,6 +26,31 @@ typedef struct {
     CellAttrs attrs;
 } GPUCell;
 static_assert(sizeof(GPUCell) == 20, "Fix the ordering of GPUCell");
+// GPUCell is used when rendering lines, see render_line()
+
+// The data for a cell uploaded to the GPU. The shaders get the style of the
+// cell from a texture holding the CellStyleTable of the screen.
+typedef struct CellGPUData {
+    sprite_index sprite_idx;
+    uint32_t style_and_mark; // style_idx << CELL_GPU_STYLE_SHIFT | mark
+} CellGPUData;
+static_assert(sizeof(CellGPUData) == 8, "Fix the ordering of CellGPUData");
+#define CELL_GPU_STYLE_SHIFT 2u
+
+// Data computed when rendering a cell. The style of a cell is stored in its CPUCell.
+typedef struct RenderCell {
+    sprite_index sprite_idx;
+    uint8_t mark;
+    // the embedding level the cell was shaped at: written by the bidi upload, by the region code for kept rows and strip
+    // lines, and cleared by bidi_unstamp(); 0 without bidi
+    uint8_t level;
+    uint8_t padding[2];
+} RenderCell;
+// The level of cells that are never reordered and are shaped in the direction guessed from their text, such as scaled
+// cells, cells of a horizontally scrolling region, multicells across a span edge, the pre-edit text and the rows with a
+// record of a paragraph that is left unreordered. Even, and above the levels FriBidi resolves.
+#define BIDI_LEVEL_FIXED 0x80
+static_assert(sizeof(RenderCell) == 8, "Fix the ordering of RenderCell");
 
 #define SCALE_BITS 3
 #define WIDTH_BITS 3
@@ -60,7 +70,7 @@ typedef union CPUCell {
 #error "Unsupported endianness"
 #endif
         // the fields below are ordered so that none of them straddles a 32
-        // bit boundary, leaving all padding at the end
+        // bit boundary, the style index uses all the bits remaining at the end
         char_type hyperlink_id : sizeof(hyperlink_id_type) * 8;
         char_type scale : SCALE_BITS;
         char_type subscale_n : SUBSCALE_BITS;
@@ -73,11 +83,8 @@ typedef union CPUCell {
         char_type x : WIDTH_BITS + SCALE_BITS;
         char_type y : SCALE_BITS;
         char_type width : WIDTH_BITS;
-        char_type temp_flag : 1;
-        // The padding is named because unnamed bit-fields are left
-        // indeterminate by initializers, and clang on arm64 fills them with
-        // stack garbage, making cells with identical contents compare unequal.
-        char_type padding : 17;
+        // Index of the formatting of this cell in the CellStyleTable of the screen
+        char_type style_idx : STYLE_IDX_BITS;
     };
     struct {
         char_type ch_and_idx : sizeof(char_type) * 8;
@@ -92,23 +99,50 @@ typedef union LineAttrs {
         uint8_t has_dirty_text : 1;
         uint8_t has_image_placeholders : 1;
         uint8_t prompt_kind : 2;
-        // named so that initializers zero it, see CPUCell
-        uint8_t padding : 4;
+        // the bidi controls the line was first written under in implicit mode. On a line without a stamp the other two are
+        // zero, unless a leading mark set bidi_auto: then bidi_rtl is the direction its first text written in implicit mode
+        // takes.
+        uint8_t bidi_stamp : 1;
+        // Clear only when no cell of the line may reorder, see bidi_cells_may_reorder(). Kept up to date only in a paragraph
+        // holding a stamp; elsewhere it may be stale, which costs only work.
+        uint8_t bidi_may_reorder : 1;
+        uint8_t bidi_rtl : 1;
+        uint8_t bidi_auto : 1;
     };
     uint8_t val;
 } LineAttrs;
+enum { BIDI_STAMP_NONE, BIDI_STAMP_IMPLICIT };
 static_assert(sizeof(LineAttrs) == sizeof(uint8_t), "Fix the ordering of LineAttrs");
+
+// A record, or the direction a leading mark set for the line's first text
+static inline bool
+line_has_bidi_bits(LineAttrs a) {
+    return a.bidi_stamp != BIDI_STAMP_NONE || a.bidi_rtl || a.bidi_auto;
+}
+
+// Copies the record of src, or clears it when src has none
+static inline void
+line_attrs_set_bidi(LineAttrs *dest, LineAttrs src) {
+    dest->bidi_stamp = src.bidi_stamp;
+    dest->bidi_rtl = src.bidi_rtl;
+    dest->bidi_auto = src.bidi_auto;
+}
 
 
 typedef struct {
     PyObject_HEAD
 
-        GPUCell *gpu_cells;
+        // Render data, NULL for lines in the history buffer that are not being rendered
+        RenderCell *render_cells;
     CPUCell *cpu_cells;
     index_type xnum, ynum;
     bool needs_free;
     LineAttrs attrs;
     TextCache *text_cache;
+    // For lines that are copies, the generation of the style table when the
+    // copy was made, zero for lines that are views into a buffer. The style
+    // indices in a copy are invalid after the style table is garbage collected.
+    uint32_t style_generation;
 } Line;
 
 typedef struct MultiCellCommand {
@@ -117,11 +151,14 @@ typedef struct MultiCellCommand {
 } MultiCellCommand;
 
 typedef struct ANSILineOutput {
-    const GPUCell *prev_gpu_cell;
+    CellStyle prev_style; // style of the previous cell output, zero (the default style) at the start
     const CPUCell *current_multicell_state;
     index_type pos, limit;
     ANSIBuf *output_buf;
     bool escape_code_written;
+    // The bidi record of the paragraph being written, see ansi_bidi_row_start(), 0 when none is open, and the record whose
+    // controls line_as_ansi() is to write before the text of the next line it writes
+    uint8_t bidi_open, bidi_prefix;
 } ANSILineState;
 
 static inline void
@@ -132,8 +169,8 @@ cleanup_ansibuf(ANSIBuf *b) {
 #define RAII_ANSIBuf(name) __attribute__((cleanup(cleanup_ansibuf))) ANSIBuf name = {0}
 
 Line *alloc_line(TextCache *text_cache);
-void apply_sgr_to_cells(GPUCell *first_cell, unsigned int cell_count, int *params, unsigned int count, bool is_group);
-const char *cell_as_sgr(const GPUCell *, const GPUCell *);
+void apply_sgr_to_cells(CellStyleTable *t, CPUCell *cells, unsigned int cell_count, int *params, unsigned int count, bool is_group);
+const char *style_as_sgr(const CellStyle *, const CellStyle *);
 static inline bool
 cell_has_text(const CPUCell *c) {
     return c->ch_and_idx != 0;
@@ -190,6 +227,41 @@ continues_multicell_char(const CPUCell *c, const CPUCell *ref, index_type y) {
            c->subscale_d == ref->subscale_d && c->ch_and_idx == ref->ch_and_idx;
 }
 
+static inline bool
+continues_multicell_char_horizontally(const CPUCell *c, const CPUCell *ref, index_type x) {
+    // Whether c is the cell in column x of the same multicell char as ref in the same row.
+    return c->is_multicell && c->x == x && c->y == ref->y && c->scale == ref->scale && c->width == ref->width && c->subscale_n == ref->subscale_n &&
+           c->subscale_d == ref->subscale_d && c->ch_and_idx == ref->ch_and_idx;
+}
+
+typedef struct MulticellColumns {
+    index_type start, limit;
+} MulticellColumns;
+
+static inline MulticellColumns
+multicell_char_columns(const CPUCell *cells, index_type xnum, index_type x) {
+    // The columns [start, limit) of the cells of the multicell char whose cell
+    // is at x in a line of xnum cells. Only the cells that actually continue
+    // the char are included, rather than trusting the x and width of cells, as
+    // the char may be split, with some of its cells elsewhere, by a
+    // horizontally scrolled smooth scroll region, or cut off by the end of the
+    // line.
+    const CPUCell *ref = cells + x;
+    MulticellColumns ans = {.start = x, .limit = x + 1};
+    if (!ref->is_multicell) return ans;
+    while (ans.start > 0 && cells[ans.start].x && continues_multicell_char_horizontally(cells + ans.start - 1, ref, cells[ans.start].x - 1u)) ans.start--;
+    while (ans.limit < xnum && cells[ans.limit - 1].x + 1u < mcd_x_limit(ref) &&
+           continues_multicell_char_horizontally(cells + ans.limit, ref, cells[ans.limit - 1].x + 1u))
+        ans.limit++;
+    return ans;
+}
+
+static inline bool
+multicell_char_columns_are_complete(const CPUCell *cells, MulticellColumns c) {
+    // Whether all the columns of the char are present
+    return cells[c.start].x == 0 && c.limit - c.start == mcd_x_limit(cells + c.start);
+}
+
 static inline void
 text_in_cell(const CPUCell *c, const TextCache *tc, ListOfChars *ans) {
     if (c->ch_is_idx) {
@@ -221,6 +293,12 @@ cell_set_chars(CPUCell *c, TextCache *tc, const ListOfChars *lc) {
     }
 }
 
+// The glyph registered with the glyph protocol bound to the cell when its text was printed
+static inline struct VGGlyph *
+cell_registered_glyph(const CPUCell *c, const TextCache *tc) {
+    return c->ch_is_idx ? tc_glyph_at_index(tc, c->ch_or_idx) : NULL;
+}
+
 static inline char_type
 cell_first_char(const CPUCell *c, const TextCache *tc) {
     if (c->ch_is_idx) {
@@ -230,32 +308,63 @@ cell_first_char(const CPUCell *c, const TextCache *tc) {
     return c->ch_or_idx;
 }
 
-static inline CellAttrs
-cursor_to_attrs(const Cursor *c) {
-    CellAttrs ans = {
-        .decoration = c->sgr.decoration,
-        .bold = c->sgr.bold,
-        .italic = c->sgr.italic,
-        .reverse = c->sgr.reverse,
-        .strike = c->sgr.strikethrough,
-        .dim = c->sgr.dim,
-        .blink = c->sgr.blink};
-    return ans;
+static inline CellStyleTable *
+line_style_table(const Line *l) {
+    return tc_style_table(l->text_cache);
+}
+
+static inline bool
+line_styles_are_valid(const Line *l) {
+    // Sets a Python exception and returns false if l is a copy made before the style table was garbage collected
+    if (l->style_generation && l->style_generation != line_style_table(l)->generation) {
+        PyErr_SetString(PyExc_ValueError, "The formatting of this copy of a line is no longer valid, as the style table changed after it was copied");
+        return false;
+    }
+    return true;
+}
+
+static inline const CellStyle *
+line_cell_style(const Line *l, index_type x) {
+    return style_table_get(line_style_table(l), l->cpu_cells[x].style_idx);
+}
+
+static inline uint32_t
+cursor_style_idx_in(CellStyleTable *t, const Cursor *cursor) {
+    // Uses the cache in the cursor without updating it
+    uint32_t idx = cursor->style_idx;
+    return style_table_intern_cached(t, &cursor->style, &idx);
 }
 
 static inline void
-attrs_to_cursor(const CellAttrs attrs, Cursor *c) {
-    c->sgr.decoration = attrs.decoration;
-    c->sgr.bold = attrs.bold;
-    c->sgr.italic = attrs.italic;
-    c->sgr.reverse = attrs.reverse;
-    c->sgr.strikethrough = attrs.strike;
-    c->sgr.dim = attrs.dim;
-    c->sgr.blink = attrs.blink;
+fill_blank_cpu_cells(CPUCell *c, index_type num, uint32_t style_idx) {
+    if (style_idx) {
+        const CPUCell blank = {.style_idx = style_idx};
+        for (index_type i = 0; i < num; i++) c[i] = blank;
+    } else memset(c, 0, num * sizeof(CPUCell));
 }
 
-#define cursor_as_gpu_cell(cursor)      \
-    {.attrs = cursor_to_attrs(cursor),  \
-     .fg = (cursor->sgr.fg & COL_MASK), \
-     .bg = (cursor->sgr.bg & COL_MASK), \
-     .decoration_fg = cursor->sgr.decoration_fg & COL_MASK}
+static inline void
+remap_style_idx_range(CellStyleTable *dest, const CellStyleTable *src, CPUCell *c, index_type num) {
+    // Change the style indices of cells copied from a buffer with a different style table
+    uint32_t cache = 0;
+    for (index_type i = 0; i < num; i++) c[i].style_idx = style_table_intern_cached(dest, style_table_get(src, c[i].style_idx), &cache);
+}
+
+static inline void
+cells_for_gpu(const CPUCell *c, const RenderCell *r, index_type num, CellGPUData *dest) {
+    // Build the cell data uploaded to the GPU. dest may be write combined memory so it is only written to, sequentially.
+    static_assert(MARK_MASK < (1u << CELL_GPU_STYLE_SHIFT), "Increase CELL_GPU_STYLE_SHIFT");
+    for (index_type i = 0; i < num; i++) {
+        const CellGPUData d = {.sprite_idx = r[i].sprite_idx, .style_and_mark = (c[i].style_idx << CELL_GPU_STYLE_SHIFT) | r[i].mark};
+        memcpy(dest + i, &d, sizeof(d));
+    }
+}
+
+static inline void
+cells_for_gpu_permuted(const CPUCell *c, const RenderCell *r, const uint16_t *v2l, index_type num, CellGPUData *dest) {
+    for (index_type i = 0; i < num; i++) {
+        const index_type l = v2l[i];
+        const CellGPUData d = {.sprite_idx = r[l].sprite_idx, .style_and_mark = (c[l].style_idx << CELL_GPU_STYLE_SHIFT) | r[l].mark};
+        memcpy(dest + i, &d, sizeof(d));
+    }
+}
