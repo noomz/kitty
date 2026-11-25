@@ -587,15 +587,14 @@ class Layout:
     def insert_window_next_to_changes_layout(
         self,
         all_windows: WindowList,
-        window: WindowType,
-        next_to: WindowType,
+        src_wg: WindowGroup,
+        dest_wg: WindowGroup,
         horizontal: bool,
         after: bool,
     ) -> bool:
-        "Whether insert_window_next_to() with these arguments would change the layout"
-        src_wg = all_windows.group_for_window(window)
-        dest_wg = all_windows.group_for_window(next_to)
-        if src_wg is None or dest_wg is None or src_wg.id == dest_wg.id or src_wg.dock is not None or dest_wg.dock is not None:
+        """Whether inserting src_wg next to dest_wg would change the layout. Both groups must be
+        groups of all_windows, as returned by all_windows.group_for_window()."""
+        if src_wg.id == dest_wg.id or src_wg.dock is not None or dest_wg.dock is not None:
             return False
         if self.drag_overlay_mode in (DragOverlayMode.axis_x, DragOverlayMode.axis_y):
             # Inserting a group on the side of its neighbour it is already on keeps the order

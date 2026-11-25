@@ -77,6 +77,7 @@ typedef struct Options {
     color_type cursor_trail_color;
     int cursor_trail_start_threshold_x;
     int cursor_trail_start_threshold_y;
+    bool cursor_trail_only_at_prompt;
     unsigned int url_style;
     unsigned int scrollback_pager_history_size;
     bool scrollback_fill_enlarged_window;
@@ -462,10 +463,11 @@ typedef struct CursorMove {
 
 typedef struct CursorTrail {
     bool needs_render;
-    bool target_updated;  // set when cursor moves to a new cell; consumed by child-monitor to fire shader events
-    bool prev_edge_valid; // true once cursor_edge_* has been set at least once
-    bool window_changed;  // set when the most recent cursor move was into a different window
-    id_type window_id;    // the window whose cursor the trail last followed
+    bool target_updated;             // set when cursor moves to a new cell; consumed by child-monitor to fire shader events
+    bool prev_edge_valid;            // true once cursor_edge_* has been set at least once
+    bool window_changed;             // set when the most recent cursor move was into a different window
+    id_type window_id;               // the window whose cursor the trail last followed
+    monotonic_t command_finished_at; // command_state.finished_at of the window the cursor last moved in, when it moved
     monotonic_t updated_at;
     monotonic_t cursor_changed_at; // time of most recent cursor position change (for custom shaders)
     float opacity;

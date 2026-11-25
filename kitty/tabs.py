@@ -289,6 +289,9 @@ class Tab:  # {{{
         # switching away, so it can be saved to a session as well.
         self._used_layouts: dict[str, Layout] = {}
         self.cwd = self.args.directory
+        # Session files expand variables in the cwd when they are parsed, so it
+        # must not be expanded again when launching children.
+        self.cwd_is_expanded = False
         if no_initial_window:
             self._set_current_layout(self.enabled_layouts[0])
         elif session_tab is None:
@@ -300,7 +303,7 @@ class Tab:  # {{{
                 self.new_special_window(special_window)
         else:
             if session_tab.cwd:
-                self.cwd = session_tab.cwd
+                self.cwd, self.cwd_is_expanded = session_tab.cwd, True
             l0 = session_tab.layout
             self._set_current_layout(l0)
             self.startup(session_tab)
@@ -367,6 +370,7 @@ class Tab:  # {{{
         if tm is not None:
             tm.park_os_window_docks(self)
         self.name, self.cwd, self.created_in_session_name = other_tab.name, other_tab.cwd, other_tab.created_in_session_name
+        self.cwd_is_expanded = other_tab.cwd_is_expanded
         self.enabled_layouts = list(other_tab.enabled_layouts)
         self._last_used_layout = other_tab._last_used_layout
         if clname := other_tab._current_layout_name:
@@ -434,6 +438,8 @@ class Tab:  # {{{
                     force_target_tab=True,
                     startup_command_via_shell_integration=window.run_command_at_shell_startup,
                     restored_scrollback=window.restored_scrollback,
+                    # The session parser has already expanded and resolved --cwd
+                    expand_cwd=False,
                 )
                 window.restored_scrollback = b''  # free the memory, it is no longer needed
                 if launched_window is not None:
@@ -513,7 +519,7 @@ class Tab:  # {{{
         appended to it. The os_window_docks are written after the windows of this
         tab, but only if this tab has some windows to write.
         """
-        from .session import is_safe_for_session_line, sanitize_for_session_line, session_launch_line
+        from .session import escape_session_value, is_safe_for_session_line, sanitize_for_session_line, session_launch_line
 
         launch_cmds = []
         active_group = self.windows.active_group
@@ -543,6 +549,9 @@ class Tab:  # {{{
         def make_relative(cwd: str) -> str:
             if session_base_dir and ser_opts.relocatable:
                 cwd = os.path.relpath(cwd, session_base_dir)
+                if not cwd.startswith('.'):
+                    # The prefix keeps directory names such as current and ~user literal.
+                    cwd = os.path.join('.', cwd)
             return cwd
 
         most_common_cwd = ''
@@ -590,7 +599,7 @@ class Tab:  # {{{
                 f'layout {layout}',
                 f'enabled_layouts {",".join(enabled_layouts)}',
                 f'set_layout_state {json.dumps(self.serialize_layout_state_for_session())}',
-                f'cd {most_common_cwd}',
+                f'cd {escape_session_value(most_common_cwd)}',
                 '',
             ] + launch_cmds
         return []
@@ -931,6 +940,7 @@ class Tab:  # {{{
         hold_after_ssh: bool = False,
         startup_command_via_shell_integration: Sequence[str] | str = (),
         launch_request: LaunchRequest | None = None,
+        expand_cwd: bool = True,
     ) -> Child:
         check_for_suitability = True
         if cmd is None:
@@ -959,7 +969,7 @@ class Tab:  # {{{
                     pass
                 else:
                     if stat.S_ISDIR(st.st_mode):
-                        cwd = old_exe
+                        cwd, expand_cwd = old_exe, False
                         cmd = resolved_shell(get_options())
                     elif not is_executable:
                         with suppress(OSError):
@@ -978,9 +988,11 @@ class Tab:  # {{{
         pwid = platform_window_id(self.os_window_id)
         if pwid is not None:
             fenv['WINDOWID'] = str(pwid)
+        if not cwd:
+            cwd, expand_cwd = self.cwd, not self.cwd_is_expanded
         ans = Child(
             cmd,
-            cwd or self.cwd,
+            cwd,
             stdin,
             fenv,
             cwd_from,
@@ -992,6 +1004,7 @@ class Tab:  # {{{
             hold_after_ssh=hold_after_ssh,
             startup_command_via_shell_integration=startup_command_via_shell_integration,
             launch_request=launch_request,
+            expand_cwd=expand_cwd,
         )
         ans.fork()
         return ans
@@ -1059,6 +1072,7 @@ class Tab:  # {{{
         restored_scrollback: bytes = b'',
         os_window_dock: bool = False,
         launch_request: LaunchRequest | None = None,
+        expand_cwd: bool = True,
     ) -> Window:
         """
         Create a new window. When dock is specified, the window is docked to
@@ -1101,6 +1115,7 @@ class Tab:  # {{{
             hold_after_ssh=hold_after_ssh,
             startup_command_via_shell_integration=startup_command_via_shell_integration,
             launch_request=launch_request,
+            expand_cwd=expand_cwd,
         )
         window = Window(
             self,
@@ -2634,14 +2649,13 @@ class TabManager:  # {{{
         if mode is DragOverlayMode.full:
             # The whole window is highlighted, but the drop still inserts directionally
             return WHOLE_WINDOW_QUADRANT, direction
-        if mode is DragOverlayMode.free:
-            if (
-                w is not None
-                and src is not None
-                and not layout.insert_window_next_to_changes_layout(windows, w, dest_window, direction in ('left', 'right'), direction in ('right', 'bottom'))
-            ):
-                # The window is already on this side of dest_window, all that is left is to swap them
-                return SWAP_QUADRANT, None
+        if (
+            mode is DragOverlayMode.free
+            and src is not None
+            and not layout.insert_window_next_to_changes_layout(windows, src, dest, direction in ('left', 'right'), direction in ('right', 'bottom'))
+        ):
+            # The window is already on this side of dest_window, all that is left is to swap them
+            return SWAP_QUADRANT, None
         # The window is split off dest_window, which first takes over the space the window leaves if
         # they are next to each other, so the dropped window gets that side of the enlarged dest_window
         return quadrant_for_direction[direction], direction

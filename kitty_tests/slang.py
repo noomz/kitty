@@ -9,9 +9,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from kitty.constants import gpu_driver_path, shaders_dir, slangc
+from kitty.constants import gpu_driver_path, is_macos, shaders_dir, slangc
 from kitty.fast_data_types import gpu_shader_target, load_gpu_driver
 from kitty.shaders.slang import (
     METAL_FIXUP_MARKER,
@@ -1091,6 +1092,11 @@ float f() { static const float SCAN = 2; return SCAN; }
         return h.hexdigest()
 
     def test_all_custom_shaders_compile(self) -> None:
+        if sys.platform == 'linux' and 'arm64' in os.environ.get('BYPY_ARCH', ''):
+            # The Linux ARM build runs under emulation where slangc is
+            # extremely slow and the generated code is architecture
+            # independent, so it is already tested by the other builds
+            self.skipTest('Running under emulation')
         if __file__ and os.path.isdir((local := os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.cache'))):
             cache_base = local
         else:
@@ -1118,14 +1124,21 @@ float f() { static const float SCAN = 2; return SCAN; }
             if entry.name.endswith('.slang') and entry.name[: -len('.slang')] not in _SUPPORT_SHADER_NAMES
         )
 
-        # Compile for the target of the loaded driver and for SPIR-V and MSL,
-        # used by the Vulkan and Metal drivers, which may not be loadable on
-        # the test machine
-        targets = [driver_shader_target()]
-        if not targets[0].is_spirv:
-            targets.append(ShaderTarget('spirv', 16))
-        if not targets[0].is_msl:
-            targets.append(ShaderTarget('msl', 24))
+        # Compile for the targets of the GPU drivers that matter on this
+        # platform: Metal on macOS and OpenGL and Vulkan elsewhere. The
+        # built-in shaders are compiled for the targets of all built drivers,
+        # so use those to get the correct versions.
+        families = ('msl',) if is_macos else ('glsl', 'spirv')
+        targets = sorted(
+            (
+                ShaderTarget.parse(x)
+                for x in os.listdir(shaders_dir)
+                if x.partition('-')[0] in families and os.path.isfile(os.path.join(shaders_dir, x, 'cell.json'))
+            ),
+            key=lambda t: t.id,
+        )
+        if not targets:
+            self.fail(f'The built-in shaders have not been compiled for any of the shader targets: {families} in {shaders_dir}')
         failures: list[str] = []
 
         def check(name: str, target: ShaderTarget, vert_src: str | bytes, frag_src: str | bytes, tdir: str) -> None:
@@ -1151,33 +1164,52 @@ float f() { static const float SCAN = 2; return SCAN; }
                     if cp.returncode != 0:
                         failures.append(f'{name}: invalid MSL: {cp.stderr.decode()}{cp.stdout.decode()}')
 
-        for target in targets:
-            with tempfile.TemporaryDirectory() as cache_dir:
-                clear_caches()
-                for name in shader_names:
-                    pipeline = parse_pipeline_definition(
-                        ['startgroup', f'shaders {name}', 'endgroup'],
-                        name,
-                    )
-                    try:
-                        vert_src, frag_src, _ = build_custom_shader_pipeline(pipeline, target, cache_dir=cache_dir)
-                    except Exception as e:
-                        failures.append(f'{name} for {target.id}: {e}')
-                        continue
-                    check(name, target, vert_src, frag_src, cache_dir)
-                clear_caches()
-                # Builtin pipelines can override constants with var and chain
-                # shaders, so compile them as well
-                pipeline_names = sorted(entry.name[: -len('.pipeline')] for entry in pkg.iterdir() if entry.name.endswith('.pipeline'))
-                for name in pipeline_names:
-                    try:
-                        pipeline = parse_pipeline_definition(get_custom_pipeline_src(name).decode().splitlines(), name)
-                        vert_src, frag_src, _ = build_custom_shader_pipeline(pipeline, target, cache_dir=cache_dir)
-                    except Exception as e:
-                        failures.append(f'{name}.pipeline for {target.id}: {e}')
-                        continue
-                    check(f'{name}.pipeline', target, vert_src, frag_src, cache_dir)
-                clear_caches()
+        # Builtin pipelines can override constants with var and chain
+        # shaders, so compile them as well
+        pipeline_names = sorted(entry.name[: -len('.pipeline')] for entry in pkg.iterdir() if entry.name.endswith('.pipeline'))
+        jobs = [(name, False) for name in shader_names] + [(name, True) for name in pipeline_names]
+
+        def compile_job(name: str, is_pipeline: bool, cache_dir: str) -> None:
+            label = f'{name}.pipeline' if is_pipeline else name
+            try:
+                if is_pipeline:
+                    pipeline = parse_pipeline_definition(get_custom_pipeline_src(name).decode().splitlines(), name)
+                else:
+                    pipeline = parse_pipeline_definition(['startgroup', f'shaders {name}', 'endgroup'], name)
+            except Exception as e:
+                failures.append(f'{label}: {e}')
+                return
+            # The slang modules are target independent, so sharing the cache
+            # dir between targets means they are only built once
+            for target in targets:
+                try:
+                    vert_src, frag_src, _ = build_custom_shader_pipeline(pipeline, target, cache_dir=cache_dir)
+                except Exception as e:
+                    failures.append(f'{label} for {target.id}: {e}')
+                    continue
+                check(label, target, vert_src, frag_src, cache_dir)
+
+        # Each job uses its own cache dir, as building is serialized per cache
+        # dir. Compilation happens in slangc subprocesses so threads are fine.
+        # The first job is run alone and its cache dir used to seed the others,
+        # so that the shared types module is built only once. This matters
+        # when running under emulation, where slangc is very slow.
+        clear_caches()
+        try:
+            with tempfile.TemporaryDirectory() as tdir:
+                seed = os.path.join(tdir, 'seed')
+                compile_job(*jobs[0], seed)
+
+                def run_job(i: int) -> None:
+                    cache_dir = os.path.join(tdir, str(i))
+                    shutil.copytree(seed, cache_dir)
+                    compile_job(*jobs[i], cache_dir)
+
+                with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as executor:
+                    for future in [executor.submit(run_job, i) for i in range(1, len(jobs))]:
+                        future.result()
+        finally:
+            clear_caches()
 
         if failures:
             self.fail('Custom shader compilation failures:\n' + '\n'.join(failures))

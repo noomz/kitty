@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # License: GPL v3 Copyright: 2026, Kovid Goyal <kovid at kovidgoyal.net>
 
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 from kitty.fast_data_types import Screen
@@ -148,6 +149,160 @@ class TestSessions(BaseTest):
                     boss.get_save_filepath.assert_not_called()
                     assert_error('None of the matching windows')
         boss.edit_file.assert_not_called()
+
+    def test_save_as_session_preserves_literal_dollars(self) -> None:
+        from functools import partial
+
+        from kitty.boss import Boss
+        from kitty.child import Child
+        from kitty.launch import LaunchSpec, get_env
+        from kitty.session import default_save_as_session_opts, save_as_session_part2
+        from kitty.tabs import Tab, TabManager
+        from kitty.utils import resolve_custom_file
+        from kitty.window import EdgeWidths, Window, WindowCreationSpec
+
+        opts = self.set_options()
+        literal = 'literal $KITTY_SESSION_TEST ${KITTY_SESSION_TEST} $$'
+        cmd = ['/bin/true', literal]
+        # Watchers are stored as specified by the user, so $$ is a literal $
+        watcher = '/watchers/w $$KITTY_SESSION_TEST.py'
+        creation_spec = WindowCreationSpec(cmd=cmd, env=(('SESSION_VALUE', literal),), watchers=(watcher,))
+        save_opts = default_save_as_session_opts()
+        save_opts.save_only = True
+
+        class Group(list[SimpleNamespace]):
+            docks = ()
+
+            def __init__(self, window: SimpleNamespace) -> None:
+                super().__init__([window])
+                self.id = window.id
+
+        def make_group(wid: int, path: Path) -> Group:
+            w = SimpleNamespace(
+                id=wid,
+                os_window_id=0,
+                tab_id=0,
+                cwd_for_serialization=str(path),
+                last_focused_at=0,
+                creation_spec=creation_spec,
+                actions_on_close=(),
+                actions_on_focus_change=(),
+                actions_on_removal=(),
+                allow_remote_control=False,
+                remote_control_passwords=None,
+                user_vars={'name': literal},
+                override_title=literal,
+                padding=EdgeWidths(),
+                margin=EdgeWidths(),
+            )
+            w.as_launch_command = partial(Window.as_launch_command, cast(Window, w))
+            return Group(w)
+
+        with TemporaryDirectory() as tmp, patch.dict('os.environ', KITTY_SESSION_TEST='expanded'):
+            base = Path(tmp).resolve()
+            original = base / 'original'
+            names = ('common ' + literal, 'override ' + literal, 'current', '~root')
+            for name in names:
+                (original / name).mkdir(parents=True)
+            groups = [make_group(i, original / name) for i, name in enumerate(names, 1)]
+            tab = SimpleNamespace(
+                windows=SimpleNamespace(active_group=groups[0], groups=groups, tab_docks=(), dock_owner=lambda g: None),
+                enabled_layouts=['tall'],
+                _current_layout_name='tall',
+                name=literal,
+                serialize_layout_state_for_session=dict,
+            )
+            tab.serialize_state_as_session = partial(Tab.serialize_state_as_session, cast(Tab, tab))
+            tm = SimpleNamespace(tabs=[tab], active_tab=tab, wm_class=literal, wm_name=literal, os_window_docks=())
+            tm.serialize_state_as_session = partial(TabManager.serialize_state_as_session, cast(TabManager, tm))
+            boss = SimpleNamespace(os_window_map={1: tm})
+            boss.serialize_state_as_session = partial(Boss.serialize_state_as_session, cast(Boss, boss))
+            logo_path = str(base / (literal + '.png'))
+            filename = 'test.kitty-session'
+            for relocatable in (False, True):
+                with self.subTest(relocatable=relocatable):
+                    save_opts.relocatable = relocatable
+                    with patch('kitty.window.get_window_logo_settings_if_not_default', return_value=(logo_path, 1.0, (0.5,) * 4)):
+                        save_as_session_part2(boss, save_opts, str(original / filename))
+                    root = original
+                    if relocatable:
+                        root = original.rename(base / ('relocated ' + literal))
+                    path = root / filename
+                    (session,) = parse_session(path.read_text(), opts, session_path=str(path))
+                    (saved_tab,) = session.tabs
+                    self.ae((saved_tab.name, session.os_window_class, session.os_window_name), (literal, literal, literal))
+                    self.ae(len(saved_tab.windows), len(names))
+                    self.ae(saved_tab.cwd, str(root / names[0]))
+                    for window, name in zip(saved_tab.windows, names):
+                        spec = window.launch_spec
+                        assert isinstance(spec, LaunchSpec)
+                        self.ae(spec.args, cmd)
+                        self.ae(spec.opts.window_title, literal)
+                        self.ae(spec.opts.var, ['name=' + literal])
+                        self.ae(resolve_custom_file(spec.opts.logo), logo_path)
+                        self.ae([resolve_custom_file(x) for x in spec.opts.watcher], ['/watchers/w $KITTY_SESSION_TEST.py'])
+                        # Tab._startup() launches session windows without expanding the cwd again
+                        child = Child(spec.args, spec.opts.cwd, env=get_env(spec.opts), expand_cwd=False)
+                        self.ae((child.cwd, child.env['SESSION_VALUE']), (str(root / name), literal))
+
+    def test_session_cwd_resolution(self) -> None:
+        from kitty.child import Child
+        from kitty.launch import LaunchSpec
+
+        opts = self.set_options()
+        with TemporaryDirectory() as tmp, patch.dict('os.environ', KITTY_SESSION_TEST='expanded'):
+            base = Path(tmp).resolve()
+            path = base / 'test.kitty-session'
+            text = (
+                'cd tab$$KITTY_SESSION_TEST\nlaunch\nlaunch --cwd=win$KITTY_SESSION_TEST\nlaunch --cwd=~\nlaunch --cwd=current\n'
+                'launch --cwd=/abs$$KITTY_SESSION_TEST\n'
+            )
+            (session,) = parse_session(text, opts, session_path=str(path))
+            (tab,) = session.tabs
+            self.ae(tab.cwd, str(base / 'tab$KITTY_SESSION_TEST'))
+            cwds = []
+            for w in tab.windows:
+                assert isinstance(w.launch_spec, LaunchSpec)
+                cwds.append(w.launch_spec.opts.cwd)
+            self.ae(cwds, [tab.cwd, str(base / 'winexpanded'), os.path.expanduser('~'), 'current', '/abs$KITTY_SESSION_TEST'])
+            # Other callers still get their cwd expanded by Child
+            self.ae(Child(['/bin/true'], str(base / '$KITTY_SESSION_TEST')).cwd, str(base / 'expanded'))
+            self.ae(Child(['/bin/true'], str(base / '$KITTY_SESSION_TEST'), expand_cwd=False).cwd, str(base / '$KITTY_SESSION_TEST'))
+
+    def test_session_cwd_is_not_expanded_again(self) -> None:
+        from kitty.launch import launch, parse_launch_args
+        from kitty.session import Tab as SessionTab
+        from kitty.session import WindowSpec
+        from kitty.tabs import Tab
+
+        self.set_options()
+        # Tab._startup() launches session windows without expanding the cwd
+        session_tab = SimpleNamespace(windows=[WindowSpec(parse_launch_args([]))], active_window_idx=0, layout_state=None)
+        stub = SimpleNamespace(created_in_session_name='')
+        with patch('kitty.tabs.get_boss'), patch('kitty.launch.launch', return_value=None) as launch_mock:
+            Tab._startup(cast(Tab, stub), cast(SessionTab, session_tab))
+        self.ae(launch_mock.call_args.kwargs['expand_cwd'], False)
+        # launch() passes it on
+        boss = SimpleNamespace(active_window=None)
+        with patch('kitty.launch._launch', return_value=None) as _launch_mock:
+            launch(cast(Any, boss), cast(Any, SimpleNamespace(keep_focus=False)), [], expand_cwd=False)
+        self.ae(_launch_mock.call_args.args[-1], False)
+
+        # Tab.launch_child() decides whether Child expands the cwd
+        def child_kwargs(tab_cwd_is_expanded: bool, **kw: Any) -> tuple[str, bool]:
+            stub = SimpleNamespace(cwd='/tab$X', cwd_is_expanded=tab_cwd_is_expanded, os_window_id=0, args=SimpleNamespace(args=()))
+            with patch('kitty.tabs.Child') as child_mock, patch('kitty.tabs.platform_window_id', return_value=None):
+                Tab.launch_child(cast(Tab, stub), cmd=kw.pop('cmd', ['/bin/true']), **kw)
+            return child_mock.call_args.args[1], child_mock.call_args.kwargs['expand_cwd']
+
+        self.ae(child_kwargs(False, cwd='/w$X'), ('/w$X', True))
+        self.ae(child_kwargs(True, cwd='/w$X', expand_cwd=False), ('/w$X', False))
+        self.ae(child_kwargs(True), ('/tab$X', False))
+        self.ae(child_kwargs(False), ('/tab$X', True))
+        with TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, 'd$X')
+            os.mkdir(d)
+            self.ae(child_kwargs(False, cmd=[d]), (d, False))
 
     def test_save_as_session_line_injection(self) -> None:
         # Values such as the cwd reported via OSC 7 or user vars are under the
@@ -617,6 +772,7 @@ class TestSessions(BaseTest):
 
         class FakeTab:
             name = cwd = ''
+            cwd_is_expanded = False
             enabled_layouts, _last_used_layout, _current_layout_name = ['tall'], None, ''
 
             def __init__(self, tm: 'FakeTabManager', session: str, *windows: FakeWindow) -> None:

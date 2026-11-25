@@ -50,6 +50,10 @@ def get_os_window_sizing_data(opts: Options, session: Optional['Session'] = None
 ResizeSpec = tuple[str, int]
 
 
+def resolve_session_cwd(path: str, session_base_dir: str) -> str:
+    return os.path.abspath(os.path.join(session_base_dir, os.path.expanduser(path)))
+
+
 class WindowSpec:
     def __init__(
         self, launch_spec: Union['LaunchSpec', 'SpecialWindowInstance'], serialized_id: int = 0, run_command_at_shell_startup: Sequence[str] | str = ()
@@ -78,6 +82,7 @@ class Tab:
         self.enabled_layouts = opts.enabled_layouts
         self.layout = (self.enabled_layouts or ['tall'])[0]
         self.layout_state: dict[str, Any] | None = None
+        # Always absolute with variables expanded, see set_cwd()
         self.cwd: str | None = None
         self.next_title: str | None = None
 
@@ -129,7 +134,7 @@ class Session:
     def set_layout_state(self, val: str) -> None:
         self.tabs[-1].layout_state = json.loads(val)
 
-    def add_window(self, cmd: None | str | list[str], expand: Callable[[str], str] = lambda x: x) -> None:
+    def add_window(self, cmd: None | str | list[str], expand: Callable[[str], str] = lambda x: x, session_base_dir: str = '') -> None:
         from .launch import parse_launch_args
 
         needs_expandvars = False
@@ -152,6 +157,13 @@ class Session:
         t = self.tabs[-1]
         if t.next_title and not spec.opts.window_title:
             spec.opts.window_title = t.next_title
+        if spec.opts.cwd:
+            from .window import CwdRequestType
+
+            # Relative paths are resolved with respect to the session file, as
+            # for cd. The result is not expanded again, see Tab._startup().
+            if spec.opts.cwd not in CwdRequestType.__members__:
+                spec.opts.cwd = resolve_session_cwd(spec.opts.cwd, session_base_dir)
         spec.opts.cwd = spec.opts.cwd or t.cwd
         t.windows.append(WindowSpec(spec, serialized_id=serialize_data['id'], run_command_at_shell_startup=serialize_data.get('cmd_at_shell_startup', ())))
         t.next_title = None
@@ -194,13 +206,8 @@ class Session:
             self.tabs[-1].layout = self.tabs[-1].enabled_layouts[0]
 
     def set_cwd(self, val: str, session_base_dir: str) -> None:
-        if val:
-            val = os.path.expanduser(val)
-            if not os.path.isabs(val):
-                val = os.path.abspath(os.path.join(session_base_dir, val))
-            self.tabs[-1].cwd = val
-        elif session_base_dir:
-            self.tabs[-1].cwd = session_base_dir
+        if val or session_base_dir:
+            self.tabs[-1].cwd = resolve_session_cwd(val, session_base_dir)
 
 
 SESSION_FILE_EXTENSIONS = {'session', 'kitty-session', 'kitty_session'}
@@ -219,8 +226,13 @@ def is_safe_for_session_line(text: str) -> bool:
     return session_line_break_pat.search(text) is None and text == text.strip()
 
 
+def escape_session_value(text: str) -> str:
+    """Escape literal dollar signs for one pass through expandvars()."""
+    return text.replace('$', '$$')
+
+
 def sanitize_for_session_line(text: str) -> str:
-    return session_line_break_pat.sub(' ', text).strip()
+    return escape_session_value(session_line_break_pat.sub(' ', text).strip())
 
 
 def session_launch_line(args: Sequence[str]) -> str:
@@ -303,7 +315,7 @@ def parse_session(
             elif cmd == 'layout':
                 ans.set_layout(rest)
             elif cmd == 'launch':
-                ans.add_window(rest, expand)
+                ans.add_window(rest, expand, session_base_dir)
             elif cmd == 'focus':
                 ans.focus()
             elif cmd == 'focus_tab':
