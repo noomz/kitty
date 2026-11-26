@@ -315,6 +315,10 @@ typedef struct XIScrollDevice {
     unsigned num_events;
     GLFWOffsetType offset_type;
     bool v120_offset_needs_scaling;
+    // XWayland uses a single device for both wheels and touchpads, so the
+    // offset type is detected per event rather than once per device
+    bool is_xwayland;
+    monotonic_t last_highres_event_at;
 } XIScrollDevice;
 
 typedef struct XdndSelectionRequest {
@@ -483,7 +487,6 @@ typedef struct _GLFWlibraryX11 {
         int version;
         Window source;
         char format[256];
-        int format_priority;
         Window target_window;    // For drag events: the window being dragged over
         const char **mimes;      // Cached MIME types from drag enter (original, never reordered)
         size_t mimes_count;      // Count of MIME types (full original list, never reduced)

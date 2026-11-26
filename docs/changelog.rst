@@ -144,10 +144,19 @@ Detailed list of changes
   terminal scrolls, vertically or horizontally, by amounts in pixels, with
   images moving along with the text
 
-- A new mode (``5523``) to :ref:`report scroll events to programs in full detail
-  <detailed_wheel_events>`, with pixel or high resolution deltas, the device
-  kind, gesture phase and momentum/natural scrolling flags. Kittens can use it
-  via ``Loop.DetailedWheelEvents()``
+- A new mode (``5523``) to :ref:`report all mouse events to programs in full
+  detail <detailed_mouse_events>`, in an encoding that is valid ECMA-48, unlike
+  SGR pixel mouse reporting, which uses negative numbers. Every event has the
+  cell and pixel position, the buttons held, the modifiers, the time of the
+  event and a serial. Presses and releases have click counts that respect the
+  double click interval of the desktop, the mouse entering and leaving the
+  window is reported and scroll events have pixel or high resolution deltas,
+  the device kind, gesture phase and momentum/natural scrolling flags. Kittens
+  can use it via ``Loop.DetailedMouseEvents()``
+
+- Sessions: A new :ac:`set_session` action and :ref:`kitten @ set-session
+  <at-set-session>` remote control command to move existing windows and tabs
+  to another session (:iss:`10941`)
 
 - Initial support for the proposed glyph protocol (:iss:`10872`), allowing
   programs to register their own vector glyphs for codepoints in a reserved
@@ -234,6 +243,17 @@ Detailed list of changes
 - Building kitty now requires libfribidi, libbrotlidec (except on macOS) and,
   for the Vulkan driver, the Vulkan headers. The Go SIMD code now uses the
   Go ``simd`` package with ``GOEXPERIMENT=simd``
+
+- XWayland: Fix scrolling with the touchpad being too slow, and becoming much
+  too fast or the mouse wheel not scrolling, when both a touchpad and a mouse
+  wheel are used (:iss:`10938`)
+
+- Linux: Fix events for file descriptors being dispatched to the wrong handler
+  when a handler, such as a drag and drop or DBus one, stops watching a file
+  descriptor while events are being processed
+
+- X11: Fix dropping files into programs that accept drops, such as the
+  :doc:`dnd kitten </kittens/dnd>`, failing silently (:iss:`10944`)
 
 0.51.1 [2026-11-23]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

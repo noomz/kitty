@@ -54,9 +54,10 @@ typedef struct {
     int fd, events, enabled, ready;
     watch_callback_func callback;
     void *callback_data;
-    GLFWuserdatafreefun free;
     id_type id;
-    const char *name;
+    // Set when the watch is removed while watches are being dispatched, the
+    // watch is then dropped from the array once dispatching is done
+    bool removed;
 } Watch;
 
 typedef struct {
@@ -65,7 +66,6 @@ typedef struct {
     timer_callback_func callback;
     void *callback_data;
     GLFWuserdatafreefun free;
-    const char *name;
     bool repeats;
     // Set when the timer is removed while timers are being dispatched, the
     // timer is then dropped from the array once dispatching is done
@@ -105,11 +105,15 @@ typedef struct {
     // calling_timers only while timer callbacks are running
     bool in_timer_dispatch, calling_timers;
     size_t num_removed_timers;
+    // Set from when poll() returns until watches have been dispatched, as
+    // fds[i].revents is only valid for watches[i] during that time
+    bool defer_watch_removal;
+    size_t num_removed_watches;
 } EventLoopData;
 
 
 void check_for_wakeup_events(EventLoopData *eld);
-id_type addWatch(EventLoopData *eld, const char *name, int fd, int events, int enabled, watch_callback_func cb, void *cb_data);
+id_type addWatch(EventLoopData *eld, int fd, int events, int enabled, watch_callback_func cb, void *cb_data);
 void removeWatch(EventLoopData *eld, id_type watch_id);
 void toggleWatch(EventLoopData *eld, id_type watch_id, int enabled);
 id_type addTimer(
@@ -127,3 +131,5 @@ bool initPollData(EventLoopData *eld, int display_fd);
 void wakeupEventLoop(EventLoopData *eld);
 char *utf_8_strndup(const char *source, size_t max_length);
 int createAnonymousFile(off_t size);
+monotonic_t event_time_ms_to_monotonic(uint32_t time_ms);
+monotonic_t event_time_ns_to_monotonic(uint64_t time_ns);

@@ -27,58 +27,60 @@ void
 update_fds(EventLoopData *eld) {
     for (nfds_t i = 0; i < eld->watches_count; i++) {
         Watch *w = eld->watches + i;
-        eld->fds[i].fd = w->fd;
-        eld->fds[i].events = w->enabled ? w->events : 0;
+        // poll() ignores negative fds, so removed watches are not polled
+        eld->fds[i].fd = w->removed ? -1 : w->fd;
+        eld->fds[i].events = w->enabled && !w->removed ? w->events : 0;
     }
 }
 
 
 id_type
-addWatch(EventLoopData *eld, const char *name, int fd, int events, int enabled, watch_callback_func cb, void *cb_data) {
+addWatch(EventLoopData *eld, int fd, int events, int enabled, watch_callback_func cb, void *cb_data) {
     if (eld->watches_count >= sizeof(eld->watches) / sizeof(eld->watches[0])) {
         _glfwInputError(GLFW_PLATFORM_ERROR, "Too many watches added");
         return 0;
     }
     static id_type watch_counter = 0;
+    // Clear any revents left over from a previously removed watch, so that a
+    // watch added after poll() returns, for example by a timer callback, is not
+    // reported as ready
+    eld->fds[eld->watches_count].revents = 0;
     Watch *w = eld->watches + eld->watches_count++;
-    w->name = name;
+    w->ready = 0;
+    w->removed = false;
     w->fd = fd;
     w->events = events;
     w->enabled = enabled;
     w->callback = cb;
     w->callback_data = cb_data;
-    w->free = NULL;
     w->id = ++watch_counter;
     update_fds(eld);
     return w->id;
 }
 
-#define removeX(which, item_id, update_func)                                                                                                   \
-    {                                                                                                                                          \
-        for (nfds_t i = 0; i < eld->which##_count; i++) {                                                                                      \
-            if (eld->which[i].id == item_id) {                                                                                                 \
-                eld->which##_count--;                                                                                                          \
-                if (eld->which[i].callback_data && eld->which[i].free) {                                                                       \
-                    eld->which[i].free(eld->which[i].id, eld->which[i].callback_data);                                                         \
-                    eld->which[i].callback_data = NULL;                                                                                        \
-                    eld->which[i].free = NULL;                                                                                                 \
-                }                                                                                                                              \
-                if (i < eld->which##_count) { memmove(eld->which + i, eld->which + i + 1, sizeof(eld->which[0]) * (eld->which##_count - i)); } \
-                update_func(eld);                                                                                                              \
-                break;                                                                                                                         \
-            }                                                                                                                                  \
-        }                                                                                                                                      \
-    }
-
 void
 removeWatch(EventLoopData *eld, id_type watch_id) {
-    removeX(watches, watch_id, update_fds);
+    for (nfds_t i = 0; i < eld->watches_count; i++) {
+        Watch *w = eld->watches + i;
+        if (w->id != watch_id) continue;
+        if (w->removed) return;
+        if (eld->defer_watch_removal) {
+            // Removing would move watches that are yet to be dispatched out of
+            // sync with the revents of their fds
+            w->removed = true;
+            w->ready = 0;
+            eld->num_removed_watches++;
+        } else remove_i_from_array(eld->watches, i, eld->watches_count);
+        update_fds(eld);
+        return;
+    }
 }
 
 void
 toggleWatch(EventLoopData *eld, id_type watch_id, int enabled) {
     for (nfds_t i = 0; i < eld->watches_count; i++) {
         if (eld->watches[i].id == watch_id) {
+            if (eld->watches[i].removed) break;
             if (eld->watches[i].enabled != enabled) {
                 eld->watches[i].enabled = enabled;
                 update_fds(eld);
@@ -147,7 +149,6 @@ addTimer(
     }
     Timer *t = eld->timers + eld->timers_count++;
     t->interval = interval;
-    t->name = name;
     t->trigger_at = enabled ? monotonic() + interval : MONOTONIC_T_MAX;
     t->repeats = repeats;
     t->removed = false;
@@ -254,14 +255,33 @@ pollWithTimeout(struct pollfd *fds, nfds_t nfds, monotonic_t timeout) {
 
 static void
 dispatchEvents(EventLoopData *eld) {
-    for (nfds_t i = 0; i < eld->watches_count; i++) {
+    // Callbacks can add or remove watches. Removed watches are only marked as
+    // such so that watches[i] and fds[i] stay in sync. Watches added during
+    // dispatch are not dispatched as they were not polled.
+    const nfds_t count = eld->watches_count;
+    for (nfds_t i = 0; i < count; i++) {
         Watch *ww = eld->watches + i;
-        struct pollfd *pfd = eld->fds + i;
-        if (pfd->revents & ww->events) {
+        const int revents = eld->fds[i].revents;
+        if (!ww->removed && ww->enabled && (revents & ww->events)) {
             ww->ready = 1;
-            if (ww->callback) ww->callback(ww->fd, pfd->revents, ww->callback_data);
+            if (ww->callback) ww->callback(ww->fd, revents, ww->callback_data);
         } else ww->ready = 0;
     }
+}
+
+static void
+drop_removed_watches(EventLoopData *eld) {
+    eld->defer_watch_removal = false;
+    if (!eld->num_removed_watches) return;
+    nfds_t dest = 0;
+    for (nfds_t i = 0; i < eld->watches_count; i++) {
+        if (eld->watches[i].removed) continue;
+        if (dest != i) eld->watches[dest] = eld->watches[i];
+        dest++;
+    }
+    eld->watches_count = dest;
+    eld->num_removed_watches = 0;
+    update_fds(eld);
 }
 
 unsigned
@@ -358,7 +378,7 @@ mark_key_repeat_fd_ready(int fd UNUSED, int events UNUSED, void *data) {
 
 bool
 initPollData(EventLoopData *eld, int display_fd) {
-    if (!addWatch(eld, "display", display_fd, POLLIN, 1, NULL, NULL)) return false;
+    if (!addWatch(eld, display_fd, POLLIN, 1, NULL, NULL)) return false;
 #ifdef HAS_EVENT_FD
     eld->wakeupFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (eld->wakeupFd == -1) return false;
@@ -367,7 +387,7 @@ initPollData(EventLoopData *eld, int display_fd) {
     if (pipe2(eld->wakeupFds, O_CLOEXEC | O_NONBLOCK) != 0) return false;
     const int wakeup_fd = eld->wakeupFds[0];
 #endif
-    if (!addWatch(eld, "wakeup", wakeup_fd, POLLIN, 1, mark_wakep_fd_ready, eld)) return false;
+    if (!addWatch(eld, wakeup_fd, POLLIN, 1, mark_wakep_fd_ready, eld)) return false;
 
 #ifdef HAS_TIMER_FD
     eld->key_repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -378,7 +398,7 @@ initPollData(EventLoopData *eld, int display_fd) {
     const int key_repeat_fd = eld->key_repeat_fds[0];
 #endif
 #ifdef _GLFW_WAYLAND
-    if (!addWatch(eld, "key_repeat", key_repeat_fd, POLLIN, 1, mark_key_repeat_fd_ready, eld)) return false;
+    if (!addWatch(eld, key_repeat_fd, POLLIN, 1, mark_key_repeat_fd_ready, eld)) return false;
 #else
     (void)key_repeat_fd;
     (void)mark_key_repeat_fd_ready;
@@ -467,13 +487,16 @@ pollForEvents(EventLoopData *eld, monotonic_t timeout, watch_callback_func displ
             errno = 0;
             result = pollWithTimeout(eld->fds, eld->watches_count, timeout);
             int saved_errno = errno;
+            // Callbacks below can remove watches
+            eld->defer_watch_removal = true;
             if (display_callback) display_callback(result, display_fd_ready(eld), NULL);
             dispatchTimers(eld);
             if (result > 0) {
                 dispatchEvents(eld);
                 read_ok = eld->watches[0].ready;
-                break;
             }
+            drop_removed_watches(eld);
+            if (result > 0) break;
             timeout = end_time - monotonic();
             if (timeout <= 0) break;
             if (result < 0 && (saved_errno == EINTR || saved_errno == EAGAIN)) continue;
@@ -482,12 +505,15 @@ pollForEvents(EventLoopData *eld, monotonic_t timeout, watch_callback_func displ
             errno = 0;
             result = poll(eld->fds, eld->watches_count, -1);
             int saved_errno = errno;
+            // Callbacks below can remove watches
+            eld->defer_watch_removal = true;
             if (display_callback) display_callback(result, display_fd_ready(eld), NULL);
             dispatchTimers(eld);
             if (result > 0) {
                 dispatchEvents(eld);
                 read_ok = eld->watches[0].ready;
             }
+            drop_removed_watches(eld);
             if (result < 0 && (saved_errno == EINTR || saved_errno == EAGAIN)) continue;
             break;
         }
@@ -579,4 +605,35 @@ createAnonymousFile(off_t size) {
         return -1;
     }
     return fd;
+}
+
+// Input event times from Wayland compositors and X servers are on the
+// CLOCK_MONOTONIC clock, which is not the clock of monotonic(), so only the age
+// of an event is used, measured against CLOCK_MONOTONIC. See
+// MAX_INPUT_EVENT_AGE_SECONDS for implausible ages.
+static monotonic_t
+event_age_to_monotonic(monotonic_t age) {
+    const monotonic_t now = monotonic();
+    if (age < 0 || age > s_to_monotonic_t(MAX_INPUT_EVENT_AGE_SECONDS)) return now;
+    return now - age;
+}
+
+// Converts an event time in milliseconds, which wraps at 32 bits, as used by
+// wl_pointer, wl_touch and X11 events
+monotonic_t
+event_time_ms_to_monotonic(uint32_t time_ms) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return monotonic();
+    const uint32_t now_ms = (uint32_t)((uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u);
+    return event_age_to_monotonic(ms_to_monotonic_t((monotonic_t)(uint32_t)(now_ms - time_ms)));
+}
+
+// Converts an event time in nanoseconds, as used by the input timestamps protocol
+monotonic_t
+event_time_ns_to_monotonic(uint64_t time_ns) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return monotonic();
+    const uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+    if (time_ns > now_ns) return monotonic();
+    return event_age_to_monotonic((monotonic_t)(now_ns - time_ns));
 }

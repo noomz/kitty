@@ -282,6 +282,7 @@ do_screen_reset(Screen *self, bool is_hard_reset) {
     }
     self->modes = empty_modes;
     self->saved_modes = empty_modes;
+    detailed_mouse_events_changed(self);
     zero_at_ptr(&self->bidi);
     screen_bidi_records_writes_changed(self);
     self->active_hyperlink_id = 0;
@@ -4402,14 +4403,16 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
 #define SIMPLE_MODE(name) \
     case name: self->modes.m##name = val; break;
 
-#define MOUSE_MODE(name, attr, value) \
-    case name: self->modes.attr = val ? value : 0; break;
+#define MOUSE_MODE(name, attr, value)        \
+    case name:                               \
+        self->modes.attr = val ? value : 0;  \
+        detailed_mouse_events_changed(self); \
+        break;
 
     bool private;
     switch (mode) {
         SIMPLE_MODE(LNM)
         SIMPLE_MODE(PASTE_EVENTS)
-        SIMPLE_MODE(WHEEL_EVENTS)
         SIMPLE_MODE(IRM)
         SIMPLE_MODE(DECARM)
         SIMPLE_MODE(BRACKETED_PASTE)
@@ -4424,6 +4427,15 @@ set_mode_from_const(Screen *self, unsigned int mode, bool val) {
         MOUSE_MODE(MOUSE_SGR_PIXEL_MODE, mouse_tracking_protocol, SGR_PIXEL_PROTOCOL)
         MOUSE_MODE(MOUSE_URXVT_MODE, mouse_tracking_protocol, URXVT_PROTOCOL)
 
+        case DETAILED_MOUSE_EVENTS:
+            // The times of the events are relative to when the mode was turned on
+            if (val && !self->modes.mDETAILED_MOUSE_EVENTS) {
+                zero_at_ptr(&self->mouse_events);
+                self->mouse_events.clock_origin = monotonic();
+            }
+            self->modes.mDETAILED_MOUSE_EVENTS = val;
+            detailed_mouse_events_changed(self);
+            break;
         case DECSCLM:
         case DECNRCM: break; // we ignore these modes
         case BDSM:
@@ -5005,7 +5017,7 @@ scroll_past_image(Screen *self, unsigned int count) {
     const bool add_to_history = self->linebuf == self->main_linebuf && self->margin_top == 0;
     unsigned int n = MIN(count, self->lines);
     count -= n;
-    while (n-- > 0) { INDEX_UP(add_to_history); }
+    screen_scroll(self, n);
     if (!count) return;
     // The scroll region is now blank so further scrolling only adds blank lines
     // to the history and moves images. Bound the number of blank lines as the
@@ -5129,7 +5141,7 @@ copy_specific_mode(Screen *self, unsigned int mode, const ScreenModes *src, Scre
         SIMPLE_MODE(FOCUS_TRACKING)
         SIMPLE_MODE(COLOR_PREFERENCE_NOTIFICATION)
         SIMPLE_MODE(PASTE_EVENTS)
-        SIMPLE_MODE(WHEEL_EVENTS)
+        SIDE_EFFECTS(DETAILED_MOUSE_EVENTS)
         SIMPLE_MODE(INBAND_RESIZE_NOTIFICATION)
         SIMPLE_MODE(VISIBILITY_REPORTS)
         SIMPLE_MODE(DECCKM)
@@ -5137,7 +5149,10 @@ copy_specific_mode(Screen *self, unsigned int mode, const ScreenModes *src, Scre
         SIMPLE_MODE(DECAWM)
         case MOUSE_BUTTON_TRACKING:
         case MOUSE_MOTION_TRACKING:
-        case MOUSE_MOVE_TRACKING: dest->mouse_tracking_mode = src->mouse_tracking_mode; break;
+        case MOUSE_MOVE_TRACKING:
+            dest->mouse_tracking_mode = src->mouse_tracking_mode;
+            if (do_side_effects) detailed_mouse_events_changed(self);
+            break;
         case MOUSE_UTF8_MODE:
         case MOUSE_SGR_MODE:
         case MOUSE_URXVT_MODE: dest->mouse_tracking_protocol = src->mouse_tracking_protocol; break;
@@ -5179,7 +5194,7 @@ copy_specific_modes(Screen *self, const ScreenModes *src, ScreenModes *dest) {
     copy_specific_mode(self, INBAND_RESIZE_NOTIFICATION, src, dest);
     copy_specific_mode(self, VISIBILITY_REPORTS, src, dest);
     copy_specific_mode(self, PASTE_EVENTS, src, dest);
-    copy_specific_mode(self, WHEEL_EVENTS, src, dest);
+    copy_specific_mode(self, DETAILED_MOUSE_EVENTS, src, dest);
     copy_specific_mode(self, DECCKM, src, dest);
     copy_specific_mode(self, DECTCEM, src, dest);
     copy_specific_mode(self, DECAWM, src, dest);
@@ -5864,7 +5879,7 @@ report_mode_status(Screen *self, unsigned int which, bool private) {
         KNOWN_MODE(VISIBILITY_REPORTS);
         KNOWN_MODE(INBAND_RESIZE_NOTIFICATION);
         KNOWN_MODE(PASTE_EVENTS);
-        KNOWN_MODE(WHEEL_EVENTS);
+        KNOWN_MODE(DETAILED_MOUSE_EVENTS);
 #undef KNOWN_MODE
         case ALTERNATE_SCREEN: ans = self->linebuf == self->alt_linebuf ? 1 : 2; break;
         case MOUSE_BUTTON_TRACKING: ans = self->modes.mouse_tracking_mode == BUTTON_MODE ? 1 : 2; break;
@@ -8956,7 +8971,7 @@ MODE_GETSET(focus_tracking_enabled, FOCUS_TRACKING)
 MODE_GETSET(color_preference_notification, COLOR_PREFERENCE_NOTIFICATION)
 MODE_GETSET(in_band_resize_notification, INBAND_RESIZE_NOTIFICATION)
 MODE_GETSET(paste_events, PASTE_EVENTS)
-MODE_GETSET(wheel_events, WHEEL_EVENTS)
+MODE_GETSET(detailed_mouse_events, DETAILED_MOUSE_EVENTS)
 MODE_GETSET(auto_repeat_enabled, DECARM)
 MODE_GETSET(cursor_visible, DECTCEM)
 MODE_GETSET(cursor_key_mode, DECCKM)
@@ -10938,8 +10953,8 @@ static PyMethodDef methods[] = {
 
 static PyGetSetDef getsetters[] = {
     GETSET(in_bracketed_paste_mode) GETSET(color_preference_notification) GETSET(auto_repeat_enabled) GETSET(focus_tracking_enabled)
-        GETSET(in_band_resize_notification) GETSET(paste_events) GETSET(wheel_events) GETSET(cursor_visible) GETSET(cursor_key_mode) GETSET(disable_ligatures)
-            GETSET(render_unfocused_cursor){NULL} /* Sentinel */
+        GETSET(in_band_resize_notification) GETSET(paste_events) GETSET(detailed_mouse_events) GETSET(cursor_visible) GETSET(cursor_key_mode)
+            GETSET(disable_ligatures) GETSET(render_unfocused_cursor){NULL} /* Sentinel */
 };
 
 #if UINT_MAX == UINT32_MAX

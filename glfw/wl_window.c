@@ -2090,8 +2090,8 @@ static void
 relativePointerHandleRelativeMotion(
     void *data,
     struct zwp_relative_pointer_v1 *pointer UNUSED,
-    uint32_t timeHi UNUSED,
-    uint32_t timeLo UNUSED,
+    uint32_t timeHi,
+    uint32_t timeLo,
     wl_fixed_t dx,
     wl_fixed_t dy,
     wl_fixed_t dxUnaccel,
@@ -2110,7 +2110,9 @@ relativePointerHandleRelativeMotion(
         ypos += wl_fixed_to_double(dy);
     }
 
-    _glfwInputCursorPos(window, xpos, ypos);
+    // The time is in microseconds, on the same clock as wl_pointer event times
+    const uint64_t time_us = ((uint64_t)timeHi << 32) | timeLo;
+    _glfwInputCursorPos(window, xpos, ypos, time_us <= UINT64_MAX / 1000u ? event_time_ns_to_monotonic(time_us * 1000u) : 0);
 }
 
 static const struct zwp_relative_pointer_v1_listener relativePointerListener = {relativePointerHandleRelativeMotion};
@@ -2648,7 +2650,7 @@ request_drop_data(_GLFWWaylandDataOffer *offer, const char *mime) {
     safe_close(pipefd[1]);
     // Flush to ensure the compositor processes the receive request
     wl_display_flush(_glfw.wl.display);
-    id_type watch_id = addWatch(&_glfw.wl.eventLoopData, "drop_data", pipefd[0], POLLIN | POLLERR | POLLHUP, true, drop_data_available, NULL);
+    id_type watch_id = addWatch(&_glfw.wl.eventLoopData, pipefd[0], POLLIN | POLLERR | POLLHUP, true, drop_data_available, NULL);
     if (!watch_id) {
         safe_close(pipefd[0]);
         return ERANGE;
@@ -3467,7 +3469,7 @@ ready_for_drag_data(int fd, int events UNUSED, void *data UNUSED) {
 
 static GLFWid
 add_drag_watch(int fd) {
-    return addWatch(&_glfw.wl.eventLoopData, "drag_source", fd, POLLOUT | POLLERR | POLLHUP, true, ready_for_drag_data, NULL);
+    return addWatch(&_glfw.wl.eventLoopData, fd, POLLOUT | POLLERR | POLLHUP, true, ready_for_drag_data, NULL);
 }
 
 int
