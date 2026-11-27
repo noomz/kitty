@@ -205,6 +205,10 @@ Detailed list of changes
 - Remote control: Automatically remove stale UNIX sockets left behind by a
   killed kitty instance when using :option:`kitty --listen-on`
 
+- Fix DIM/FAINT text under a block cursor that uses a fixed
+  :opt:`cursor_text_color` being hard to read. Such text is now drawn
+  undimmed in the cursor text color (:pull:`10948`)
+
 - Fix selections jumping to other text when only part of the screen scrolls,
   for example, in programs that use a scroll region to append output above
   their input area (:iss:`10930`)
@@ -248,12 +252,19 @@ Detailed list of changes
   too fast or the mouse wheel not scrolling, when both a touchpad and a mouse
   wheel are used (:iss:`10938`)
 
+- Wayland: Fix a touch being ignored when the compositor reuses the id of a
+  touch point that was lifted, before ending the frame of the lift
+  (:iss:`10947`)
+
 - Linux: Fix events for file descriptors being dispatched to the wrong handler
   when a handler, such as a drag and drop or DBus one, stops watching a file
   descriptor while events are being processed
 
 - X11: Fix dropping files into programs that accept drops, such as the
   :doc:`dnd kitten </kittens/dnd>`, failing silently (:iss:`10944`)
+
+- A new option :opt:`ime_preedit_style` to control how the pre-edit text of
+  input methods and dictation is styled (:iss:`10739`)
 
 0.51.1 [2026-11-23]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
